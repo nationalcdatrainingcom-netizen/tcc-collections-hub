@@ -33,13 +33,26 @@ async function initDB() {
         family_name VARCHAR(255) NOT NULL,
         parent_first VARCHAR(255),
         parent_last VARCHAR(255),
+        parent2_first VARCHAR(255),
+        parent2_last VARCHAR(255),
         email VARCHAR(255),
+        email2 VARCHAR(255),
         phone VARCHAR(50),
+        phone2 VARCHAR(50),
         center VARCHAR(100),
         track VARCHAR(20) DEFAULT 'current' CHECK (track IN ('current', 'former')),
         status VARCHAR(30) DEFAULT 'active' CHECK (status IN ('active', 'past_due', 'hold', 'arrangement', 'paid', 'closed')),
         balance NUMERIC(10,2) DEFAULT 0,
         original_balance NUMERIC(10,2) DEFAULT 0,
+        aging_current NUMERIC(10,2) DEFAULT 0,
+        aging_1_30 NUMERIC(10,2) DEFAULT 0,
+        aging_31_60 NUMERIC(10,2) DEFAULT 0,
+        aging_61_90 NUMERIC(10,2) DEFAULT 0,
+        aging_90_plus NUMERIC(10,2) DEFAULT 0,
+        is_cdc BOOLEAN DEFAULT false,
+        cdc_expected NUMERIC(10,2) DEFAULT 0,
+        cdc_received NUMERIC(10,2) DEFAULT 0,
+        cdc_gap NUMERIC(10,2) DEFAULT 0,
         last_payment_date DATE,
         days_past_due INTEGER DEFAULT 0,
         stage VARCHAR(30) DEFAULT 'none',
@@ -52,10 +65,19 @@ async function initDB() {
       CREATE TABLE IF NOT EXISTS col_children (
         id SERIAL PRIMARY KEY,
         account_id INTEGER REFERENCES col_accounts(id) ON DELETE CASCADE,
+        child_first VARCHAR(255),
+        child_last VARCHAR(255),
         child_name VARCHAR(255) NOT NULL,
         classroom VARCHAR(100),
         enrollment_status VARCHAR(30) DEFAULT 'enrolled',
         attendance_hold BOOLEAN DEFAULT false,
+        balance NUMERIC(10,2) DEFAULT 0,
+        aging_current NUMERIC(10,2) DEFAULT 0,
+        aging_1_30 NUMERIC(10,2) DEFAULT 0,
+        aging_31_60 NUMERIC(10,2) DEFAULT 0,
+        aging_61_90 NUMERIC(10,2) DEFAULT 0,
+        aging_90_plus NUMERIC(10,2) DEFAULT 0,
+        is_cdc BOOLEAN DEFAULT false,
         created_at TIMESTAMP DEFAULT NOW()
       );
 
@@ -269,6 +291,261 @@ function cleanPhone(val) {
   if (!val) return null;
   return String(val).replace(/[^\d+]/g, '');
 }
+
+// ============================================================
+// PLAYGROUND TWO-FILE IMPORT (AR Aging + Guardians)
+// ============================================================
+const playgroundUpload = upload.fields([
+  { name: 'arFile', maxCount: 1 },
+  { name: 'guardianFile', maxCount: 1 }
+]);
+
+app.post('/api/import/playground', playgroundUpload, async (req, res) => {
+  try {
+    const arBuffer = req.files?.arFile?.[0]?.buffer;
+    const guardianBuffer = req.files?.guardianFile?.[0]?.buffer;
+    if (!arBuffer || !guardianBuffer) return res.status(400).json({ error: 'Both AR Aging and Guardians files are required' });
+
+    const center = req.body.center || '';
+    const preview = req.body.preview === 'true';
+
+    // Parse AR Aging CSV: Last Name, First Name, Current, 1-30 days, 31-60 days, 61-90 days, 90+ days, Total, Total aging
+    const arRecords = parse(arBuffer.toString('utf-8'), { columns: false, skip_empty_lines: true, relax_column_count: true });
+    const arHeader = arRecords[0];
+    const arData = arRecords.slice(1).filter(r => r[0] && r[0].trim() !== '' && r[0].trim() !== 'Total');
+
+    // Parse Guardians CSV: Last name, First name, Relationship, Last Name, First Name, Phone, Email
+    const gRecords = parse(guardianBuffer.toString('utf-8'), { columns: false, skip_empty_lines: true, relax_column_count: true });
+    const gData = gRecords.slice(1);
+
+    // Build guardian lookup: childKey -> [{relationship, parentFirst, parentLast, phone, email}]
+    const guardianMap = {};
+    for (const g of gData) {
+      const childLast = (g[0] || '').trim().toLowerCase();
+      const childFirst = (g[1] || '').trim().toLowerCase();
+      const key = childLast + '|' + childFirst;
+      if (!guardianMap[key]) guardianMap[key] = [];
+      guardianMap[key].push({
+        relationship: (g[2] || '').trim(),
+        parentLast: (g[3] || '').trim(),
+        parentFirst: (g[4] || '').trim(),
+        phone: cleanPhone(g[5]),
+        email: (g[6] || '').trim()
+      });
+    }
+
+    // Process AR data: merge with guardians, group by family (parent email or last name)
+    const familyMap = {}; // key -> { parentInfo, children[], totalBalance, aging }
+
+    for (const row of arData) {
+      const childLast = (row[0] || '').trim();
+      const childFirst = (row[1] || '').trim();
+      const agingTotal = parseBalance(row[8]);
+
+      // We only care about children who owe money (positive Total aging)
+      // But also track CDC children (negative Current with $0 aging) for reference
+      const currentBal = parseBalance(row[2]);
+      const isCDC = currentBal < 0 && agingTotal === 0;
+
+      const childKey = childLast.toLowerCase() + '|' + childFirst.toLowerCase();
+      const guardians = guardianMap[childKey] || [];
+
+      // Find primary parent (prefer Mother/Parent with email)
+      let primary = guardians.find(g => g.email && (g.relationship === 'Parent' || g.relationship === 'Mother'));
+      if (!primary) primary = guardians.find(g => g.email);
+      if (!primary) primary = guardians[0] || { parentFirst: '', parentLast: childLast, phone: '', email: '' };
+
+      // Secondary parent
+      let secondary = guardians.find(g => g !== primary && (g.email || g.phone));
+
+      // Group by parent email (best) or parent last name (fallback)
+      const familyKey = primary.email ? primary.email.toLowerCase() : (primary.parentLast || childLast).toLowerCase();
+
+      if (!familyMap[familyKey]) {
+        familyMap[familyKey] = {
+          familyName: primary.parentLast || childLast,
+          parentFirst: primary.parentFirst,
+          parentLast: primary.parentLast || childLast,
+          email: primary.email,
+          phone: primary.phone,
+          parent2First: secondary ? secondary.parentFirst : '',
+          parent2Last: secondary ? secondary.parentLast : '',
+          email2: secondary ? secondary.email : '',
+          phone2: secondary ? secondary.phone : '',
+          children: [],
+          totalBalance: 0,
+          aging: { current: 0, d1_30: 0, d31_60: 0, d61_90: 0, d90_plus: 0 },
+          isCDC: false,
+          cdcExpected: 0
+        };
+      }
+
+      const family = familyMap[familyKey];
+      const childBalance = agingTotal;
+      const childAging = {
+        current: parseBalance(row[2]),
+        d1_30: parseBalance(row[3]),
+        d31_60: parseBalance(row[4]),
+        d61_90: parseBalance(row[5]),
+        d90_plus: parseBalance(row[6])
+      };
+
+      family.children.push({
+        childFirst, childLast,
+        childName: childFirst + ' ' + childLast,
+        balance: childBalance,
+        aging: childAging,
+        isCDC
+      });
+
+      if (childBalance > 0) {
+        family.totalBalance += childBalance;
+        family.aging.d1_30 += childAging.d1_30;
+        family.aging.d31_60 += childAging.d31_60;
+        family.aging.d61_90 += childAging.d61_90;
+        family.aging.d90_plus += childAging.d90_plus;
+      }
+
+      if (isCDC) {
+        family.isCDC = true;
+        family.cdcExpected += Math.abs(currentBal);
+      }
+    }
+
+    // Filter to only families that owe money OR are CDC
+    const owingFamilies = Object.values(familyMap).filter(f => f.totalBalance > 0 || f.isCDC);
+
+    if (preview) {
+      return res.json({
+        total_children: arData.length,
+        total_families: Object.keys(familyMap).length,
+        owing_families: owingFamilies.length,
+        total_owed: owingFamilies.reduce((sum, f) => sum + f.totalBalance, 0),
+        cdc_families: owingFamilies.filter(f => f.isCDC).length,
+        cdc_expected: owingFamilies.reduce((sum, f) => sum + f.cdcExpected, 0),
+        families: owingFamilies.map(f => ({
+          familyName: f.parentFirst ? f.parentFirst + ' ' + f.parentLast : f.familyName,
+          email: f.email,
+          phone: f.phone,
+          balance: f.totalBalance,
+          isCDC: f.isCDC,
+          cdcExpected: f.cdcExpected,
+          children: f.children.map(c => ({ name: c.childName, balance: c.balance, isCDC: c.isCDC })),
+          aging: f.aging
+        }))
+      });
+    }
+
+    // Actual import
+    const client = await pool.connect();
+    let imported = 0, updated = 0, skipped = 0;
+    const errors = [];
+
+    try {
+      await client.query('BEGIN');
+
+      for (const family of owingFamilies) {
+        try {
+          // Only import families that actually owe money (skip CDC-only with no family balance)
+          if (family.totalBalance <= 0 && !family.isCDC) { skipped++; continue; }
+
+          const displayName = family.parentLast + (family.parentFirst ? ', ' + family.parentFirst : '');
+
+          // Check for existing account
+          const existing = await client.query(
+            `SELECT id FROM col_accounts WHERE
+              (LOWER(REPLACE(email, ' ', '')) = LOWER(REPLACE($1, ' ', '')) AND $1 != '')
+              OR (LOWER(REPLACE(family_name, ' ', '')) = LOWER(REPLACE($2, ' ', '')))`,
+            [family.email || '', displayName]
+          );
+
+          let accountId;
+          if (existing.rows.length > 0) {
+            accountId = existing.rows[0].id;
+            await client.query(
+              `UPDATE col_accounts SET
+                balance = $1, email = COALESCE(NULLIF($2,''), email), phone = COALESCE(NULLIF($3,''), phone),
+                email2 = COALESCE(NULLIF($4,''), email2), phone2 = COALESCE(NULLIF($5,''), phone2),
+                parent2_first = COALESCE(NULLIF($6,''), parent2_first), parent2_last = COALESCE(NULLIF($7,''), parent2_last),
+                center = COALESCE(NULLIF($8,''), center),
+                aging_1_30 = $9, aging_31_60 = $10, aging_61_90 = $11, aging_90_plus = $12,
+                is_cdc = $13, cdc_expected = $14,
+                status = CASE WHEN $1 > 0 THEN 'past_due' ELSE status END,
+                source = 'playground', updated_at = NOW()
+               WHERE id = $15`,
+              [family.totalBalance, family.email, family.phone,
+               family.email2, family.phone2, family.parent2First, family.parent2Last,
+               center, family.aging.d1_30, family.aging.d31_60, family.aging.d61_90, family.aging.d90_plus,
+               family.isCDC, family.cdcExpected, accountId]
+            );
+            updated++;
+          } else {
+            const ins = await client.query(
+              `INSERT INTO col_accounts (family_name, parent_first, parent_last, email, phone,
+                parent2_first, parent2_last, email2, phone2,
+                center, track, status, balance, original_balance,
+                aging_1_30, aging_31_60, aging_61_90, aging_90_plus,
+                is_cdc, cdc_expected, source)
+               VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,'current',$11,$12,$12,$13,$14,$15,$16,$17,$18,'playground')
+               RETURNING id`,
+              [displayName, family.parentFirst, family.parentLast, family.email, family.phone,
+               family.parent2First, family.parent2Last, family.email2, family.phone2,
+               center, family.totalBalance > 0 ? 'past_due' : 'active', family.totalBalance,
+               family.aging.d1_30, family.aging.d31_60, family.aging.d61_90, family.aging.d90_plus,
+               family.isCDC, family.cdcExpected]
+            );
+            accountId = ins.rows[0].id;
+            imported++;
+          }
+
+          // Add children
+          for (const child of family.children) {
+            const existingChild = await client.query(
+              `SELECT id FROM col_children WHERE account_id = $1 AND LOWER(child_name) = LOWER($2)`,
+              [accountId, child.childName]
+            );
+            if (existingChild.rows.length === 0) {
+              await client.query(
+                `INSERT INTO col_children (account_id, child_first, child_last, child_name, balance,
+                  aging_current, aging_1_30, aging_31_60, aging_61_90, aging_90_plus, is_cdc)
+                 VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11)`,
+                [accountId, child.childFirst, child.childLast, child.childName, child.balance,
+                 child.aging.current, child.aging.d1_30, child.aging.d31_60, child.aging.d61_90, child.aging.d90_plus,
+                 child.isCDC]
+              );
+            } else {
+              await client.query(
+                `UPDATE col_children SET balance=$1, aging_current=$2, aging_1_30=$3, aging_31_60=$4,
+                  aging_61_90=$5, aging_90_plus=$6, is_cdc=$7 WHERE id=$8`,
+                [child.balance, child.aging.current, child.aging.d1_30, child.aging.d31_60,
+                 child.aging.d61_90, child.aging.d90_plus, child.isCDC, existingChild.rows[0].id]
+              );
+            }
+          }
+        } catch (rowErr) {
+          errors.push(`${family.familyName}: ${rowErr.message}`);
+        }
+      }
+
+      await client.query('COMMIT');
+
+      await pool.query(
+        'INSERT INTO col_activity_log (user_name, action, details) VALUES ($1,$2,$3)',
+        ['System', 'playground_import', `${center}: Imported ${imported} new, updated ${updated}, skipped ${skipped}. ${errors.length} errors.`]
+      );
+
+      res.json({ imported, updated, skipped, errors: errors.slice(0, 20), total_families: owingFamilies.length, center });
+    } catch (txErr) {
+      await client.query('ROLLBACK');
+      throw txErr;
+    } finally {
+      client.release();
+    }
+  } catch (err) {
+    console.error('Playground import error:', err);
+    res.status(500).json({ error: err.message });
+  }
+});
 
 // ============================================================
 // API ROUTES
@@ -1072,45 +1349,42 @@ tr.paid-row { background: #E8F5E9; }
 
 <!-- Import Modal -->
 <div class="modal-overlay" id="importModal">
-  <div class="modal" style="max-width: 800px;">
+  <div class="modal" style="max-width: 850px;">
     <div class="modal-header">
-      <h2>Import CSV</h2>
+      <h2>Import from Playground</h2>
       <button class="modal-close" onclick="closeModal('importModal')">&times;</button>
     </div>
     <div class="modal-body" id="importBody">
-      <div class="form-row">
-        <div class="form-group">
-          <label>Source</label>
-          <select id="importSource">
-            <option value="playground">Playground</option>
-            <option value="kangarootime_v1">Kangarootime V1</option>
-            <option value="kangarootime_v2">Kangarootime V2</option>
-            <option value="other">Other</option>
-          </select>
-        </div>
-        <div class="form-group">
-          <label>Default Center (if not in CSV)</label>
-          <select id="importCenter">
-            <option value="">None</option>
-            <option value="Peace Boulevard">Peace Boulevard</option>
-            <option value="Niles">Niles</option>
-            <option value="Montessori">Montessori</option>
-          </select>
-        </div>
-      </div>
       <div class="form-group">
-        <label>Default Track</label>
-        <select id="importTrack">
-          <option value="current">Current Families</option>
-          <option value="former">Former Families</option>
+        <label>Center *</label>
+        <select id="importCenter" style="max-width:300px;">
+          <option value="">Select Center</option>
+          <option value="Peace Boulevard">Peace Boulevard</option>
+          <option value="Niles">Niles</option>
+          <option value="Montessori">Montessori</option>
         </select>
       </div>
-      <div class="import-zone" id="importZone">
-        <p style="font-size: 16px; margin-bottom: 10px;">📄 Drop your CSV file here or <label for="importFile">browse</label></p>
-        <p style="font-size: 12px; color: #999;">Supports Playground and Kangarootime exports</p>
-        <input type="file" id="importFile" accept=".csv,.txt" onchange="handleImportFile(this.files[0])">
+
+      <div style="display:grid; grid-template-columns: 1fr 1fr; gap: 16px; margin-bottom:16px;">
+        <div class="import-zone" id="arZone" style="padding:24px;">
+          <p style="font-size:14px; font-weight:600; margin-bottom:6px;">📊 Step 1: AR Aging Report</p>
+          <p style="font-size:12px; color:#888; margin-bottom:10px;">Accounts Receivable Aging (Non Zero) - Monthly</p>
+          <label for="arFile" style="padding:8px 16px; background:#E3F2FD; border-radius:6px; font-size:13px;">Choose File</label>
+          <input type="file" id="arFile" accept=".csv" onchange="fileSelected('ar', this.files[0])" style="display:none;">
+          <div id="arFileName" style="margin-top:8px; font-size:12px; color:#27AE60;"></div>
+        </div>
+        <div class="import-zone" id="guardianZone" style="padding:24px;">
+          <p style="font-size:14px; font-weight:600; margin-bottom:6px;">👪 Step 2: Primary Guardians</p>
+          <p style="font-size:12px; color:#888; margin-bottom:10px;">Primary Guardians report for parent contact info</p>
+          <label for="guardianFile" style="padding:8px 16px; background:#E3F2FD; border-radius:6px; font-size:13px;">Choose File</label>
+          <input type="file" id="guardianFile" accept=".csv" onchange="fileSelected('guardian', this.files[0])" style="display:none;">
+          <div id="guardianFileName" style="margin-top:8px; font-size:12px; color:#27AE60;"></div>
+        </div>
       </div>
-      <div id="importPreview" style="display:none;"></div>
+
+      <button class="btn btn-primary" id="previewBtn" onclick="previewPlaygroundImport()" disabled>Preview Import</button>
+
+      <div id="importPreview" style="display:none; margin-top:16px;"></div>
     </div>
   </div>
 </div>
@@ -1283,12 +1557,12 @@ async function loadAccounts() {
             <div style="font-weight:600;">\${esc(a.family_name)}</div>
             \${childNames ? '<div style="font-size:12px; color:#888;">'+esc(childNames)+'</div>' : ''}
           </td>
-          <td>\${esc(a.center || '—')}</td>
+          <td>\${esc(a.center || '-')}</td>
           <td><span class="badge badge-\${a.track}">\${a.track}</span></td>
           <td><span class="badge badge-\${a.status}">\${a.status.replace('_',' ')}</span></td>
           <td style="font-weight:600; color:\${a.balance > 0 ? '#E74C3C' : '#27AE60'};">\${fmt(a.balance)}</td>
-          <td style="font-size:12px;">\${esc(a.email || '—')}</td>
-          <td style="font-size:12px;">\${esc(a.phone || '—')}</td>
+          <td style="font-size:12px;">\${esc(a.email || '-')}</td>
+          <td style="font-size:12px;">\${esc(a.phone || '-')}</td>
         </tr>\`;
       }).join('');
     }
@@ -1296,7 +1570,7 @@ async function loadAccounts() {
     const start = currentOffset + 1;
     const end = Math.min(currentOffset + PAGE_SIZE, currentTotal);
     document.getElementById('pageInfo').textContent = currentTotal > 0
-      ? \`Showing \${start}–\${end} of \${currentTotal} accounts\`
+      ? \`Showing \${start}-\${end} of \${currentTotal} accounts\`
       : 'No accounts found';
     document.getElementById('prevBtn').disabled = currentOffset === 0;
     document.getElementById('nextBtn').disabled = currentOffset + PAGE_SIZE >= currentTotal;
@@ -1343,7 +1617,7 @@ async function showDetail(id) {
           <div class="detail-item"><span class="label">Email</span><span class="value">\${esc(a.email || 'Not provided')}</span></div>
           <div class="detail-item"><span class="label">Phone</span><span class="value">\${esc(a.phone || 'Not provided')}</span></div>
           <div class="detail-item"><span class="label">Center</span><span class="value">\${esc(a.center || 'Not set')}</span></div>
-          <div class="detail-item"><span class="label">Source</span><span class="value">\${esc(a.source || '—')}</span></div>
+          <div class="detail-item"><span class="label">Source</span><span class="value">\${esc(a.source || '-')}</span></div>
         </div>
       </div>
 
@@ -1398,7 +1672,7 @@ async function showDetail(id) {
       <div class="detail-section">
         <h3>Activity</h3>
         \${a.activity && a.activity.length > 0
-          ? a.activity.map(act => \`<div class="activity-item"><span class="time">\${new Date(act.created_at).toLocaleString()}</span> — <span class="action">\${esc(act.user_name || '')}</span>: \${esc(act.action)} \${act.details ? '— '+esc(act.details) : ''}</div>\`).join('')
+          ? a.activity.map(act => \`<div class="activity-item"><span class="time">\${new Date(act.created_at).toLocaleString()}</span> - <span class="action">\${esc(act.user_name || '')}</span>: \${esc(act.action)} \${act.details ? '- '+esc(act.details) : ''}</div>\`).join('')
           : '<p style="color:#999;">No activity yet</p>'
         }
       </div>
@@ -1577,75 +1851,102 @@ async function saveEditAccount() {
 function showImportModal() {
   document.getElementById('importPreview').style.display = 'none';
   document.getElementById('importPreview').innerHTML = '';
+  document.getElementById('arFileName').textContent = '';
+  document.getElementById('guardianFileName').textContent = '';
+  document.getElementById('previewBtn').disabled = true;
+  window._arFile = null;
+  window._guardianFile = null;
   openModal('importModal');
 }
 
-async function handleImportFile(file) {
+function fileSelected(type, file) {
   if (!file) return;
+  if (type === 'ar') {
+    window._arFile = file;
+    document.getElementById('arFileName').textContent = '✓ ' + file.name;
+  } else {
+    window._guardianFile = file;
+    document.getElementById('guardianFileName').textContent = '✓ ' + file.name;
+  }
+  document.getElementById('previewBtn').disabled = !(window._arFile && window._guardianFile);
+}
+
+async function previewPlaygroundImport() {
+  const center = document.getElementById('importCenter').value;
+  if (!center) return toast('Please select a center', 'error');
+  if (!window._arFile || !window._guardianFile) return toast('Both files are required', 'error');
+
   const formData = new FormData();
-  formData.append('file', file);
-  formData.append('source', document.getElementById('importSource').value);
-  formData.append('center', document.getElementById('importCenter').value);
-  formData.append('track', document.getElementById('importTrack').value);
+  formData.append('arFile', window._arFile);
+  formData.append('guardianFile', window._guardianFile);
+  formData.append('center', center);
   formData.append('preview', 'true');
 
   try {
-    const res = await fetch('/api/import', { method: 'POST', body: formData });
+    const res = await fetch('/api/import/playground', { method: 'POST', body: formData });
     const data = await res.json();
-
     if (data.error) return toast(data.error, 'error');
 
     const preview = document.getElementById('importPreview');
     preview.style.display = 'block';
 
-    let mappingHtml = '<h4 style="margin-bottom:8px;">Column Mapping Detected</h4>';
-    mappingHtml += '<div style="font-size:12px; color:#666; margin-bottom:12px;">Headers: ' + data.headers.map(h => '<code>'+esc(h)+'</code>').join(', ') + '</div>';
+    let html = '<div style="background:#f8f9fa; padding:16px; border-radius:8px; margin-bottom:16px;">';
+    html += '<div style="display:grid; grid-template-columns:repeat(4,1fr); gap:12px; text-align:center;">';
+    html += '<div><div style="font-size:24px; font-weight:700; color:#1B4F72;">' + data.total_children + '</div><div style="font-size:11px; color:#888;">Total Children</div></div>';
+    html += '<div><div style="font-size:24px; font-weight:700; color:#E74C3C;">' + data.owing_families + '</div><div style="font-size:11px; color:#888;">Families Owing</div></div>';
+    html += '<div><div style="font-size:24px; font-weight:700; color:#E74C3C;">' + fmt(data.total_owed) + '</div><div style="font-size:11px; color:#888;">Total Owed</div></div>';
+    html += '<div><div style="font-size:24px; font-weight:700; color:#F39C12;">' + data.cdc_families + '</div><div style="font-size:11px; color:#888;">CDC Families</div></div>';
+    html += '</div></div>';
 
-    mappingHtml += '<table class="preview-table"><thead><tr><th>Family Name</th><th>Email</th><th>Phone</th><th>Balance</th><th>Child</th><th>Center</th></tr></thead><tbody>';
-    data.preview.forEach(r => {
-      mappingHtml += \`<tr><td>\${esc(r.family_name||r.parent_last||'')}</td><td>\${esc(r.email||'')}</td><td>\${esc(r.phone||'')}</td><td>\${r.balance ? fmt(r.balance) : '—'}</td><td>\${esc(r.child_name||'')}</td><td>\${esc(r.center||'')}</td></tr>\`;
-    });
-    mappingHtml += '</tbody></table>';
-    mappingHtml += \`<p style="font-size:13px; margin:12px 0;">Total rows to import: <strong>\${data.total_rows}</strong> (accounts with $0 balance will be skipped)</p>\`;
-    mappingHtml += \`<button class="btn btn-primary" onclick="executeImport()">Import \${data.total_rows} Rows</button>\`;
+    if (data.families.length > 0) {
+      html += '<table class="preview-table"><thead><tr><th>Parent</th><th>Email</th><th>Phone</th><th>Children</th><th>Balance</th><th>CDC</th><th>Aging</th></tr></thead><tbody>';
+      data.families.filter(f => f.balance > 0).sort((a,b) => b.balance - a.balance).forEach(f => {
+        const kids = f.children.map(c => c.name + (c.isCDC ? ' (CDC)' : '')).join(', ');
+        const aging = [];
+        if (f.aging.d1_30 > 0) aging.push('1-30d: ' + fmt(f.aging.d1_30));
+        if (f.aging.d31_60 > 0) aging.push('31-60d: ' + fmt(f.aging.d31_60));
+        if (f.aging.d61_90 > 0) aging.push('61-90d: ' + fmt(f.aging.d61_90));
+        if (f.aging.d90_plus > 0) aging.push('90+d: ' + fmt(f.aging.d90_plus));
+        html += '<tr><td style="font-weight:600;">' + esc(f.familyName) + '</td><td style="font-size:11px;">' + esc(f.email||'-') + '</td><td style="font-size:11px;">' + esc(f.phone||'-') + '</td><td style="font-size:11px;">' + esc(kids) + '</td><td style="font-weight:600; color:#E74C3C;">' + fmt(f.balance) + '</td><td>' + (f.isCDC ? '<span class="badge badge-arrangement">CDC</span>' : '') + '</td><td style="font-size:10px;">' + aging.join('<br>') + '</td></tr>';
+      });
+      html += '</tbody></table>';
+    }
 
-    preview.innerHTML = mappingHtml;
+    html += '<div style="margin-top:16px; display:flex; gap:10px; align-items:center;">';
+    html += '<button class="btn btn-primary" onclick="executePlaygroundImport()">Import ' + data.owing_families + ' Families into ' + esc(center) + '</button>';
+    html += '<span style="font-size:12px; color:#888;">Only families with balances > $0 will be imported</span>';
+    html += '</div>';
 
-    // Store the file for actual import
-    window._importFile = file;
-  } catch(e) { toast('Error previewing file', 'error'); }
+    preview.innerHTML = html;
+  } catch(e) { console.error(e); toast('Error previewing import', 'error'); }
 }
 
-async function executeImport() {
-  if (!window._importFile) return toast('No file to import', 'error');
-
+async function executePlaygroundImport() {
+  const center = document.getElementById('importCenter').value;
   const formData = new FormData();
-  formData.append('file', window._importFile);
-  formData.append('source', document.getElementById('importSource').value);
-  formData.append('center', document.getElementById('importCenter').value);
-  formData.append('track', document.getElementById('importTrack').value);
+  formData.append('arFile', window._arFile);
+  formData.append('guardianFile', window._guardianFile);
+  formData.append('center', center);
 
   try {
-    const res = await fetch('/api/import', { method: 'POST', body: formData });
+    const res = await fetch('/api/import/playground', { method: 'POST', body: formData });
     const data = await res.json();
-
     if (data.error) return toast(data.error, 'error');
 
-    const preview = document.getElementById('importPreview');
-    preview.innerHTML = \`
-      <div style="text-align:center; padding:20px;">
+    document.getElementById('importPreview').innerHTML = \`
+      <div style="text-align:center; padding:24px;">
         <div style="font-size:48px; margin-bottom:10px;">✅</div>
-        <h3 style="color:#27AE60;">Import Complete</h3>
-        <p style="margin-top:10px;">
-          <strong>\${data.imported}</strong> new accounts imported<br>
+        <h3 style="color:#27AE60;">Import Complete - \${esc(data.center)}</h3>
+        <p style="margin-top:12px; font-size:15px;">
+          <strong>\${data.imported}</strong> new family accounts imported<br>
           <strong>\${data.updated}</strong> existing accounts updated<br>
-          <strong>\${data.skipped}</strong> rows skipped (no name or $0 balance)
+          <strong>\${data.total_families}</strong> total families processed
         </p>
-        \${data.errors && data.errors.length > 0 ? '<p style="color:#E74C3C; font-size:12px; margin-top:10px;">' + data.errors.length + ' errors (see console)</p>' : ''}
+        \${data.errors.length > 0 ? '<p style="color:#E74C3C; font-size:12px; margin-top:8px;">' + data.errors.length + ' errors</p>' : ''}
         <button class="btn btn-primary" style="margin-top:16px;" onclick="closeModal('importModal'); loadAccounts(); loadStats();">Done</button>
       </div>
     \`;
-    toast(\`Imported \${data.imported} accounts!\`, 'success');
+    toast('Imported ' + data.imported + ' accounts for ' + data.center + '!', 'success');
   } catch(e) { toast('Import failed', 'error'); }
 }
 
@@ -1656,9 +1957,9 @@ async function loadActivity() {
     const logs = await res.json();
     document.getElementById('activityBody').innerHTML = logs.length > 0
       ? logs.map(l => \`<div class="activity-item">
-          <span class="time">\${new Date(l.created_at).toLocaleString()}</span> —
+          <span class="time">\${new Date(l.created_at).toLocaleString()}</span> -
           <span class="action">\${esc(l.user_name||'System')}</span>: \${esc(l.action)}
-          \${l.family_name ? ' — <em>'+esc(l.family_name)+'</em>' : ''}
+          \${l.family_name ? ' - <em>'+esc(l.family_name)+'</em>' : ''}
           \${l.details ? '<br><span style="font-size:12px;color:#888;">'+esc(l.details)+'</span>' : ''}
         </div>\`).join('')
       : '<p style="color:#999;">No activity recorded yet.</p>';
@@ -1682,7 +1983,7 @@ function esc(s) {
 // ============================================================
 initDB().then(() => {
   app.listen(PORT, () => {
-    console.log(\`TCC Collections Hub running on port \${PORT}\`);
+    console.log(`TCC Collections Hub running on port ${PORT}`);
   });
 }).catch(err => {
   console.error('Failed to initialize database:', err);
