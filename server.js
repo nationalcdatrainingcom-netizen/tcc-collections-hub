@@ -2448,7 +2448,7 @@ async function viewCDCStatement(id) {
     if (noAuth.length > 0 && data.status !== 'approved') {
       html += '<div style="background:#FCE4EC; padding:16px; border-radius:8px; margin-bottom:16px;">';
       html += '<h4 style="color:#C62828; margin-bottom:10px;">No Authorization - Approve to Shift Balance to Families</h4>';
-      html += '<p style="font-size:12px; color:#888; margin-bottom:10px;">Approving will add these amounts to each family\'s balance and mark them as past due.</p>';
+      html += '<p style="font-size:12px; color:#888; margin-bottom:10px;">Approving will add these amounts to each family account balance and mark them as past due.</p>';
       html += '<table class="preview-table"><thead><tr><th>Child</th><th>Matched Family</th><th>Email</th><th>Estimated Amount</th></tr></thead><tbody>';
       noAuth.forEach(c => {
         const est = c.hours_billed > 0 && c.max_rate > 0 ? (c.hours_billed * c.max_rate).toFixed(2) : '0.00';
