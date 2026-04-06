@@ -147,6 +147,54 @@ async function initDB() {
       CREATE INDEX IF NOT EXISTS idx_col_payments_account ON col_payments(account_id);
       CREATE INDEX IF NOT EXISTS idx_col_communications_account ON col_communications(account_id);
       CREATE INDEX IF NOT EXISTS idx_col_activity_log_account ON col_activity_log(account_id);
+
+      CREATE TABLE IF NOT EXISTS col_cdc_statements (
+        id SERIAL PRIMARY KEY,
+        voucher VARCHAR(50),
+        voucher_date DATE,
+        provider_id VARCHAR(50),
+        center VARCHAR(100),
+        pay_period_start DATE,
+        pay_period_end DATE,
+        total_pay NUMERIC(10,2) DEFAULT 0,
+        net_total_pay NUMERIC(10,2) DEFAULT 0,
+        total_children INTEGER DEFAULT 0,
+        children_paid INTEGER DEFAULT 0,
+        children_no_auth INTEGER DEFAULT 0,
+        children_duplicate INTEGER DEFAULT 0,
+        status VARCHAR(30) DEFAULT 'pending' CHECK (status IN ('pending', 'reviewed', 'approved', 'archived')),
+        approved_by VARCHAR(100),
+        approved_at TIMESTAMP,
+        raw_json TEXT,
+        created_at TIMESTAMP DEFAULT NOW()
+      );
+
+      CREATE TABLE IF NOT EXISTS col_cdc_children (
+        id SERIAL PRIMARY KEY,
+        statement_id INTEGER REFERENCES col_cdc_statements(id) ON DELETE CASCADE,
+        account_id INTEGER REFERENCES col_accounts(id) ON DELETE SET NULL,
+        child_name VARCHAR(255) NOT NULL,
+        child_name_normalized VARCHAR(255),
+        case_no VARCHAR(50),
+        child_id_no VARCHAR(50),
+        hours_auth INTEGER DEFAULT 0,
+        hours_billed INTEGER DEFAULT 0,
+        hours_paid INTEGER DEFAULT 0,
+        fc NUMERIC(10,2) DEFAULT 0,
+        max_rate NUMERIC(10,2) DEFAULT 0,
+        amount_paid NUMERIC(10,2) DEFAULT 0,
+        error_desc VARCHAR(255),
+        is_paid BOOLEAN DEFAULT false,
+        is_no_auth BOOLEAN DEFAULT false,
+        is_duplicate BOOLEAN DEFAULT false,
+        balance_shifted BOOLEAN DEFAULT false,
+        shift_amount NUMERIC(10,2) DEFAULT 0,
+        created_at TIMESTAMP DEFAULT NOW()
+      );
+
+      CREATE INDEX IF NOT EXISTS idx_col_cdc_statements_center ON col_cdc_statements(center);
+      CREATE INDEX IF NOT EXISTS idx_col_cdc_children_statement ON col_cdc_children(statement_id);
+      CREATE INDEX IF NOT EXISTS idx_col_cdc_children_account ON col_cdc_children(account_id);
     `);
     console.log('Database tables initialized');
   } finally {
@@ -1041,6 +1089,261 @@ app.delete('/api/accounts/:id', async (req, res) => {
 });
 
 // ============================================================
+// CDC RECONCILIATION ROUTES
+// ============================================================
+const { execSync } = require('child_process');
+const fs = require('fs');
+const os = require('os');
+
+// --- Upload & Parse CDC Statement PDF ---
+app.post('/api/cdc/upload', upload.single('cdcFile'), async (req, res) => {
+  try {
+    if (!req.file) return res.status(400).json({ error: 'No PDF file uploaded' });
+
+    // Write to temp file
+    const tmpPath = path.join(os.tmpdir(), 'cdc_' + Date.now() + '.pdf');
+    fs.writeFileSync(tmpPath, req.file.buffer);
+
+    // Run Python parser
+    let parsed;
+    try {
+      const output = execSync(`python3 parse_cdc.py "${tmpPath}"`, {
+        cwd: process.cwd(),
+        timeout: 30000,
+        encoding: 'utf-8'
+      });
+      parsed = JSON.parse(output);
+    } catch (pyErr) {
+      fs.unlinkSync(tmpPath);
+      return res.status(500).json({ error: 'PDF parsing failed: ' + (pyErr.stderr || pyErr.message) });
+    }
+
+    fs.unlinkSync(tmpPath);
+
+    if (parsed.errors && parsed.errors.length > 0) {
+      return res.status(400).json({ error: 'Parser errors: ' + parsed.errors.join(', ') });
+    }
+
+    // Match children to existing accounts
+    for (const child of parsed.children) {
+      const nameParts = child.name.trim().split(/\s+/);
+      const firstName = nameParts[0];
+      const lastName = nameParts[nameParts.length - 1];
+
+      // Try to match by child name in col_children
+      const match = await pool.query(
+        `SELECT c.id as child_id, c.account_id, a.family_name, a.email, a.phone
+         FROM col_children c JOIN col_accounts a ON c.account_id = a.id
+         WHERE (LOWER(c.child_first) = LOWER($1) AND LOWER(c.child_last) = LOWER($2))
+            OR LOWER(c.child_name) ILIKE $3
+         LIMIT 1`,
+        [firstName, lastName, '%' + firstName + '%' + lastName + '%']
+      );
+
+      if (match.rows.length > 0) {
+        child.matched_account_id = match.rows[0].account_id;
+        child.matched_family = match.rows[0].family_name;
+        child.matched_email = match.rows[0].email;
+      } else {
+        child.matched_account_id = null;
+        child.matched_family = null;
+        child.matched_email = null;
+      }
+    }
+
+    // Check for duplicate statement
+    if (parsed.voucher) {
+      const existing = await pool.query(
+        'SELECT id FROM col_cdc_statements WHERE voucher = $1',
+        [parsed.voucher]
+      );
+      if (existing.rows.length > 0) {
+        parsed.duplicate_warning = true;
+        parsed.existing_statement_id = existing.rows[0].id;
+      }
+    }
+
+    res.json(parsed);
+  } catch (err) {
+    console.error('CDC upload error:', err);
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// --- Save CDC Statement (after review) ---
+app.post('/api/cdc/save', async (req, res) => {
+  try {
+    const { parsed } = req.body;
+    if (!parsed) return res.status(400).json({ error: 'No parsed data provided' });
+
+    const client = await pool.connect();
+    try {
+      await client.query('BEGIN');
+
+      // Parse pay period dates
+      let periodStart = null, periodEnd = null;
+      if (parsed.pay_period) {
+        const parts = parsed.pay_period.split(' - ');
+        if (parts.length === 2) {
+          periodStart = parts[0].trim();
+          periodEnd = parts[1].trim();
+        }
+      }
+
+      // Insert statement
+      const stmt = await client.query(
+        `INSERT INTO col_cdc_statements (voucher, voucher_date, provider_id, center,
+          pay_period_start, pay_period_end, total_pay, net_total_pay,
+          total_children, children_paid, children_no_auth, children_duplicate,
+          status, raw_json)
+         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, 'pending', $13)
+         RETURNING id`,
+        [parsed.voucher, parsed.voucher_date || null, parsed.provider_id, parsed.center,
+         periodStart, periodEnd, parsed.total_pay, parsed.net_total_pay || parsed.total_pay,
+         parsed.summary?.total_children || 0, parsed.summary?.children_paid || 0,
+         parsed.summary?.children_no_auth || 0, parsed.summary?.children_duplicate || 0,
+         JSON.stringify(parsed)]
+      );
+      const statementId = stmt.rows[0].id;
+
+      // Insert children
+      for (const child of parsed.children) {
+        await client.query(
+          `INSERT INTO col_cdc_children (statement_id, account_id, child_name, child_name_normalized,
+            case_no, child_id_no, hours_auth, hours_billed, hours_paid,
+            fc, max_rate, amount_paid, error_desc, is_paid, is_no_auth, is_duplicate)
+           VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16)`,
+          [statementId, child.matched_account_id, child.name, child.name_normalized,
+           child.case_no, child.child_id, child.hours_auth, child.hours_billed, child.hours_paid,
+           child.fc, child.max_rate, child.amount_paid, child.error, child.is_paid,
+           child.is_no_auth, child.is_duplicate]
+        );
+      }
+
+      await client.query('COMMIT');
+
+      await pool.query(
+        'INSERT INTO col_activity_log (user_name, action, details) VALUES ($1, $2, $3)',
+        ['Mary', 'cdc_statement_uploaded', `${parsed.center}: Voucher ${parsed.voucher}, ${parsed.summary?.total_children || 0} children, $${parsed.total_pay}`]
+      );
+
+      res.json({ success: true, statement_id: statementId });
+    } catch (txErr) {
+      await client.query('ROLLBACK');
+      throw txErr;
+    } finally {
+      client.release();
+    }
+  } catch (err) {
+    console.error('CDC save error:', err);
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// --- Approve CDC Statement (shift no-auth balances to families) ---
+app.post('/api/cdc/approve/:id', async (req, res) => {
+  try {
+    const { id } = req.params;
+    const { shifts } = req.body; // Array of { child_id, account_id, amount }
+
+    const client = await pool.connect();
+    try {
+      await client.query('BEGIN');
+
+      let totalShifted = 0;
+      let familiesAffected = 0;
+
+      for (const shift of (shifts || [])) {
+        if (!shift.account_id || !shift.amount || shift.amount <= 0) continue;
+
+        // Update account balance
+        await client.query(
+          `UPDATE col_accounts SET
+            balance = balance + $1,
+            cdc_gap = cdc_gap + $1,
+            status = CASE WHEN status = 'active' THEN 'past_due' ELSE status END,
+            updated_at = NOW()
+           WHERE id = $2`,
+          [shift.amount, shift.account_id]
+        );
+
+        // Mark CDC child as shifted
+        await client.query(
+          `UPDATE col_cdc_children SET balance_shifted = true, shift_amount = $1
+           WHERE id = $2`,
+          [shift.amount, shift.cdc_child_id]
+        );
+
+        // Log the shift
+        await pool.query(
+          'INSERT INTO col_activity_log (user_name, action, account_id, details) VALUES ($1, $2, $3, $4)',
+          ['Mary', 'cdc_balance_shifted', shift.account_id,
+           `CDC No Authorization: $${shift.amount} shifted to family balance for ${shift.child_name}`]
+        );
+
+        totalShifted += shift.amount;
+        familiesAffected++;
+      }
+
+      // Mark statement as approved
+      await client.query(
+        `UPDATE col_cdc_statements SET status = 'approved', approved_by = 'Mary', approved_at = NOW()
+         WHERE id = $1`,
+        [id]
+      );
+
+      await client.query('COMMIT');
+
+      res.json({ success: true, total_shifted: totalShifted, families_affected: familiesAffected });
+    } catch (txErr) {
+      await client.query('ROLLBACK');
+      throw txErr;
+    } finally {
+      client.release();
+    }
+  } catch (err) {
+    console.error('CDC approve error:', err);
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// --- List CDC Statements ---
+app.get('/api/cdc/statements', async (req, res) => {
+  try {
+    const result = await pool.query(
+      `SELECT s.*,
+        (SELECT COUNT(*) FROM col_cdc_children WHERE statement_id = s.id AND is_no_auth = true AND balance_shifted = false) as pending_shifts
+       FROM col_cdc_statements s
+       ORDER BY s.created_at DESC LIMIT 50`
+    );
+    res.json(result.rows);
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// --- Get CDC Statement Detail ---
+app.get('/api/cdc/statements/:id', async (req, res) => {
+  try {
+    const stmt = await pool.query('SELECT * FROM col_cdc_statements WHERE id = $1', [req.params.id]);
+    if (stmt.rows.length === 0) return res.status(404).json({ error: 'Statement not found' });
+
+    const children = await pool.query(
+      `SELECT cc.*, a.family_name, a.email, a.phone
+       FROM col_cdc_children cc
+       LEFT JOIN col_accounts a ON cc.account_id = a.id
+       WHERE cc.statement_id = $1
+       ORDER BY cc.child_name`,
+      [req.params.id]
+    );
+
+    res.json({ ...stmt.rows[0], children: children.rows });
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// ============================================================
 // FRONTEND
 // ============================================================
 app.get('/', (req, res) => {
@@ -1204,6 +1507,7 @@ tr.paid-row { background: #E8F5E9; }
   <h1>TCC <span>Collections Hub</span></h1>
   <div class="header-actions">
     <button class="header-btn" onclick="showImportModal()">📤 Import CSV</button>
+    <button class="header-btn primary" onclick="showCDCModal()">🏛️ CDC Reconciliation</button>
     <button class="header-btn" onclick="showAddModal()">➕ Add Account</button>
     <button class="header-btn" onclick="loadActivity()">📋 Activity Log</button>
   </div>
@@ -1412,6 +1716,44 @@ tr.paid-row { background: #E8F5E9; }
       <button class="btn btn-outline" onclick="closeModal('editModal')">Cancel</button>
       <button class="btn btn-primary" onclick="saveEditAccount()">Save Changes</button>
     </div>
+  </div>
+</div>
+
+<!-- CDC Reconciliation Modal -->
+<div class="modal-overlay" id="cdcModal">
+  <div class="modal" style="max-width: 950px;">
+    <div class="modal-header">
+      <h2>CDC Reconciliation</h2>
+      <button class="modal-close" onclick="closeModal('cdcModal')">&times;</button>
+    </div>
+    <div class="modal-body" id="cdcBody">
+      <div style="display:flex; gap:16px; margin-bottom:16px;">
+        <button class="btn btn-primary btn-sm" onclick="showCDCUpload()" id="cdcUploadTab" style="opacity:1;">Upload Statement</button>
+        <button class="btn btn-outline btn-sm" onclick="showCDCHistory()" id="cdcHistoryTab">Statement History</button>
+      </div>
+      <div id="cdcUploadSection">
+        <div class="import-zone" style="padding:24px;">
+          <p style="font-size:14px; font-weight:600; margin-bottom:6px;">Upload CDC Statement PDF (DHS-1381)</p>
+          <p style="font-size:12px; color:#888; margin-bottom:10px;">Upload the biweekly CDC Statement of Payments from MDHHS</p>
+          <label for="cdcFile" style="padding:8px 16px; background:#E3F2FD; border-radius:6px; font-size:13px; cursor:pointer;">Choose PDF File</label>
+          <input type="file" id="cdcFile" accept=".pdf" onchange="handleCDCUpload(this.files[0])" style="display:none;">
+          <div id="cdcFileName" style="margin-top:8px; font-size:12px; color:#27AE60;"></div>
+        </div>
+        <div id="cdcParseResult" style="display:none; margin-top:16px;"></div>
+      </div>
+      <div id="cdcHistorySection" style="display:none;"></div>
+    </div>
+  </div>
+</div>
+
+<!-- CDC Review Modal -->
+<div class="modal-overlay" id="cdcReviewModal">
+  <div class="modal" style="max-width: 950px;">
+    <div class="modal-header">
+      <h2 id="cdcReviewTitle">Review CDC Statement</h2>
+      <button class="modal-close" onclick="closeModal('cdcReviewModal')">&times;</button>
+    </div>
+    <div class="modal-body" id="cdcReviewBody"></div>
   </div>
 </div>
 
@@ -1948,6 +2290,230 @@ async function executePlaygroundImport() {
     \`;
     toast('Imported ' + data.imported + ' accounts for ' + data.center + '!', 'success');
   } catch(e) { toast('Import failed', 'error'); }
+}
+
+// CDC Reconciliation
+let cdcParsedData = null;
+
+function showCDCModal() {
+  document.getElementById('cdcParseResult').style.display = 'none';
+  document.getElementById('cdcParseResult').innerHTML = '';
+  document.getElementById('cdcFileName').textContent = '';
+  showCDCUpload();
+  openModal('cdcModal');
+}
+
+function showCDCUpload() {
+  document.getElementById('cdcUploadSection').style.display = 'block';
+  document.getElementById('cdcHistorySection').style.display = 'none';
+  document.getElementById('cdcUploadTab').className = 'btn btn-primary btn-sm';
+  document.getElementById('cdcHistoryTab').className = 'btn btn-outline btn-sm';
+}
+
+async function showCDCHistory() {
+  document.getElementById('cdcUploadSection').style.display = 'none';
+  document.getElementById('cdcHistorySection').style.display = 'block';
+  document.getElementById('cdcUploadTab').className = 'btn btn-outline btn-sm';
+  document.getElementById('cdcHistoryTab').className = 'btn btn-primary btn-sm';
+
+  try {
+    const res = await fetch('/api/cdc/statements');
+    const stmts = await res.json();
+    const section = document.getElementById('cdcHistorySection');
+
+    if (stmts.length === 0) {
+      section.innerHTML = '<p style="color:#999; text-align:center; padding:20px;">No CDC statements uploaded yet.</p>';
+      return;
+    }
+
+    let html = '<table class="preview-table"><thead><tr><th>Date</th><th>Center</th><th>Voucher</th><th>Pay Period</th><th>Children</th><th>No Auth</th><th>Total Paid</th><th>Status</th><th></th></tr></thead><tbody>';
+    stmts.forEach(s => {
+      const statusClass = s.status === 'approved' ? 'badge-paid' : s.status === 'pending' ? 'badge-past_due' : 'badge-active';
+      const periodStart = s.pay_period_start ? new Date(s.pay_period_start).toLocaleDateString() : '';
+      const periodEnd = s.pay_period_end ? new Date(s.pay_period_end).toLocaleDateString() : '';
+      html += '<tr><td>' + new Date(s.created_at).toLocaleDateString() + '</td><td>' + esc(s.center) + '</td><td>' + esc(s.voucher) + '</td><td style="font-size:11px;">' + periodStart + ' - ' + periodEnd + '</td><td>' + s.total_children + '</td><td style="color:#E74C3C; font-weight:600;">' + s.children_no_auth + '</td><td>' + fmt(s.total_pay) + '</td><td><span class="badge ' + statusClass + '">' + s.status + '</span></td><td><button class="btn btn-sm btn-outline" onclick="viewCDCStatement(' + s.id + ')">View</button></td></tr>';
+    });
+    html += '</tbody></table>';
+    section.innerHTML = html;
+  } catch(e) { toast('Error loading CDC history', 'error'); }
+}
+
+async function handleCDCUpload(file) {
+  if (!file) return;
+  document.getElementById('cdcFileName').textContent = 'Parsing ' + file.name + '...';
+
+  const formData = new FormData();
+  formData.append('cdcFile', file);
+
+  try {
+    const res = await fetch('/api/cdc/upload', { method: 'POST', body: formData });
+    const data = await res.json();
+
+    if (data.error) { toast(data.error, 'error'); document.getElementById('cdcFileName').textContent = ''; return; }
+
+    cdcParsedData = data;
+    document.getElementById('cdcFileName').textContent = file.name;
+
+    const result = document.getElementById('cdcParseResult');
+    result.style.display = 'block';
+
+    const s = data.summary;
+    let html = '<div style="background:#f8f9fa; padding:16px; border-radius:8px; margin-bottom:16px;">';
+    html += '<div style="display:flex; justify-content:space-between; align-items:center; margin-bottom:12px;">';
+    html += '<div><strong>' + esc(data.center) + '</strong> - Voucher ' + esc(data.voucher) + '</div>';
+    html += '<div style="font-size:13px; color:#888;">Pay Period: ' + esc(data.pay_period) + '</div>';
+    html += '</div>';
+
+    if (data.duplicate_warning) {
+      html += '<div style="background:#FFF3E0; padding:10px; border-radius:6px; margin-bottom:12px; font-size:13px; color:#E65100;">This statement (voucher ' + esc(data.voucher) + ') has already been uploaded. Saving again will create a duplicate.</div>';
+    }
+
+    html += '<div style="display:grid; grid-template-columns:repeat(5,1fr); gap:12px; text-align:center;">';
+    html += '<div><div style="font-size:24px; font-weight:700; color:#1B4F72;">' + s.total_children + '</div><div style="font-size:11px; color:#888;">Total Children</div></div>';
+    html += '<div><div style="font-size:24px; font-weight:700; color:#27AE60;">' + s.children_paid + '</div><div style="font-size:11px; color:#888;">Paid</div></div>';
+    html += '<div><div style="font-size:24px; font-weight:700; color:#E74C3C;">' + s.children_no_auth + '</div><div style="font-size:11px; color:#888;">No Authorization</div></div>';
+    html += '<div><div style="font-size:24px; font-weight:700; color:#888;">' + s.children_duplicate + '</div><div style="font-size:11px; color:#888;">Duplicate</div></div>';
+    html += '<div><div style="font-size:24px; font-weight:700; color:#27AE60;">' + fmt(s.total_paid) + '</div><div style="font-size:11px; color:#888;">CDC Paid</div></div>';
+    html += '</div></div>';
+
+    // Show No Authorization children prominently
+    const noAuth = data.children.filter(c => c.is_no_auth);
+    if (noAuth.length > 0) {
+      html += '<div style="background:#FCE4EC; padding:16px; border-radius:8px; margin-bottom:16px;">';
+      html += '<h4 style="color:#C62828; margin-bottom:10px;">No Authorization - Family Responsibility</h4>';
+      html += '<table class="preview-table"><thead><tr><th>Child Name</th><th>Case No.</th><th>Matched Family</th><th>Family Email</th><th>Expected Amount</th></tr></thead><tbody>';
+      noAuth.forEach(c => {
+        const expected = c.hours_billed > 0 ? (c.hours_billed * c.max_rate).toFixed(2) : 'Unknown';
+        html += '<tr><td style="font-weight:600;">' + esc(c.name) + '</td><td style="font-size:11px;">' + esc(c.case_no) + '</td><td>' + (c.matched_family ? esc(c.matched_family) : '<span style="color:#E74C3C;">Not matched</span>') + '</td><td style="font-size:11px;">' + esc(c.matched_email || '-') + '</td><td style="font-weight:600; color:#E74C3C;">$' + expected + '</td></tr>';
+      });
+      html += '</tbody></table>';
+      html += '</div>';
+    }
+
+    // Show all paid children
+    const paid = data.children.filter(c => c.is_paid);
+    if (paid.length > 0) {
+      html += '<details style="margin-bottom:16px;"><summary style="cursor:pointer; font-weight:600; color:#1B4F72; margin-bottom:8px;">Paid Children (' + paid.length + ') - click to expand</summary>';
+      html += '<table class="preview-table"><thead><tr><th>Child</th><th>Hours Billed</th><th>Hours Paid</th><th>Rate</th><th>FC</th><th>Amount Paid</th><th>Notes</th></tr></thead><tbody>';
+      paid.forEach(c => {
+        html += '<tr><td>' + esc(c.name) + '</td><td>' + c.hours_billed + '</td><td>' + c.hours_paid + '</td><td>$' + (c.max_rate||0).toFixed(2) + '</td><td>$' + (c.fc||0).toFixed(2) + '</td><td style="color:#27AE60; font-weight:600;">' + fmt(c.amount_paid) + '</td><td style="font-size:11px; color:#888;">' + esc(c.error || '') + '</td></tr>';
+      });
+      html += '</tbody></table></details>';
+    }
+
+    html += '<div style="display:flex; gap:10px; margin-top:16px;">';
+    html += '<button class="btn btn-primary" onclick="saveCDCStatement()">Save Statement</button>';
+    html += '<span style="font-size:12px; color:#888; align-self:center;">Saves the statement for review. You can approve and shift balances after saving.</span>';
+    html += '</div>';
+
+    result.innerHTML = html;
+  } catch(e) { console.error(e); toast('Error parsing CDC statement', 'error'); document.getElementById('cdcFileName').textContent = ''; }
+}
+
+async function saveCDCStatement() {
+  if (!cdcParsedData) return toast('No parsed data to save', 'error');
+
+  try {
+    const res = await fetch('/api/cdc/save', {
+      method: 'POST', headers: {'Content-Type':'application/json'},
+      body: JSON.stringify({ parsed: cdcParsedData })
+    });
+    const data = await res.json();
+    if (data.error) return toast(data.error, 'error');
+
+    toast('CDC statement saved!', 'success');
+    viewCDCStatement(data.statement_id);
+  } catch(e) { toast('Error saving statement', 'error'); }
+}
+
+async function viewCDCStatement(id) {
+  try {
+    const res = await fetch('/api/cdc/statements/' + id);
+    const data = await res.json();
+    if (data.error) return toast(data.error, 'error');
+
+    document.getElementById('cdcReviewTitle').textContent = 'CDC Statement - ' + (data.center || '') + ' - ' + (data.voucher || '');
+
+    const noAuth = data.children.filter(c => c.is_no_auth && !c.balance_shifted);
+    const shifted = data.children.filter(c => c.balance_shifted);
+    const paid = data.children.filter(c => c.is_paid);
+
+    let html = '<div style="display:grid; grid-template-columns:repeat(4,1fr); gap:12px; text-align:center; background:#f8f9fa; padding:16px; border-radius:8px; margin-bottom:16px;">';
+    html += '<div><div style="font-size:20px; font-weight:700;">' + data.total_children + '</div><div style="font-size:11px; color:#888;">Children</div></div>';
+    html += '<div><div style="font-size:20px; font-weight:700; color:#27AE60;">' + fmt(data.total_pay) + '</div><div style="font-size:11px; color:#888;">CDC Paid</div></div>';
+    html += '<div><div style="font-size:20px; font-weight:700; color:#E74C3C;">' + noAuth.length + '</div><div style="font-size:11px; color:#888;">Pending Shifts</div></div>';
+    html += '<div><span class="badge badge-' + (data.status === 'approved' ? 'paid' : 'past_due') + '">' + data.status + '</span></div>';
+    html += '</div>';
+
+    if (noAuth.length > 0 && data.status !== 'approved') {
+      html += '<div style="background:#FCE4EC; padding:16px; border-radius:8px; margin-bottom:16px;">';
+      html += '<h4 style="color:#C62828; margin-bottom:10px;">No Authorization - Approve to Shift Balance to Families</h4>';
+      html += '<p style="font-size:12px; color:#888; margin-bottom:10px;">Approving will add these amounts to each family\'s balance and mark them as past due.</p>';
+      html += '<table class="preview-table"><thead><tr><th>Child</th><th>Matched Family</th><th>Email</th><th>Estimated Amount</th></tr></thead><tbody>';
+      noAuth.forEach(c => {
+        const est = c.hours_billed > 0 && c.max_rate > 0 ? (c.hours_billed * c.max_rate).toFixed(2) : '0.00';
+        html += '<tr><td style="font-weight:600;">' + esc(c.child_name) + '</td><td>' + (c.family_name ? esc(c.family_name) : '<span style="color:#E74C3C;">Not matched</span>') + '</td><td style="font-size:11px;">' + esc(c.email || '-') + '</td><td style="font-weight:600; color:#E74C3C;">$' + est + '</td></tr>';
+      });
+      html += '</tbody></table>';
+      html += '<button class="btn btn-danger" style="margin-top:12px;" onclick="approveCDCShifts(' + data.id + ')">Approve & Shift Balances to Families</button>';
+      html += '</div>';
+    }
+
+    if (shifted.length > 0) {
+      html += '<div style="background:#FFF3E0; padding:16px; border-radius:8px; margin-bottom:16px;">';
+      html += '<h4 style="color:#E65100; margin-bottom:10px;">Already Shifted to Families (' + shifted.length + ')</h4>';
+      shifted.forEach(c => {
+        html += '<div style="padding:4px 0; font-size:13px;">' + esc(c.child_name) + ' - $' + (c.shift_amount||0).toFixed(2) + ' shifted to ' + esc(c.family_name || 'unknown') + '</div>';
+      });
+      html += '</div>';
+    }
+
+    if (paid.length > 0) {
+      html += '<details><summary style="cursor:pointer; font-weight:600; color:#1B4F72; margin-bottom:8px;">Paid Children (' + paid.length + ')</summary>';
+      html += '<table class="preview-table"><thead><tr><th>Child</th><th>Amount Paid</th><th>Hours</th><th>Notes</th></tr></thead><tbody>';
+      paid.forEach(c => {
+        html += '<tr><td>' + esc(c.child_name) + '</td><td style="color:#27AE60;">' + fmt(c.amount_paid) + '</td><td>' + c.hours_paid + '/' + c.hours_billed + '</td><td style="font-size:11px;">' + esc(c.error_desc||'') + '</td></tr>';
+      });
+      html += '</tbody></table></details>';
+    }
+
+    document.getElementById('cdcReviewBody').innerHTML = html;
+    closeModal('cdcModal');
+    openModal('cdcReviewModal');
+  } catch(e) { console.error(e); toast('Error loading statement', 'error'); }
+}
+
+async function approveCDCShifts(statementId) {
+  try {
+    const res = await fetch('/api/cdc/statements/' + statementId);
+    const data = await res.json();
+
+    const noAuth = data.children.filter(c => c.is_no_auth && !c.balance_shifted && c.account_id);
+    const shifts = noAuth.map(c => ({
+      cdc_child_id: c.id,
+      account_id: c.account_id,
+      child_name: c.child_name,
+      amount: c.hours_billed > 0 && c.max_rate > 0 ? parseFloat((c.hours_billed * c.max_rate).toFixed(2)) : 0
+    })).filter(s => s.amount > 0);
+
+    if (shifts.length === 0) return toast('No matched families with amounts to shift', 'error');
+
+    const totalToShift = shifts.reduce((sum, s) => sum + s.amount, 0);
+    if (!confirm('This will add $' + totalToShift.toFixed(2) + ' to ' + shifts.length + ' family accounts. Continue?')) return;
+
+    const approveRes = await fetch('/api/cdc/approve/' + statementId, {
+      method: 'POST', headers: {'Content-Type':'application/json'},
+      body: JSON.stringify({ shifts })
+    });
+    const result = await approveRes.json();
+
+    if (result.error) return toast(result.error, 'error');
+
+    toast('Shifted $' + result.total_shifted.toFixed(2) + ' to ' + result.families_affected + ' families', 'success');
+    viewCDCStatement(statementId);
+    loadStats();
+    loadAccounts();
+  } catch(e) { console.error(e); toast('Error approving shifts', 'error'); }
 }
 
 // Activity Log
