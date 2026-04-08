@@ -1,0 +1,1476 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>TCC Billing Hub</title>
+<link href="https://fonts.googleapis.com/css2?family=DM+Serif+Display:ital@0;1&family=DM+Sans:wght@300;400;500;600&display=swap" rel="stylesheet">
+<style>
+:root {
+  --navy: #1a2744;
+  --navy-light: #243259;
+  --gold: #c9a84c;
+  --gold-light: #e8c96a;
+  --cream: #faf8f3;
+  --white: #ffffff;
+  --red: #c0392b;
+  --red-light: #fdecea;
+  --amber: #d68910;
+  --amber-light: #fef9ec;
+  --green: #1e8449;
+  --green-light: #eafaf1;
+  --blue: #1a5276;
+  --blue-light: #eaf4fb;
+  --gray: #6c7a89;
+  --gray-light: #f4f4f6;
+  --border: #e2e0d8;
+  --shadow: 0 2px 12px rgba(26,39,68,0.10);
+  --shadow-lg: 0 8px 32px rgba(26,39,68,0.15);
+}
+
+* { margin:0; padding:0; box-sizing:border-box; }
+
+body {
+  font-family: 'DM Sans', sans-serif;
+  background: var(--cream);
+  color: var(--navy);
+  min-height: 100vh;
+}
+
+/* ── Layout ── */
+.app { display:flex; min-height:100vh; }
+
+.sidebar {
+  width: 240px;
+  background: var(--navy);
+  color: var(--white);
+  display: flex;
+  flex-direction: column;
+  position: fixed;
+  top: 0; left: 0; bottom: 0;
+  z-index: 100;
+}
+
+.sidebar-logo {
+  padding: 24px 20px 20px;
+  border-bottom: 1px solid rgba(255,255,255,0.1);
+}
+.sidebar-logo h1 {
+  font-family: 'DM Serif Display', serif;
+  font-size: 18px;
+  color: var(--gold-light);
+  line-height: 1.2;
+}
+.sidebar-logo p { font-size: 11px; color: rgba(255,255,255,0.5); margin-top:3px; letter-spacing:.5px; text-transform:uppercase; }
+
+.nav-section { padding: 16px 0 8px; }
+.nav-label { font-size: 10px; letter-spacing: 1px; text-transform: uppercase; color: rgba(255,255,255,0.35); padding: 0 20px 8px; }
+
+.nav-item {
+  display: flex; align-items: center; gap: 10px;
+  padding: 9px 20px;
+  cursor: pointer;
+  font-size: 13.5px;
+  font-weight: 400;
+  color: rgba(255,255,255,0.7);
+  transition: all .15s;
+  border-left: 3px solid transparent;
+}
+.nav-item:hover { background: rgba(255,255,255,0.07); color: var(--white); }
+.nav-item.active { background: rgba(201,168,76,0.15); color: var(--gold-light); border-left-color: var(--gold); }
+.nav-item .badge {
+  margin-left: auto;
+  background: var(--red);
+  color: white;
+  font-size: 10px;
+  font-weight: 600;
+  padding: 1px 6px;
+  border-radius: 10px;
+  min-width: 18px;
+  text-align: center;
+}
+.nav-icon { font-size:15px; width:18px; text-align:center; }
+
+.main { margin-left: 240px; flex:1; }
+
+.topbar {
+  background: var(--white);
+  border-bottom: 1px solid var(--border);
+  padding: 14px 32px;
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  position: sticky; top: 0; z-index: 50;
+}
+.topbar h2 { font-family:'DM Serif Display',serif; font-size:22px; font-weight:400; }
+.topbar-actions { display:flex; gap:10px; align-items:center; }
+
+.content { padding: 28px 32px; }
+
+/* ── Cards ── */
+.card {
+  background: var(--white);
+  border: 1px solid var(--border);
+  border-radius: 10px;
+  padding: 20px 24px;
+  margin-bottom: 20px;
+  box-shadow: var(--shadow);
+}
+.card-title {
+  font-family:'DM Serif Display',serif;
+  font-size:16px; font-weight:400;
+  margin-bottom:16px;
+  display:flex; align-items:center; gap:8px;
+}
+
+/* ── Stats Grid ── */
+.stats-grid { display:grid; grid-template-columns:repeat(auto-fit,minmax(180px,1fr)); gap:16px; margin-bottom:24px; }
+.stat-card {
+  background: var(--white);
+  border: 1px solid var(--border);
+  border-radius: 10px;
+  padding: 18px 20px;
+  box-shadow: var(--shadow);
+  position: relative;
+  overflow: hidden;
+}
+.stat-card::before {
+  content:'';
+  position:absolute; top:0; left:0; right:0; height:3px;
+}
+.stat-card.danger::before { background:var(--red); }
+.stat-card.warning::before { background:var(--amber); }
+.stat-card.success::before { background:var(--green); }
+.stat-card.info::before { background:var(--blue); }
+.stat-number { font-family:'DM Serif Display',serif; font-size:36px; font-weight:400; line-height:1; }
+.stat-card.danger .stat-number { color:var(--red); }
+.stat-card.warning .stat-number { color:var(--amber); }
+.stat-card.success .stat-number { color:var(--green); }
+.stat-card.info .stat-number { color:var(--blue); }
+.stat-label { font-size:12px; color:var(--gray); margin-top:6px; font-weight:500; text-transform:uppercase; letter-spacing:.5px; }
+
+/* ── Flags ── */
+.flag-item {
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  padding: 12px 16px;
+  margin-bottom: 10px;
+  display: flex;
+  align-items: flex-start;
+  gap: 14px;
+  transition: all .15s;
+}
+.flag-item:hover { box-shadow: var(--shadow); }
+.flag-item.MISSING_FROM_STATEMENT, .flag-item.NO_AUTHORIZATION { border-left: 4px solid var(--red); background: var(--red-light); }
+.flag-item.NOT_FOUND_IN_DHS { border-left: 4px solid var(--amber); background: var(--amber-light); }
+.flag-item.NEW_CHILD_NO_STATUS { border-left: 4px solid var(--blue); background: var(--blue-light); }
+.flag-item.AFTER_CLOSING_PICKUP { border-left: 4px solid var(--amber); background: var(--amber-light); }
+.flag-icon { font-size:20px; margin-top:1px; flex-shrink:0; }
+.flag-body { flex:1; }
+.flag-name { font-weight:600; font-size:14px; }
+.flag-detail { font-size:13px; color:var(--gray); margin-top:2px; }
+.flag-meta { font-size:11px; color:var(--gray); margin-top:4px; }
+.flag-actions { display:flex; gap:8px; margin-top:8px; }
+
+/* ── Tables ── */
+.table-wrap { overflow-x:auto; }
+table { width:100%; border-collapse:collapse; font-size:13.5px; }
+th { background:var(--navy); color:var(--gold-light); font-weight:500; padding:10px 14px; text-align:left; font-size:12px; letter-spacing:.3px; }
+td { padding:9px 14px; border-bottom:1px solid var(--border); vertical-align:middle; }
+tr:hover td { background:#f8f7f3; }
+.badge-pill {
+  display:inline-block;
+  padding:2px 10px;
+  border-radius:12px;
+  font-size:11px;
+  font-weight:600;
+  letter-spacing:.3px;
+}
+.badge-noauth { background:var(--red-light); color:var(--red); }
+.badge-paid { background:var(--green-light); color:var(--green); }
+.badge-missing { background:var(--amber-light); color:var(--amber); }
+.badge-pending { background:var(--gray-light); color:var(--gray); }
+.badge-cdc { background:#e8f4fd; color:#1a5276; }
+.badge-gsrp { background:#f0e6ff; color:#6c3483; }
+.badge-private { background:var(--gray-light); color:var(--gray); }
+.badge-both { background:#fef9ec; color:#d68910; }
+.badge-unknown { background:#fce4ec; color:#c62828; }
+
+/* ── Buttons ── */
+.btn {
+  padding: 8px 16px;
+  border-radius: 7px;
+  font-size: 13px;
+  font-weight: 500;
+  cursor: pointer;
+  border: none;
+  transition: all .15s;
+  font-family: inherit;
+}
+.btn-primary { background:var(--navy); color:var(--white); }
+.btn-primary:hover { background:var(--navy-light); }
+.btn-gold { background:var(--gold); color:var(--navy); }
+.btn-gold:hover { background:var(--gold-light); }
+.btn-ghost { background:transparent; color:var(--navy); border:1px solid var(--border); }
+.btn-ghost:hover { background:var(--gray-light); }
+.btn-danger { background:var(--red); color:var(--white); }
+.btn-sm { padding:5px 10px; font-size:12px; }
+.btn-green { background:var(--green); color:white; }
+.btn-green:hover { opacity:.85; }
+
+/* ── Forms ── */
+.form-row { display:flex; gap:14px; flex-wrap:wrap; margin-bottom:14px; }
+.form-group { display:flex; flex-direction:column; gap:5px; flex:1; min-width:160px; }
+label { font-size:12px; font-weight:600; color:var(--navy); text-transform:uppercase; letter-spacing:.4px; }
+input, select, textarea {
+  padding: 9px 12px;
+  border: 1px solid var(--border);
+  border-radius: 7px;
+  font-size: 13.5px;
+  font-family: inherit;
+  background: var(--white);
+  color: var(--navy);
+  transition: border-color .15s;
+}
+input:focus, select:focus, textarea:focus {
+  outline:none;
+  border-color: var(--gold);
+  box-shadow: 0 0 0 3px rgba(201,168,76,0.15);
+}
+.checkbox-row { display:flex; align-items:center; gap:8px; font-size:13.5px; }
+.checkbox-row input[type=checkbox] { width:16px; height:16px; accent-color:var(--navy); }
+
+/* ── Tabs ── */
+.tabs { display:flex; gap:2px; border-bottom:2px solid var(--border); margin-bottom:20px; }
+.tab {
+  padding:10px 18px;
+  cursor:pointer;
+  font-size:13.5px;
+  font-weight:500;
+  color:var(--gray);
+  border-bottom:2px solid transparent;
+  margin-bottom:-2px;
+  transition:all .15s;
+}
+.tab:hover { color:var(--navy); }
+.tab.active { color:var(--navy); border-bottom-color:var(--gold); font-weight:600; }
+
+/* ── Upload zone ── */
+.upload-zone {
+  border: 2px dashed var(--border);
+  border-radius: 10px;
+  padding: 32px;
+  text-align: center;
+  cursor: pointer;
+  transition: all .2s;
+  background: var(--gray-light);
+}
+.upload-zone:hover, .upload-zone.drag { border-color:var(--gold); background:var(--amber-light); }
+.upload-zone p { font-size:14px; color:var(--gray); margin-top:8px; }
+
+/* ── Center selector ── */
+.center-selector {
+  display: flex;
+  gap: 8px;
+  margin-bottom: 20px;
+  flex-wrap: wrap;
+}
+.center-btn {
+  padding: 7px 16px;
+  border-radius: 20px;
+  border: 2px solid var(--border);
+  background: var(--white);
+  cursor: pointer;
+  font-size: 13px;
+  font-weight: 500;
+  transition: all .15s;
+  font-family: inherit;
+  color: var(--gray);
+}
+.center-btn.active { border-color:var(--navy); background:var(--navy); color:var(--white); }
+.center-btn:hover:not(.active) { border-color:var(--navy); color:var(--navy); }
+
+/* ── Loading / Empty ── */
+.loading { text-align:center; padding:40px; color:var(--gray); font-size:14px; }
+.empty { text-align:center; padding:40px; color:var(--gray); }
+.empty-icon { font-size:48px; margin-bottom:12px; }
+
+/* ── Modal ── */
+.modal-overlay {
+  display:none;
+  position:fixed; inset:0;
+  background:rgba(0,0,0,0.5);
+  z-index:200;
+  align-items:center;
+  justify-content:center;
+}
+.modal-overlay.open { display:flex; }
+.modal {
+  background:var(--white);
+  border-radius:12px;
+  padding:28px;
+  width:90%;
+  max-width:500px;
+  max-height:90vh;
+  overflow-y:auto;
+  box-shadow: var(--shadow-lg);
+}
+.modal-title { font-family:'DM Serif Display',serif; font-size:20px; margin-bottom:20px; }
+.modal-footer { display:flex; gap:10px; justify-content:flex-end; margin-top:20px; }
+
+/* ── Billing output ── */
+.billing-block {
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  margin-bottom: 12px;
+  overflow: hidden;
+}
+.billing-block-header {
+  background: var(--navy);
+  color: var(--white);
+  padding: 10px 16px;
+  display:flex; align-items:center; justify-content:space-between;
+  font-size:14px;
+  font-weight:500;
+}
+.billing-block-body { padding:12px 16px; }
+.time-entry {
+  display:flex; gap:12px; align-items:center;
+  padding:6px 0;
+  border-bottom:1px solid var(--gray-light);
+  font-size:13px;
+}
+.time-entry:last-child { border-bottom:none; }
+.time-tag {
+  font-size:11px;
+  padding:2px 8px;
+  border-radius:4px;
+  font-weight:600;
+}
+.time-tag.cdc { background:#e8f4fd; color:#1a5276; }
+.time-tag.gsrp { background:#f0e6ff; color:#6c3483; }
+.time-tag.private { background:var(--gray-light); color:var(--gray); }
+.time-tag.fee { background:var(--red-light); color:var(--red); }
+
+/* ── Toasts ── */
+#toast-container { position:fixed; bottom:24px; right:24px; z-index:1000; display:flex; flex-direction:column; gap:8px; }
+.toast {
+  background:var(--navy);
+  color:var(--white);
+  padding:12px 18px;
+  border-radius:8px;
+  font-size:13.5px;
+  box-shadow:var(--shadow-lg);
+  animation:slideIn .2s ease;
+}
+.toast.success { background:var(--green); }
+.toast.error { background:var(--red); }
+.toast.warning { background:var(--amber); }
+@keyframes slideIn { from{transform:translateX(60px);opacity:0} to{transform:none;opacity:1} }
+
+/* ── Period status ── */
+.period-row { display:flex; align-items:center; gap:12px; padding:10px 0; border-bottom:1px solid var(--gray-light); font-size:13.5px; }
+.period-num { font-family:'DM Serif Display',serif; font-size:22px; color:var(--navy); min-width:50px; }
+.period-dates { color:var(--gray); font-size:12px; }
+.period-status { margin-left:auto; display:flex; gap:8px; }
+
+input[type="file"] { display:none; }
+</style>
+</head>
+<body>
+<div class="app">
+
+<!-- Sidebar -->
+<nav class="sidebar">
+  <div class="sidebar-logo">
+    <h1>TCC Billing Hub</h1>
+    <p>The Children's Center</p>
+  </div>
+  <div class="nav-section">
+    <div class="nav-label">Overview</div>
+    <div class="nav-item active" onclick="showPage('dashboard')">
+      <span class="nav-icon">📊</span> Dashboard
+      <span class="badge" id="flag-badge" style="display:none">0</span>
+    </div>
+  </div>
+  <div class="nav-section">
+    <div class="nav-label">CDC Billing</div>
+    <div class="nav-item" onclick="showPage('cdc-reconciliation')">
+      <span class="nav-icon">📋</span> Reconciliation
+    </div>
+    <div class="nav-item" onclick="showPage('billing-periods')">
+      <span class="nav-icon">📅</span> Billing Periods
+    </div>
+  </div>
+  <div class="nav-section">
+    <div class="nav-label">Attendance</div>
+    <div class="nav-item" onclick="showPage('upload-attendance')">
+      <span class="nav-icon">⬆️</span> Upload Timesheets
+    </div>
+    <div class="nav-item" onclick="showPage('billing-engine')">
+      <span class="nav-icon">⚙️</span> Billing Engine
+    </div>
+  </div>
+  <div class="nav-section">
+    <div class="nav-label">Management</div>
+    <div class="nav-item" onclick="showPage('children')">
+      <span class="nav-icon">👶</span> Child Roster
+    </div>
+    <div class="nav-item" onclick="showPage('flags')">
+      <span class="nav-icon">🚩</span> All Flags
+    </div>
+    <div class="nav-item" onclick="showPage('no-school-days')">
+      <span class="nav-icon">🏫</span> No-School Days
+    </div>
+    <div class="nav-item" onclick="showPage('tuition-rates')">
+      <span class="nav-icon">💰</span> Tuition Rates
+    </div>
+  </div>
+</nav>
+
+<!-- Main -->
+<div class="main">
+  <div class="topbar">
+    <h2 id="page-title">Dashboard</h2>
+    <div class="topbar-actions" id="topbar-actions"></div>
+  </div>
+  <div class="content" id="content"></div>
+</div>
+
+</div>
+
+<!-- Modals -->
+<div class="modal-overlay" id="modal-overlay">
+  <div class="modal" id="modal-content"></div>
+</div>
+
+<div id="toast-container"></div>
+
+<script>
+// ── Config ────────────────────────────────────────────────────────────────────
+const TOKEN = new URLSearchParams(location.search).get('token') || localStorage.getItem('tcc_token') || '';
+if (TOKEN) localStorage.setItem('tcc_token', TOKEN);
+
+const CENTERS = ['Niles', 'Peace', 'Montessori'];
+let currentCenter = 'Niles';
+
+const FLAG_ICONS = {
+  NO_AUTHORIZATION: '🔴',
+  MISSING_FROM_STATEMENT: '🔴',
+  NOT_FOUND_IN_DHS: '🟡',
+  NEW_CHILD_NO_STATUS: '🔵',
+  AFTER_CLOSING_PICKUP: '🟡',
+};
+const FLAG_LABELS = {
+  NO_AUTHORIZATION: 'No Authorization',
+  MISSING_FROM_STATEMENT: 'Missing from Statement',
+  NOT_FOUND_IN_DHS: 'Not Found in DHS',
+  NEW_CHILD_NO_STATUS: 'Unknown Subsidy Status',
+  AFTER_CLOSING_PICKUP: 'Late Pickup — After Closing',
+};
+
+// ── API ───────────────────────────────────────────────────────────────────────
+async function api(method, path, body) {
+  const opts = {
+    method,
+    headers: { 'Content-Type':'application/json', 'Authorization': `Bearer ${TOKEN}` }
+  };
+  if (body) opts.body = JSON.stringify(body);
+  const res = await fetch('/api' + path, opts);
+  if (!res.ok) throw new Error(await res.text());
+  return res.json();
+}
+
+async function uploadFile(path, formData) {
+  const res = await fetch('/api' + path, {
+    method: 'POST',
+    headers: { 'Authorization': `Bearer ${TOKEN}` },
+    body: formData
+  });
+  if (!res.ok) throw new Error(await res.text());
+  return res.json();
+}
+
+// ── Toast ─────────────────────────────────────────────────────────────────────
+function toast(msg, type='info') {
+  const t = document.createElement('div');
+  t.className = `toast ${type}`;
+  t.textContent = msg;
+  document.getElementById('toast-container').appendChild(t);
+  setTimeout(() => t.remove(), 3500);
+}
+
+// ── Modal ─────────────────────────────────────────────────────────────────────
+function openModal(html) {
+  document.getElementById('modal-content').innerHTML = html;
+  document.getElementById('modal-overlay').classList.add('open');
+}
+function closeModal() {
+  document.getElementById('modal-overlay').classList.remove('open');
+}
+document.getElementById('modal-overlay').addEventListener('click', e => {
+  if (e.target === document.getElementById('modal-overlay')) closeModal();
+});
+
+// ── Center Selector HTML ──────────────────────────────────────────────────────
+function centerSelector(onChange) {
+  return `<div class="center-selector">
+    ${CENTERS.map(c => `<button class="center-btn ${c===currentCenter?'active':''}"
+      onclick="currentCenter='${c}';${onChange}">${c}</button>`).join('')}
+  </div>`;
+}
+
+// ── Page Router ───────────────────────────────────────────────────────────────
+const pages = {};
+function showPage(name) {
+  document.querySelectorAll('.nav-item').forEach(el => el.classList.remove('active'));
+  document.querySelectorAll('.nav-item').forEach(el => {
+    if (el.textContent.trim().toLowerCase().includes(name.replace(/-/g,' ').split(' ')[0])) el.classList.add('active');
+  });
+  pages[name]?.();
+}
+
+// ── Dashboard ─────────────────────────────────────────────────────────────────
+pages['dashboard'] = async () => {
+  document.getElementById('page-title').textContent = 'Dashboard';
+  document.getElementById('topbar-actions').innerHTML = '';
+  const content = document.getElementById('content');
+  content.innerHTML = '<div class="loading">Loading dashboard…</div>';
+  try {
+    const [dash, flags] = await Promise.all([
+      api('GET', '/dashboard'),
+      api('GET', '/flags?resolved=false')
+    ]);
+
+    // Update badge
+    const total = flags.length;
+    const badge = document.getElementById('flag-badge');
+    badge.textContent = total;
+    badge.style.display = total > 0 ? 'inline-block' : 'none';
+
+    const noAuthCount = flags.filter(f => f.flag_type==='NO_AUTHORIZATION').length;
+    const missingCount = flags.filter(f => f.flag_type==='MISSING_FROM_STATEMENT').length;
+    const notFoundCount = flags.filter(f => f.flag_type==='NOT_FOUND_IN_DHS').length;
+    const newChildCount = flags.filter(f => f.flag_type==='NEW_CHILD_NO_STATUS').length;
+    const latePickup = flags.filter(f => f.flag_type==='AFTER_CLOSING_PICKUP').length;
+
+    content.innerHTML = `
+      <div class="stats-grid">
+        <div class="stat-card danger">
+          <div class="stat-number">${noAuthCount + missingCount}</div>
+          <div class="stat-label">CDC Billing Issues</div>
+        </div>
+        <div class="stat-card warning">
+          <div class="stat-number">${notFoundCount}</div>
+          <div class="stat-label">Not Found in DHS</div>
+        </div>
+        <div class="stat-card info">
+          <div class="stat-number">${newChildCount}</div>
+          <div class="stat-label">Unknown Subsidy Status</div>
+        </div>
+        <div class="stat-card warning">
+          <div class="stat-number">${latePickup}</div>
+          <div class="stat-label">Late Pickup Alerts</div>
+        </div>
+        <div class="stat-card ${total > 0 ? 'danger' : 'success'}">
+          <div class="stat-number">${total}</div>
+          <div class="stat-label">Total Open Flags</div>
+        </div>
+      </div>
+
+      ${dash.overduePeriods?.length ? `
+      <div class="card">
+        <div class="card-title">⚠️ Overdue Billing Periods</div>
+        ${dash.overduePeriods.map(p => `
+          <div class="period-row">
+            <div class="period-num">${p.period_number}</div>
+            <div>
+              <div>${fmtDate(p.start_date)} – ${fmtDate(p.end_date)}</div>
+              <div class="period-dates">Deadline: ${fmtDate(p.reporting_deadline)}</div>
+            </div>
+            <div class="period-status">
+              <span class="badge-pill badge-pending">Billing Pending</span>
+            </div>
+          </div>
+        `).join('')}
+      </div>` : ''}
+
+      <div class="card">
+        <div class="card-title">🚩 Open Flags — Action Required</div>
+        ${flags.length === 0 ? `
+          <div class="empty"><div class="empty-icon">✅</div><p>No open flags. All clear!</p></div>
+        ` : flags.slice(0,10).map(f => renderFlag(f)).join('')}
+        ${flags.length > 10 ? `<button class="btn btn-ghost" style="margin-top:8px" onclick="showPage('flags')">View all ${flags.length} flags →</button>` : ''}
+      </div>
+    `;
+  } catch(e) { content.innerHTML = `<div class="loading">Error: ${e.message}</div>`; }
+};
+
+function renderFlag(f) {
+  const icon = FLAG_ICONS[f.flag_type] || '🔵';
+  const label = FLAG_LABELS[f.flag_type] || f.flag_type;
+  return `
+  <div class="flag-item ${f.flag_type}">
+    <div class="flag-icon">${icon}</div>
+    <div class="flag-body">
+      <div class="flag-name">${f.child_name || 'Unknown Child'}</div>
+      <div class="flag-detail">${f.flag_detail || ''}</div>
+      <div class="flag-meta">${f.center} · ${label}${f.period_number?' · Period '+f.period_number:''}${f.attend_date?' · '+fmtDate(f.attend_date):''} · ${timeAgo(f.created_at)}</div>
+      <div class="flag-actions">
+        <button class="btn btn-sm btn-green" onclick="resolveFlag(${f.id})">✓ Resolve</button>
+      </div>
+    </div>
+  </div>`;
+}
+
+// ── Flags Page ─────────────────────────────────────────────────────────────────
+pages['flags'] = async () => {
+  document.getElementById('page-title').textContent = 'All Flags';
+  document.getElementById('topbar-actions').innerHTML = '';
+  const content = document.getElementById('content');
+  content.innerHTML = '<div class="loading">Loading flags…</div>';
+  try {
+    const flags = await api('GET', '/flags?resolved=false');
+    let html = `
+      <div class="tabs">
+        <div class="tab active" id="tab-open" onclick="switchFlagTab('open')">Open (${flags.length})</div>
+        <div class="tab" id="tab-resolved" onclick="switchFlagTab('resolved')">Resolved</div>
+      </div>
+      <div id="flags-list">
+        ${flags.length === 0
+          ? `<div class="empty"><div class="empty-icon">✅</div><p>No open flags!</p></div>`
+          : flags.map(f => renderFlag(f)).join('')}
+      </div>`;
+    content.innerHTML = html;
+  } catch(e) { content.innerHTML = `<div class="loading">Error: ${e.message}</div>`; }
+};
+
+async function switchFlagTab(tab) {
+  document.querySelectorAll('.tab').forEach(t => t.classList.remove('active'));
+  document.getElementById(`tab-${tab}`)?.classList.add('active');
+  const flags = await api('GET', `/flags?resolved=${tab==='resolved'}`);
+  document.getElementById('flags-list').innerHTML = flags.length === 0
+    ? `<div class="empty"><div class="empty-icon">${tab==='open'?'✅':'📭'}</div><p>No ${tab} flags.</p></div>`
+    : flags.map(f => `
+      <div class="flag-item ${f.flag_type}" style="${f.resolved?'opacity:.6':''}">
+        <div class="flag-icon">${FLAG_ICONS[f.flag_type]||'🔵'}</div>
+        <div class="flag-body">
+          <div class="flag-name">${f.child_name}</div>
+          <div class="flag-detail">${f.flag_detail||''}</div>
+          <div class="flag-meta">${f.center} · ${FLAG_LABELS[f.flag_type]||f.flag_type}${f.period_number?' · Period '+f.period_number:''} · ${timeAgo(f.created_at)}</div>
+          ${!f.resolved ? `<div class="flag-actions"><button class="btn btn-sm btn-green" onclick="resolveFlag(${f.id})">✓ Resolve</button></div>` : `<div class="flag-meta" style="color:var(--green)">✓ Resolved ${fmtDate(f.resolved_at)} by ${f.resolved_by}</div>`}
+        </div>
+      </div>`).join('');
+}
+
+async function resolveFlag(id) {
+  try {
+    await api('PUT', `/flags/${id}/resolve`, { resolved_by: 'admin' });
+    toast('Flag resolved', 'success');
+    showPage('flags');
+    // Refresh badge
+    const flags = await api('GET', '/flags?resolved=false');
+    const badge = document.getElementById('flag-badge');
+    badge.textContent = flags.length;
+    badge.style.display = flags.length > 0 ? 'inline-block' : 'none';
+  } catch(e) { toast('Error: '+e.message, 'error'); }
+}
+
+// ── Child Roster ──────────────────────────────────────────────────────────────
+pages['children'] = async () => {
+  document.getElementById('page-title').textContent = 'Child Roster';
+  document.getElementById('topbar-actions').innerHTML =
+    `<button class="btn btn-gold" onclick="openAddChild()">+ Add Child</button>`;
+  const content = document.getElementById('content');
+  content.innerHTML = '<div class="loading">Loading roster…</div>';
+
+  const renderRoster = async () => {
+    const children = await api('GET', `/children?center=${currentCenter}`);
+    content.innerHTML = `
+      ${centerSelector('renderChildren()')}
+      <div class="card" style="padding:0">
+        <div class="table-wrap">
+          <table>
+            <thead><tr>
+              <th>Child Name</th>
+              <th>Status</th>
+              <th>GSRP</th>
+              <th>CDC</th>
+              <th>School Age</th>
+              <th>Active</th>
+              <th>Notes</th>
+              <th></th>
+            </tr></thead>
+            <tbody>
+            ${children.length === 0 ? `<tr><td colspan="8" style="text-align:center;padding:32px;color:var(--gray)">No children found for ${currentCenter}</td></tr>` :
+              children.map(c => `
+              <tr>
+                <td><strong>${c.last_name}, ${c.first_name}</strong></td>
+                <td>${subsidyBadge(c.subsidy_type)}</td>
+                <td>${c.is_gsrp ? '✅' : '—'}</td>
+                <td>${c.is_cdc ? '✅' : '—'}</td>
+                <td>${c.is_school_age ? '✅' : '—'}</td>
+                <td>${c.is_active ? '✅' : '<span style="color:var(--red)">Inactive</span>'}</td>
+                <td style="font-size:12px;color:var(--gray);max-width:200px">${c.notes||''}</td>
+                <td><button class="btn btn-sm btn-ghost" onclick='editChild(${JSON.stringify(c)})'>Edit</button></td>
+              </tr>`).join('')}
+            </tbody>
+          </table>
+        </div>
+      </div>`;
+  };
+  window.renderChildren = renderRoster;
+  await renderRoster();
+};
+
+function subsidyBadge(type) {
+  const map = {
+    cdc: '<span class="badge-pill badge-cdc">CDC</span>',
+    gsrp: '<span class="badge-pill badge-gsrp">GSRP</span>',
+    private_pay: '<span class="badge-pill badge-private">Private Pay</span>',
+    cdc_gsrp: '<span class="badge-pill badge-both">CDC + GSRP</span>',
+    unknown: '<span class="badge-pill badge-unknown">⚠ Unknown</span>',
+  };
+  return map[type] || `<span class="badge-pill badge-pending">${type}</span>`;
+}
+
+function openAddChild() {
+  openModal(`
+    <div class="modal-title">Add Child</div>
+    <div class="form-row">
+      <div class="form-group"><label>First Name</label><input id="fn" placeholder="First name"></div>
+      <div class="form-group"><label>Last Name</label><input id="ln" placeholder="Last name"></div>
+    </div>
+    <div class="form-row">
+      <div class="form-group"><label>Center</label>
+        <select id="ctr">${CENTERS.map(c=>`<option ${c===currentCenter?'selected':''}>${c}</option>`).join('')}</select>
+      </div>
+      <div class="form-group"><label>Subsidy Type</label>
+        <select id="stype">
+          <option value="private_pay">Private Pay</option>
+          <option value="cdc">CDC</option>
+          <option value="gsrp">GSRP</option>
+          <option value="cdc_gsrp">CDC + GSRP</option>
+          <option value="unknown">Unknown</option>
+        </select>
+      </div>
+    </div>
+    <div class="form-row">
+      <div class="form-group">
+        <label>Flags</label>
+        <div class="checkbox-row"><input type="checkbox" id="ig">GSRP</div>
+        <div class="checkbox-row"><input type="checkbox" id="ic">CDC</div>
+        <div class="checkbox-row"><input type="checkbox" id="isa">School Age</div>
+      </div>
+    </div>
+    <div class="form-group" style="margin-bottom:0"><label>Notes</label><textarea id="notes" rows="2" placeholder="Optional notes"></textarea></div>
+    <div class="modal-footer">
+      <button class="btn btn-ghost" onclick="closeModal()">Cancel</button>
+      <button class="btn btn-primary" onclick="saveNewChild()">Add Child</button>
+    </div>`);
+}
+
+async function saveNewChild() {
+  const data = {
+    first_name: document.getElementById('fn').value.trim(),
+    last_name: document.getElementById('ln').value.trim(),
+    center: document.getElementById('ctr').value,
+    subsidy_type: document.getElementById('stype').value,
+    is_gsrp: document.getElementById('ig').checked,
+    is_cdc: document.getElementById('ic').checked,
+    is_school_age: document.getElementById('isa').checked,
+    notes: document.getElementById('notes').value.trim(),
+  };
+  if (!data.first_name || !data.last_name) return toast('Name required','error');
+  try {
+    await api('POST', '/children', data);
+    toast('Child added','success');
+    closeModal();
+    pages['children']();
+  } catch(e) { toast('Error: '+e.message,'error'); }
+}
+
+function editChild(child) {
+  openModal(`
+    <div class="modal-title">Edit: ${child.first_name} ${child.last_name}</div>
+    <div class="form-row">
+      <div class="form-group"><label>Subsidy Type</label>
+        <select id="estype">
+          <option value="private_pay" ${child.subsidy_type==='private_pay'?'selected':''}>Private Pay</option>
+          <option value="cdc" ${child.subsidy_type==='cdc'?'selected':''}>CDC</option>
+          <option value="gsrp" ${child.subsidy_type==='gsrp'?'selected':''}>GSRP Only</option>
+          <option value="cdc_gsrp" ${child.subsidy_type==='cdc_gsrp'?'selected':''}>CDC + GSRP</option>
+          <option value="unknown" ${child.subsidy_type==='unknown'?'selected':''}>Unknown</option>
+        </select>
+      </div>
+    </div>
+    <div class="form-row">
+      <div class="form-group">
+        <div class="checkbox-row"><input type="checkbox" id="eig" ${child.is_gsrp?'checked':''}>GSRP</div>
+        <div class="checkbox-row"><input type="checkbox" id="eic" ${child.is_cdc?'checked':''}>CDC</div>
+        <div class="checkbox-row"><input type="checkbox" id="eisa" ${child.is_school_age?'checked':''}>School Age</div>
+        <div class="checkbox-row"><input type="checkbox" id="eia" ${child.is_active?'checked':''}>Active</div>
+      </div>
+    </div>
+    <div class="form-group"><label>Notes</label><textarea id="enotes" rows="2">${child.notes||''}</textarea></div>
+    <div class="modal-footer">
+      <button class="btn btn-ghost" onclick="closeModal()">Cancel</button>
+      <button class="btn btn-primary" onclick="saveEditChild(${child.id})">Save</button>
+    </div>`);
+}
+
+async function saveEditChild(id) {
+  const data = {
+    subsidy_type: document.getElementById('estype').value,
+    is_gsrp: document.getElementById('eig').checked,
+    is_cdc: document.getElementById('eic').checked,
+    is_school_age: document.getElementById('eisa').checked,
+    is_active: document.getElementById('eia').checked,
+    notes: document.getElementById('enotes').value.trim(),
+  };
+  try {
+    await api('PUT', `/children/${id}`, data);
+    toast('Child updated','success');
+    closeModal();
+    pages['children']();
+  } catch(e) { toast('Error: '+e.message,'error'); }
+}
+
+// ── CDC Reconciliation ────────────────────────────────────────────────────────
+pages['cdc-reconciliation'] = async () => {
+  document.getElementById('page-title').textContent = 'CDC Reconciliation';
+  document.getElementById('topbar-actions').innerHTML =
+    `<button class="btn btn-gold" onclick="showCDCUpload()">Upload CDC Statement</button>`;
+  const content = document.getElementById('content');
+  content.innerHTML = '<div class="loading">Loading…</div>';
+
+  const renderCDC = async () => {
+    const [periods, cdcData] = await Promise.all([
+      api('GET', '/billing-periods'),
+      api('GET', `/cdc-periods?center=${currentCenter}`)
+    ]);
+    const grouped = {};
+    for (const r of cdcData) {
+      if (!grouped[r.period_number]) grouped[r.period_number] = [];
+      grouped[r.period_number].push(r);
+    }
+
+    content.innerHTML = `
+      ${centerSelector('renderCDC()')}
+      ${Object.keys(grouped).length === 0 ? `
+        <div class="card"><div class="empty"><div class="empty-icon">📭</div>
+        <p>No CDC data for ${currentCenter} yet. Upload a CDC statement to get started.</p>
+        <button class="btn btn-gold" style="margin-top:12px" onclick="showCDCUpload()">Upload Statement</button>
+        </div></div>
+      ` : Object.entries(grouped).sort((a,b)=>b[0].localeCompare(a[0])).map(([period, rows]) => {
+        const total = rows.reduce((s,r) => s+(parseFloat(r.amount_paid)||0), 0);
+        const noAuth = rows.filter(r=>r.status==='no_auth').length;
+        const missing = rows.filter(r=>r.status==='missing_from_statement').length;
+        return `
+        <div class="card" style="padding:0;margin-bottom:16px">
+          <div style="padding:14px 20px;border-bottom:1px solid var(--border);display:flex;align-items:center;gap:12px">
+            <div style="font-family:'DM Serif Display',serif;font-size:22px">Period ${period}</div>
+            <div style="font-size:13px;color:var(--gray)">${rows.length} children · $${total.toFixed(2)} received</div>
+            ${noAuth > 0 ? `<span class="badge-pill badge-noauth">${noAuth} No Auth</span>` : ''}
+            ${missing > 0 ? `<span class="badge-pill badge-missing">${missing} Missing</span>` : ''}
+          </div>
+          <div class="table-wrap">
+            <table>
+              <thead><tr>
+                <th>Child Name</th>
+                <th>Billed</th>
+                <th>Amount Paid</th>
+                <th>Applied</th>
+                <th>Status</th>
+                <th>Notes</th>
+                <th></th>
+              </tr></thead>
+              <tbody>
+              ${rows.map(r => `
+                <tr>
+                  <td><strong>${r.child_name}</strong></td>
+                  <td>${r.billed ? '✅' : '—'}</td>
+                  <td>${r.amount_paid ? '$'+parseFloat(r.amount_paid).toFixed(2) : '—'}</td>
+                  <td>${r.applied_to_account ? '✅' : '<span style="color:var(--amber)">No</span>'}</td>
+                  <td>${statusBadge(r.status)}</td>
+                  <td style="font-size:12px;color:var(--gray)">${r.notes||''}</td>
+                  <td><button class="btn btn-sm btn-ghost" onclick='editCDCRow(${JSON.stringify(r)})'>Edit</button></td>
+                </tr>`).join('')}
+              </tbody>
+            </table>
+          </div>
+        </div>`;
+      }).join('')}`;
+  };
+  window.renderCDC = renderCDC;
+  await renderCDC();
+};
+
+function statusBadge(s) {
+  const map = {
+    no_auth: '<span class="badge-pill badge-noauth">No Auth</span>',
+    paid: '<span class="badge-pill badge-paid">Paid</span>',
+    missing_from_statement: '<span class="badge-pill badge-missing">Missing</span>',
+    not_found: '<span class="badge-pill badge-noauth">Not Found</span>',
+    pending: '<span class="badge-pill badge-pending">Pending</span>',
+    unknown: '<span class="badge-pill badge-pending">Unknown</span>',
+  };
+  return map[s] || `<span class="badge-pill badge-pending">${s}</span>`;
+}
+
+function showCDCUpload() {
+  openModal(`
+    <div class="modal-title">Upload CDC Statement</div>
+    <div class="form-row">
+      <div class="form-group"><label>Center</label>
+        <select id="ucenter">${CENTERS.map(c=>`<option ${c===currentCenter?'selected':''}>${c}</option>`).join('')}</select>
+      </div>
+      <div class="form-group"><label>Period Number</label>
+        <input id="uperiod" placeholder="e.g. 607">
+      </div>
+    </div>
+    <div class="upload-zone" id="cdc-drop" onclick="document.getElementById('cdc-file').click()">
+      <div style="font-size:36px">📄</div>
+      <p>Click to upload CDC statement CSV</p>
+      <p style="font-size:12px">Columns: Child Name, Amount Paid, Status/Notes</p>
+    </div>
+    <input type="file" id="cdc-file" accept=".csv" onchange="handleCDCUpload(this)">
+    <div class="modal-footer">
+      <button class="btn btn-ghost" onclick="closeModal()">Cancel</button>
+    </div>`);
+}
+
+async function handleCDCUpload(input) {
+  const file = input.files[0];
+  if (!file) return;
+  const center = document.getElementById('ucenter').value;
+  const period = document.getElementById('uperiod').value.trim();
+  if (!period) return toast('Enter a period number','error');
+  const fd = new FormData();
+  fd.append('file', file);
+  fd.append('center', center);
+  fd.append('period_number', period);
+  try {
+    const result = await uploadFile('/upload/cdc-statement', fd);
+    toast(`Uploaded ${result.inserted} records. ${result.flags.length} flags raised.`,
+      result.flags.length > 0 ? 'warning' : 'success');
+    closeModal();
+    pages['cdc-reconciliation']();
+  } catch(e) { toast('Upload error: '+e.message,'error'); }
+}
+
+function editCDCRow(r) {
+  openModal(`
+    <div class="modal-title">Edit CDC Record</div>
+    <div style="margin-bottom:16px;font-size:15px"><strong>${r.child_name}</strong> · Period ${r.period_number}</div>
+    <div class="form-row">
+      <div class="form-group"><label>Amount Paid</label>
+        <input id="eamt" type="number" step="0.01" value="${r.amount_paid||''}">
+      </div>
+      <div class="form-group"><label>Status</label>
+        <select id="estat">
+          <option value="pending" ${r.status==='pending'?'selected':''}>Pending</option>
+          <option value="paid" ${r.status==='paid'?'selected':''}>Paid</option>
+          <option value="no_auth" ${r.status==='no_auth'?'selected':''}>No Authorization</option>
+          <option value="not_found" ${r.status==='not_found'?'selected':''}>Not Found in DHS</option>
+          <option value="missing_from_statement" ${r.status==='missing_from_statement'?'selected':''}>Missing from Statement</option>
+        </select>
+      </div>
+    </div>
+    <div class="form-row">
+      <div class="form-group"><label>Applied to Account</label>
+        <select id="eapplied">
+          <option value="false" ${!r.applied_to_account?'selected':''}>No</option>
+          <option value="true" ${r.applied_to_account?'selected':''}>Yes</option>
+        </select>
+      </div>
+    </div>
+    <div class="form-group"><label>Notes</label><textarea id="enotes2" rows="2">${r.notes||''}</textarea></div>
+    <div class="modal-footer">
+      <button class="btn btn-ghost" onclick="closeModal()">Cancel</button>
+      <button class="btn btn-primary" onclick="saveCDCRow(${r.id})">Save</button>
+    </div>`);
+}
+
+async function saveCDCRow(id) {
+  const data = {
+    amount_paid: parseFloat(document.getElementById('eamt').value)||null,
+    status: document.getElementById('estat').value,
+    applied_to_account: document.getElementById('eapplied').value === 'true',
+    notes: document.getElementById('enotes2').value.trim(),
+  };
+  try {
+    await api('PUT', `/cdc-periods/${id}`, data);
+    toast('Record updated','success');
+    closeModal();
+    pages['cdc-reconciliation']();
+  } catch(e) { toast('Error: '+e.message,'error'); }
+}
+
+// ── Upload Attendance ─────────────────────────────────────────────────────────
+pages['upload-attendance'] = () => {
+  document.getElementById('page-title').textContent = 'Upload Timesheets';
+  document.getElementById('topbar-actions').innerHTML = '';
+  document.getElementById('content').innerHTML = `
+    ${centerSelector('document.getElementById("att-center-label").textContent=currentCenter')}
+    <div class="card">
+      <div class="card-title">📤 Upload Playground Attendance CSV</div>
+      <p style="font-size:13.5px;color:var(--gray);margin-bottom:20px">
+        Upload the Playground daily attendance export for <strong id="att-center-label">${currentCenter}</strong>.
+        The system will process each child's check-in/out times and apply billing rules automatically.
+      </p>
+      <div class="upload-zone" id="att-drop" onclick="document.getElementById('att-file').click()">
+        <div style="font-size:40px">⬆️</div>
+        <p><strong>Click to upload attendance CSV</strong></p>
+        <p>Columns expected: Last name, First name, Date, Check-in, Check-out</p>
+      </div>
+      <input type="file" id="att-file" accept=".csv" onchange="handleAttUpload(this)">
+      <div id="att-result" style="margin-top:20px"></div>
+    </div>
+    <div class="card">
+      <div class="card-title">ℹ️ How It Works</div>
+      <p style="font-size:13.5px;color:var(--gray);line-height:1.7">
+        When you upload, the system:<br>
+        1. Matches each child to the roster, auto-creating unknowns with a flag<br>
+        2. Detects late pickups after 6pm and logs them with fee calculations<br>
+        3. Flags any children with unknown subsidy status so you can set them<br>
+        4. Records all check-in/out times for the billing engine to process
+      </p>
+    </div>`;
+};
+
+async function handleAttUpload(input) {
+  const file = input.files[0];
+  if (!file) return;
+  const fd = new FormData();
+  fd.append('file', file);
+  fd.append('center', currentCenter);
+  document.getElementById('att-result').innerHTML = '<div class="loading">Processing…</div>';
+  try {
+    const result = await uploadFile('/upload/attendance', fd);
+    document.getElementById('att-result').innerHTML = `
+      <div style="background:var(--green-light);border:1px solid var(--green);border-radius:8px;padding:16px">
+        <strong style="color:var(--green)">✅ Uploaded successfully</strong><br>
+        <div style="margin-top:8px;font-size:13.5px">
+          ${result.processed} records processed ·
+          ${result.flags.length} flag${result.flags.length!==1?'s':''} raised
+        </div>
+        ${result.flags.length > 0 ? `
+          <div style="margin-top:12px">
+            ${result.flags.map(f=>`<div style="font-size:13px;margin-top:4px">
+              ${FLAG_ICONS[f.type]||'🔵'} ${f.childName} — ${FLAG_LABELS[f.type]||f.type}
+            </div>`).join('')}
+          </div>` : ''}
+      </div>`;
+  } catch(e) {
+    document.getElementById('att-result').innerHTML =
+      `<div style="background:var(--red-light);border:1px solid var(--red);border-radius:8px;padding:16px;color:var(--red)">Error: ${e.message}</div>`;
+  }
+}
+
+// ── Billing Engine ────────────────────────────────────────────────────────────
+pages['billing-engine'] = () => {
+  document.getElementById('page-title').textContent = 'Billing Engine';
+  document.getElementById('topbar-actions').innerHTML = '';
+  document.getElementById('content').innerHTML = `
+    ${centerSelector('')}
+    <div class="card">
+      <div class="card-title">⚙️ Calculate Billable Hours</div>
+      <p style="font-size:13.5px;color:var(--gray);margin-bottom:16px">
+        Select a date range to calculate what should be billed to CDC vs. families for each child.
+        The engine applies GSRP carve-outs, Friday full-day rules, school-ager splits, and no-school day fees.
+      </p>
+      <div class="form-row">
+        <div class="form-group"><label>Start Date</label><input type="date" id="be-start"></div>
+        <div class="form-group"><label>End Date</label><input type="date" id="be-end"></div>
+      </div>
+      <button class="btn btn-primary" onclick="runBillingEngine()">Calculate Billing</button>
+    </div>
+    <div id="billing-output"></div>`;
+
+  // Default to current 2-week period
+  const now = new Date();
+  const start = new Date(now);
+  start.setDate(now.getDate() - 13);
+  document.getElementById('be-start').value = start.toISOString().split('T')[0];
+  document.getElementById('be-end').value = now.toISOString().split('T')[0];
+};
+
+async function runBillingEngine() {
+  const start = document.getElementById('be-start').value;
+  const end = document.getElementById('be-end').value;
+  if (!start || !end) return toast('Select date range','error');
+  document.getElementById('billing-output').innerHTML = '<div class="loading">Calculating…</div>';
+  try {
+    const results = await api('GET', `/billing/calculate?center=${currentCenter}&start_date=${start}&end_date=${end}`);
+    if (results.length === 0) {
+      document.getElementById('billing-output').innerHTML =
+        '<div class="card"><div class="empty"><div class="empty-icon">📭</div><p>No attendance records found for this period.</p></div></div>';
+      return;
+    }
+    let html = `<div style="margin-bottom:16px;font-size:13.5px;color:var(--gray)">${results.length} children found · ${start} to ${end}</div>`;
+    for (const child of results) {
+      const cdcCount = child.cdcBillableBlocks.length;
+      const gsrpCount = child.gsrpBlocks.length;
+      const privateCount = child.privateBillable.length;
+      const feeTotal = child.latePickupFees.reduce((s,f)=>s+f.fee,0);
+      const noSchoolTotal = child.noSchoolDayCharges.reduce((s,c)=>s+c.hourlyCharge,0);
+      html += `
+        <div class="billing-block">
+          <div class="billing-block-header">
+            <div>
+              <strong>${child.childName}</strong>
+              <span style="margin-left:10px;font-size:12px;opacity:.7">${subsidyType(child)}</span>
+            </div>
+            <div style="font-size:12px;display:flex;gap:10px">
+              ${cdcCount > 0 ? `<span style="color:#7fc7f0">${cdcCount} CDC blocks</span>` : ''}
+              ${gsrpCount > 0 ? `<span style="color:#c39bd3">${gsrpCount} GSRP blocks</span>` : ''}
+              ${privateCount > 0 ? `<span style="color:#aaa">${privateCount} private</span>` : ''}
+              ${feeTotal > 0 ? `<span style="color:#f1948a">$${feeTotal.toFixed(2)} late fees</span>` : ''}
+            </div>
+          </div>
+          <div class="billing-block-body">
+            ${[...child.cdcBillableBlocks.map(b=>({...b,tag:'cdc'})),
+               ...child.gsrpBlocks.map(b=>({...b,tag:'gsrp'})),
+               ...child.privateBillable.map(b=>({...b,tag:'private'}))]
+              .sort((a,b)=>a.date.localeCompare(b.date)||a.in.localeCompare(b.in))
+              .map(b=>`
+                <div class="time-entry">
+                  <span class="time-tag ${b.tag}">${b.billTo}</span>
+                  <span style="color:var(--gray);font-size:12px">${b.date}</span>
+                  <span>${fmtTime(b.in)} → ${fmtTime(b.out)}</span>
+                  <span style="color:var(--gray);font-size:12px">(${minuteDiff(b.in,b.out)} hrs)</span>
+                  ${b.type ? `<span style="font-size:11px;color:var(--gray)">${b.type.replace(/_/g,' ')}</span>` : ''}
+                </div>`).join('')}
+            ${child.latePickupFees.map(f=>`
+                <div class="time-entry">
+                  <span class="time-tag fee">LATE FEE</span>
+                  <span style="color:var(--gray);font-size:12px">${f.date}</span>
+                  <span>Pickup at ${fmtTime(f.checkoutTime)} — ${f.minsLate} min late</span>
+                  <span style="color:var(--red);font-weight:600">$${f.fee.toFixed(2)}</span>
+                </div>`).join('')}
+            ${child.noSchoolDayCharges.map(c=>`
+                <div class="time-entry">
+                  <span class="time-tag fee">NO-SCHOOL FEE</span>
+                  <span style="color:var(--gray);font-size:12px">${c.date}</span>
+                  <span>${c.hours} hrs × $8/hr</span>
+                  <span style="color:var(--red);font-weight:600">$${c.hourlyCharge.toFixed(2)}</span>
+                </div>`).join('')}
+          </div>
+        </div>`;
+    }
+    document.getElementById('billing-output').innerHTML = html;
+  } catch(e) {
+    document.getElementById('billing-output').innerHTML =
+      `<div class="card"><div style="color:var(--red)">Error: ${e.message}</div></div>`;
+  }
+};
+
+function subsidyType(child) {
+  if (child.isGsrp && child.isCdc) return 'GSRP + CDC';
+  if (child.isGsrp) return 'GSRP';
+  if (child.isCdc) return 'CDC';
+  return child.subsidyType || 'Private';
+}
+
+function fmtTime(t) {
+  if (!t) return '—';
+  const [h,m] = t.split(':').map(Number);
+  const ampm = h >= 12 ? 'PM' : 'AM';
+  const hr = h > 12 ? h-12 : h === 0 ? 12 : h;
+  return `${hr}:${String(m).padStart(2,'0')} ${ampm}`;
+}
+
+function minuteDiff(a, b) {
+  if (!a || !b) return '?';
+  const [ah,am] = a.split(':').map(Number);
+  const [bh,bm] = b.split(':').map(Number);
+  const diff = (bh*60+bm) - (ah*60+am);
+  return (diff/60).toFixed(1);
+}
+
+// ── Billing Periods ───────────────────────────────────────────────────────────
+pages['billing-periods'] = async () => {
+  document.getElementById('page-title').textContent = 'Billing Periods';
+  document.getElementById('topbar-actions').innerHTML = '';
+  const content = document.getElementById('content');
+  content.innerHTML = '<div class="loading">Loading…</div>';
+  try {
+    const periods = await api('GET', '/billing-periods');
+    content.innerHTML = `
+      <div class="card" style="padding:0">
+        <div class="table-wrap">
+          <table>
+            <thead><tr>
+              <th>Period #</th><th>Start</th><th>End</th><th>Reporting Deadline</th><th>Payment Date</th>
+              <th>Billing</th><th>Crediting</th><th></th>
+            </tr></thead>
+            <tbody>
+            ${periods.map(p => `
+              <tr>
+                <td><strong style="font-family:'DM Serif Display',serif;font-size:18px">${p.period_number}</strong></td>
+                <td>${fmtDate(p.start_date)}</td>
+                <td>${fmtDate(p.end_date)}</td>
+                <td>${fmtDate(p.reporting_deadline)}</td>
+                <td>${fmtDate(p.payment_date)}</td>
+                <td>${periodStatusBadge(p.billing_status)}</td>
+                <td>${periodStatusBadge(p.crediting_status)}</td>
+                <td><button class="btn btn-sm btn-ghost" onclick='editPeriod(${JSON.stringify(p)})'>Update</button></td>
+              </tr>`).join('')}
+            </tbody>
+          </table>
+        </div>
+      </div>`;
+  } catch(e) { content.innerHTML = `<div class="loading">Error: ${e.message}</div>`; }
+};
+
+function periodStatusBadge(s) {
+  if (s === 'Completed' || s === 'completed') return '<span class="badge-pill badge-paid">Completed</span>';
+  return '<span class="badge-pill badge-pending">Pending</span>';
+}
+
+function editPeriod(p) {
+  openModal(`
+    <div class="modal-title">Update Period ${p.period_number}</div>
+    <div class="form-row">
+      <div class="form-group"><label>Billing Status</label>
+        <select id="pbs">
+          <option value="pending" ${p.billing_status==='pending'?'selected':''}>Pending</option>
+          <option value="Completed" ${p.billing_status==='Completed'?'selected':''}>Completed</option>
+        </select>
+      </div>
+      <div class="form-group"><label>Crediting Status</label>
+        <select id="pcs">
+          <option value="pending" ${p.crediting_status==='pending'?'selected':''}>Pending</option>
+          <option value="Completed" ${p.crediting_status==='Completed'?'selected':''}>Completed</option>
+        </select>
+      </div>
+    </div>
+    <div class="modal-footer">
+      <button class="btn btn-ghost" onclick="closeModal()">Cancel</button>
+      <button class="btn btn-primary" onclick="savePeriod(${p.id})">Save</button>
+    </div>`);
+}
+
+async function savePeriod(id) {
+  try {
+    await api('PUT', `/billing-periods/${id}`, {
+      billing_status: document.getElementById('pbs').value,
+      crediting_status: document.getElementById('pcs').value,
+    });
+    toast('Period updated','success');
+    closeModal();
+    pages['billing-periods']();
+  } catch(e) { toast('Error: '+e.message,'error'); }
+}
+
+// ── No School Days ────────────────────────────────────────────────────────────
+pages['no-school-days'] = async () => {
+  document.getElementById('page-title').textContent = 'No-School Days';
+  document.getElementById('topbar-actions').innerHTML =
+    `<button class="btn btn-gold" onclick="openAddNoSchool()">+ Add Day</button>`;
+  const content = document.getElementById('content');
+  content.innerHTML = '<div class="loading">Loading…</div>';
+  try {
+    const days = await api('GET', '/no-school-days');
+    content.innerHTML = `
+      <div class="card" style="margin-bottom:16px">
+        <div class="card-title">ℹ️ About No-School Days</div>
+        <p style="font-size:13.5px;color:var(--gray);line-height:1.7">
+          On no-school days, school-age children who are not normally present during school hours will be charged
+          an additional fee: <strong>$8/hr</strong>, or a part-time/full-time rate, whichever is less.
+          Before/after school families will have the school-day hours added at the $8/hr rate.
+          Add both scheduled closures and unexpected weather/cancellation days here.
+        </p>
+      </div>
+      ${days.length === 0 ? `
+        <div class="card"><div class="empty"><div class="empty-icon">📅</div>
+        <p>No no-school days recorded. Add days as they come up.</p></div></div>
+      ` : `
+      <div class="card" style="padding:0">
+        <div class="table-wrap">
+          <table>
+            <thead><tr><th>Date</th><th>Reason</th><th>Applies To</th><th>Center</th><th></th></tr></thead>
+            <tbody>
+            ${days.map(d => `
+              <tr>
+                <td><strong>${fmtDate(d.school_date)}</strong></td>
+                <td>${d.reason || '—'}</td>
+                <td>${d.applies_to || 'All'}</td>
+                <td>${d.center || 'All Centers'}</td>
+                <td><button class="btn btn-sm btn-danger" onclick="deleteNoSchool(${d.id})">Delete</button></td>
+              </tr>`).join('')}
+            </tbody>
+          </table>
+        </div>
+      </div>`}`;
+  } catch(e) { content.innerHTML = `<div class="loading">Error: ${e.message}</div>`; }
+};
+
+function openAddNoSchool() {
+  openModal(`
+    <div class="modal-title">Add No-School Day</div>
+    <div class="form-row">
+      <div class="form-group"><label>Date</label><input type="date" id="nsd"></div>
+      <div class="form-group"><label>Center</label>
+        <select id="nsdc">
+          <option value="">All Centers</option>
+          ${CENTERS.map(c=>`<option>${c}</option>`).join('')}
+        </select>
+      </div>
+    </div>
+    <div class="form-group"><label>Reason</label>
+      <input id="nsdr" placeholder="e.g. Snow day, MLK Day, Spring Break">
+    </div>
+    <div class="form-group"><label>Applies To</label>
+      <select id="nsdap">
+        <option value="all">All Families</option>
+        <option value="school_age">School-Age Only</option>
+        <option value="gsrp">GSRP Families Only</option>
+      </select>
+    </div>
+    <div class="modal-footer">
+      <button class="btn btn-ghost" onclick="closeModal()">Cancel</button>
+      <button class="btn btn-primary" onclick="saveNoSchool()">Add</button>
+    </div>`);
+}
+
+async function saveNoSchool() {
+  const data = {
+    school_date: document.getElementById('nsd').value,
+    center: document.getElementById('nsdc').value || null,
+    reason: document.getElementById('nsdr').value.trim(),
+    applies_to: document.getElementById('nsdap').value,
+  };
+  if (!data.school_date) return toast('Select a date','error');
+  try {
+    await api('POST', '/no-school-days', data);
+    toast('No-school day added','success');
+    closeModal();
+    pages['no-school-days']();
+  } catch(e) { toast('Error: '+e.message,'error'); }
+}
+
+async function deleteNoSchool(id) {
+  if (!confirm('Delete this no-school day?')) return;
+  try {
+    await api('DELETE', `/no-school-days/${id}`);
+    toast('Deleted','success');
+    pages['no-school-days']();
+  } catch(e) { toast('Error: '+e.message,'error'); }
+}
+
+// ── Tuition Rates ─────────────────────────────────────────────────────────────
+pages['tuition-rates'] = async () => {
+  document.getElementById('page-title').textContent = 'Tuition Rates';
+  document.getElementById('topbar-actions').innerHTML =
+    `<button class="btn btn-gold" onclick="openAddRate()">+ Add Rate</button>`;
+  const content = document.getElementById('content');
+  content.innerHTML = '<div class="loading">Loading…</div>';
+  try {
+    const rates = await api('GET', '/tuition-rates');
+    content.innerHTML = `
+      <div class="card" style="margin-bottom:16px">
+        <div class="card-title">💡 How Rates Are Used</div>
+        <p style="font-size:13.5px;color:var(--gray);line-height:1.7">
+          Rates are used by the billing engine to calculate no-school day charges.
+          The system will charge the <strong>lesser of</strong>: hourly rate ($8/hr) OR the applicable part-time/full-time weekly rate.
+          Enter your rates per center so the engine can make the right calculation automatically.
+        </p>
+      </div>
+      ${rates.length === 0 ? `
+        <div class="card"><div class="empty"><div class="empty-icon">💰</div>
+        <p>No tuition rates set up yet. Add rates per center to enable no-school day fee calculations.</p></div></div>
+      ` : `
+      <div class="card" style="padding:0">
+        <div class="table-wrap">
+          <table>
+            <thead><tr><th>Center</th><th>Type</th><th>Label</th><th>Weekly Amount</th><th>Hourly Rate</th></tr></thead>
+            <tbody>
+            ${rates.map(r=>`
+              <tr>
+                <td>${r.center}</td>
+                <td>${r.rate_type}</td>
+                <td>${r.label}</td>
+                <td>$${parseFloat(r.weekly_amount||0).toFixed(2)}</td>
+                <td>$${parseFloat(r.hourly_rate||8).toFixed(2)}/hr</td>
+              </tr>`).join('')}
+            </tbody>
+          </table>
+        </div>
+      </div>`}`;
+  } catch(e) { content.innerHTML = `<div class="loading">Error: ${e.message}</div>`; }
+};
+
+function openAddRate() {
+  openModal(`
+    <div class="modal-title">Add Tuition Rate</div>
+    <div class="form-row">
+      <div class="form-group"><label>Center</label>
+        <select id="rc">${CENTERS.map(c=>`<option>${c}</option>`).join('')}</select>
+      </div>
+      <div class="form-group"><label>Type</label>
+        <select id="rtype">
+          <option value="full_time">Full Time</option>
+          <option value="part_time">Part Time</option>
+          <option value="before_after">Before & After School</option>
+          <option value="drop_in">Drop-In / Hourly</option>
+        </select>
+      </div>
+    </div>
+    <div class="form-row">
+      <div class="form-group"><label>Label</label><input id="rlabel" placeholder="e.g. Full Time Infant"></div>
+      <div class="form-group"><label>Weekly Amount ($)</label><input id="rwkly" type="number" step="0.01" placeholder="0.00"></div>
+    </div>
+    <div class="modal-footer">
+      <button class="btn btn-ghost" onclick="closeModal()">Cancel</button>
+      <button class="btn btn-primary" onclick="saveRate()">Add Rate</button>
+    </div>`);
+}
+
+async function saveRate() {
+  const data = {
+    center: document.getElementById('rc').value,
+    rate_type: document.getElementById('rtype').value,
+    label: document.getElementById('rlabel').value.trim(),
+    weekly_amount: parseFloat(document.getElementById('rwkly').value)||null,
+    hourly_rate: 8.00,
+  };
+  if (!data.label) return toast('Label required','error');
+  try {
+    await api('POST', '/tuition-rates', data);
+    toast('Rate added','success');
+    closeModal();
+    pages['tuition-rates']();
+  } catch(e) { toast('Error: '+e.message,'error'); }
+}
+
+// ── Utils ─────────────────────────────────────────────────────────────────────
+function fmtDate(d) {
+  if (!d) return '—';
+  return new Date(d).toLocaleDateString('en-US', { month:'short', day:'numeric', year:'numeric' });
+}
+
+function timeAgo(d) {
+  const diff = Date.now() - new Date(d).getTime();
+  const mins = Math.floor(diff/60000);
+  if (mins < 60) return `${mins}m ago`;
+  const hrs = Math.floor(mins/60);
+  if (hrs < 24) return `${hrs}h ago`;
+  return `${Math.floor(hrs/24)}d ago`;
+}
+
+// ── Boot ──────────────────────────────────────────────────────────────────────
+if (!TOKEN) {
+  document.getElementById('content').innerHTML = `
+    <div class="card" style="max-width:400px;margin:60px auto;text-align:center">
+      <div style="font-size:48px;margin-bottom:16px">🔒</div>
+      <div class="card-title">Authentication Required</div>
+      <p style="color:var(--gray);font-size:14px">Please access this app through the TCC Hub or add a <code>?token=</code> parameter.</p>
+    </div>`;
+} else {
+  showPage('dashboard');
+}
+</script>
+</body>
+</html>
