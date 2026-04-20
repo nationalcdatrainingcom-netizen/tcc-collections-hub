@@ -8,12 +8,62 @@ const cors = require('cors');
 const path = require('path');
 const fs = require('fs');
 
+// Stripe is optional — only used for the Collections/Pay-What-You-Can feature.
+// If STRIPE_SECRET_KEY isn't set, the Collections UI still works but payment
+// links won't be generated and webhook events won't be recorded.
+let stripe = null;
+try {
+  const Stripe = require('stripe');
+  if (process.env.STRIPE_SECRET_KEY) {
+    stripe = Stripe(process.env.STRIPE_SECRET_KEY);
+    console.log('Stripe initialized');
+  } else {
+    console.log('Stripe disabled (STRIPE_SECRET_KEY not set)');
+  }
+} catch (e) {
+  console.log('Stripe module not installed — Collections feature will be read-only');
+}
+
 const app = express();
 const pool = new Pool({ connectionString: process.env.DATABASE_URL, ssl: { rejectUnauthorized: false } });
 const upload = multer({ storage: multer.memoryStorage() });
 const JWT_SECRET = process.env.HUB_JWT_SECRET || 'tcc-hub-jwt-2026';
 
 app.use(cors());
+
+// ── Stripe webhook — must use raw body BEFORE express.json() ────────────────
+// Stripe signs the raw request body; if we JSON-parse first we can't verify.
+app.post('/api/collections/webhook',
+  express.raw({ type: 'application/json' }),
+  async (req, res) => {
+    if (!stripe) return res.status(503).send('Stripe not configured');
+    const sig = req.headers['stripe-signature'];
+    const webhookSecret = process.env.STRIPE_WEBHOOK_SECRET;
+
+    let event;
+    try {
+      if (webhookSecret) {
+        event = stripe.webhooks.constructEvent(req.body, sig, webhookSecret);
+      } else {
+        // No secret configured — parse without verification (ok for local dev only)
+        event = JSON.parse(req.body.toString());
+        console.warn('Stripe webhook received WITHOUT signature verification (set STRIPE_WEBHOOK_SECRET)');
+      }
+    } catch (err) {
+      console.error('Webhook signature verification failed:', err.message);
+      return res.status(400).send(`Webhook Error: ${err.message}`);
+    }
+
+    try {
+      await handleStripeEvent(event);
+      res.json({ received: true });
+    } catch (e) {
+      console.error('Webhook handler failed:', e);
+      res.status(500).json({ error: e.message });
+    }
+  }
+);
+
 app.use(express.json());
 app.use(express.static(path.join(__dirname, 'public')));
 
@@ -168,34 +218,112 @@ async function initDB() {
       start_date DATE,
       end_date DATE,
       reporting_deadline DATE,
+      deadline_is_4pm BOOLEAN DEFAULT FALSE,
       payment_date DATE,
+      payment_delayed_holiday BOOLEAN DEFAULT FALSE,
       billing_status TEXT DEFAULT 'pending',
       crediting_status TEXT DEFAULT 'pending'
     );
+
+    ALTER TABLE billing_periods ADD COLUMN IF NOT EXISTS deadline_is_4pm BOOLEAN DEFAULT FALSE;
+    ALTER TABLE billing_periods ADD COLUMN IF NOT EXISTS payment_delayed_holiday BOOLEAN DEFAULT FALSE;
+
+    -- ── Collections: families who left with a balance, or are very past-due ──
+    CREATE TABLE IF NOT EXISTS collections_families (
+      id SERIAL PRIMARY KEY,
+      family_name TEXT NOT NULL,
+      primary_contact_email TEXT,
+      primary_contact_phone TEXT,
+      children_names TEXT,
+      original_balance NUMERIC(10,2) NOT NULL,
+      center TEXT,
+      left_date DATE,
+      status TEXT DEFAULT 'active',
+      notes TEXT,
+      payinfull_link_url TEXT,
+      payinfull_link_id TEXT,
+      paywhatyoucan_link_url TEXT,
+      paywhatyoucan_link_id TEXT,
+      settled_at TIMESTAMPTZ,
+      created_at TIMESTAMPTZ DEFAULT NOW(),
+      updated_at TIMESTAMPTZ DEFAULT NOW()
+    );
+
+    CREATE TABLE IF NOT EXISTS collections_payments (
+      id SERIAL PRIMARY KEY,
+      family_id INTEGER REFERENCES collections_families(id) ON DELETE CASCADE,
+      stripe_payment_intent_id TEXT UNIQUE,
+      stripe_charge_id TEXT,
+      stripe_customer_email TEXT,
+      amount NUMERIC(10,2) NOT NULL,
+      amount_refunded NUMERIC(10,2) DEFAULT 0,
+      currency TEXT DEFAULT 'usd',
+      status TEXT NOT NULL,
+      failure_reason TEXT,
+      paid_at TIMESTAMPTZ,
+      link_type TEXT,
+      raw_event JSONB,
+      created_at TIMESTAMPTZ DEFAULT NOW()
+    );
+
+    CREATE TABLE IF NOT EXISTS collections_events (
+      id SERIAL PRIMARY KEY,
+      family_id INTEGER REFERENCES collections_families(id) ON DELETE CASCADE,
+      event_type TEXT NOT NULL,
+      stripe_event_id TEXT UNIQUE,
+      detail TEXT,
+      amount NUMERIC(10,2),
+      raw_event JSONB,
+      created_at TIMESTAMPTZ DEFAULT NOW()
+    );
   `);
 
-  // Seed billing periods from DHS spreadsheet
+  // Seed billing periods from the official MiLEAP CDC 2026 Payment Schedule.
+  // Columns: [period, start, end, reporting_deadline, deadline_is_4pm, payment_date, payment_delayed_holiday]
+  // The 4pm flag means the deadline falls on a day before a holiday — submissions close at 4pm, not midnight.
+  // The holiday flag means the check/EFT was delayed because of a state holiday.
+  // ON CONFLICT DO UPDATE ensures any previously-seeded wrong dates get corrected on next deploy.
   const periods = [
-    ['601','2025-12-28','2026-01-10','2026-01-15','2026-01-22'],
-    ['602','2026-01-11','2026-01-24','2026-01-29','2026-02-05'],
-    ['603','2026-01-25','2026-02-07','2026-02-12','2026-02-19'],
-    ['604','2026-02-08','2026-02-21','2026-02-26','2026-03-05'],
-    ['605','2026-02-22','2026-03-07','2026-03-12','2026-03-19'],
-    ['606','2026-03-08','2026-03-21','2026-03-26','2026-04-02'],
-    ['607','2026-03-22','2026-04-04','2026-04-09','2026-04-16'],
-    ['608','2026-04-05','2026-04-18','2026-04-23','2026-04-30'],
-    ['609','2026-04-19','2026-05-02','2026-05-07','2026-05-14'],
-    ['610','2026-05-03','2026-05-16','2026-05-21','2026-05-28'],
-    ['611','2026-05-17','2026-05-30','2026-06-04','2026-06-11'],
-    ['612','2026-05-31','2026-06-13','2026-06-18','2026-06-25'],
-    ['613','2026-06-14','2026-06-27','2026-07-02','2026-07-09'],
-    ['614','2026-06-28','2026-07-11','2026-07-16','2026-07-23'],
+    ['601','2025-12-28','2026-01-10','2026-01-15', false, '2026-01-23', true ],
+    ['602','2026-01-11','2026-01-24','2026-01-29', false, '2026-02-05', false],
+    ['603','2026-01-25','2026-02-07','2026-02-12', false, '2026-02-20', true ],
+    ['604','2026-02-08','2026-02-21','2026-02-26', false, '2026-03-05', false],
+    ['605','2026-02-22','2026-03-07','2026-03-12', false, '2026-03-19', false],
+    ['606','2026-03-08','2026-03-21','2026-03-26', false, '2026-04-02', false],
+    ['607','2026-03-22','2026-04-04','2026-04-09', false, '2026-04-16', false],
+    ['608','2026-04-05','2026-04-18','2026-04-23', false, '2026-04-30', false],
+    ['609','2026-04-19','2026-05-02','2026-05-07', false, '2026-05-14', false],
+    ['610','2026-05-03','2026-05-16','2026-05-21', false, '2026-05-29', true ],
+    ['611','2026-05-17','2026-05-30','2026-06-04', false, '2026-06-11', false],
+    ['612','2026-05-31','2026-06-13','2026-06-17', true,  '2026-06-25', false],
+    ['613','2026-06-14','2026-06-27','2026-07-01', true,  '2026-07-09', false],
+    ['614','2026-06-28','2026-07-11','2026-07-16', false, '2026-07-23', false],
+    ['615','2026-07-12','2026-07-25','2026-07-30', false, '2026-08-06', false],
+    ['616','2026-07-26','2026-08-08','2026-08-13', false, '2026-08-20', false],
+    ['617','2026-08-09','2026-08-22','2026-08-27', false, '2026-09-03', false],
+    ['618','2026-08-23','2026-09-05','2026-09-10', false, '2026-09-17', false],
+    ['619','2026-09-06','2026-09-19','2026-09-24', false, '2026-10-01', false],
+    ['620','2026-09-20','2026-10-03','2026-10-08', false, '2026-10-16', true ],
+    ['621','2026-10-04','2026-10-17','2026-10-22', false, '2026-10-29', false],
+    ['622','2026-10-18','2026-10-31','2026-11-05', false, '2026-11-13', true ],
+    ['623','2026-11-01','2026-11-14','2026-11-19', false, '2026-12-01', true ],
+    ['624','2026-11-15','2026-11-28','2026-12-03', false, '2026-12-10', false],
+    ['625','2026-11-29','2026-12-12','2026-12-17', false, '2026-12-28', true ],
+    ['626','2026-12-13','2026-12-26','2026-12-29', false, '2027-01-07', false],
   ];
-  for (const [p,s,e,r,c] of periods) {
+  for (const [p,s,e,r,r4,c,cDelayed] of periods) {
     await pool.query(
-      `INSERT INTO billing_periods (period_number,start_date,end_date,reporting_deadline,payment_date)
-       VALUES ($1,$2,$3,$4,$5) ON CONFLICT (period_number) DO NOTHING`,
-      [p,s,e,r,c]
+      `INSERT INTO billing_periods
+         (period_number, start_date, end_date, reporting_deadline, deadline_is_4pm, payment_date, payment_delayed_holiday)
+       VALUES ($1,$2,$3,$4,$5,$6,$7)
+       ON CONFLICT (period_number) DO UPDATE SET
+         start_date=EXCLUDED.start_date,
+         end_date=EXCLUDED.end_date,
+         reporting_deadline=EXCLUDED.reporting_deadline,
+         deadline_is_4pm=EXCLUDED.deadline_is_4pm,
+         payment_date=EXCLUDED.payment_date,
+         payment_delayed_holiday=EXCLUDED.payment_delayed_holiday`,
+      [p,s,e,r,r4,c,cDelayed]
     );
   }
   console.log('DB ready');
@@ -1822,6 +1950,384 @@ app.get('/api/cdc-filing/status', ssoAuth, async (req, res) => {
 });
 
 
+
+// ═════════════════════════════════════════════════════════════════════════════
+// ── Collections (Past-Due / Departed Families) ──────────────────────────────
+// ═════════════════════════════════════════════════════════════════════════════
+// Families who left TCC with a balance, or who are very far behind. Each family
+// gets two Stripe Payment Links:
+//   1. "Pay in Full 50% off" — one-time, amount = remaining_balance / 2
+//   2. "Pay What You Can" — flexible, $25 minimum
+// Webhook events from Stripe update balances, payments, and event log in real time.
+
+const COLLECTIONS_MIN_PAYMENT_CENTS = 2500; // $25 minimum for pay-what-you-can
+
+async function handleStripeEvent(event) {
+  const type = event.type;
+  const obj = event.data.object;
+
+  async function findFamilyIdFromEvent() {
+    const metadata = obj.metadata || {};
+    if (metadata.family_id) return parseInt(metadata.family_id);
+    if (obj.payment_intent) {
+      try {
+        const pi = await stripe.paymentIntents.retrieve(obj.payment_intent);
+        if (pi.metadata?.family_id) return parseInt(pi.metadata.family_id);
+      } catch { /* ignore */ }
+    }
+    const email = obj.customer_email || obj.receipt_email;
+    if (email) {
+      const { rows } = await pool.query(
+        `SELECT id FROM collections_families WHERE LOWER(primary_contact_email)=LOWER($1) LIMIT 1`,
+        [email]
+      );
+      if (rows[0]) return rows[0].id;
+    }
+    return null;
+  }
+
+  const familyId = await findFamilyIdFromEvent();
+
+  await pool.query(
+    `INSERT INTO collections_events (family_id, event_type, stripe_event_id, detail, amount, raw_event)
+     VALUES ($1,$2,$3,$4,$5,$6)
+     ON CONFLICT (stripe_event_id) DO NOTHING`,
+    [familyId, type, event.id, describeEvent(event), eventAmount(event), JSON.stringify(event)]
+  );
+
+  switch (type) {
+    case 'payment_intent.succeeded':
+    case 'checkout.session.completed': {
+      const pi = type === 'checkout.session.completed' && obj.payment_intent
+        ? await stripe.paymentIntents.retrieve(obj.payment_intent)
+        : obj;
+      const amountCents = pi.amount_received || pi.amount || 0;
+      const amount = amountCents / 100;
+      const linkType = pi.metadata?.link_type || obj.metadata?.link_type || null;
+      await pool.query(
+        `INSERT INTO collections_payments
+         (family_id, stripe_payment_intent_id, stripe_charge_id, stripe_customer_email,
+          amount, currency, status, paid_at, link_type, raw_event)
+         VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10)
+         ON CONFLICT (stripe_payment_intent_id) DO UPDATE
+           SET status='succeeded', amount=EXCLUDED.amount, paid_at=EXCLUDED.paid_at`,
+        [familyId, pi.id, pi.latest_charge || null, pi.receipt_email || obj.customer_email || null,
+         amount, pi.currency || 'usd', 'succeeded', new Date(pi.created * 1000), linkType,
+         JSON.stringify(event)]
+      );
+      if (linkType === 'pay_in_full' && familyId) {
+        await pool.query(
+          `UPDATE collections_families SET status='settled', settled_at=NOW(), updated_at=NOW() WHERE id=$1`,
+          [familyId]
+        );
+      }
+      break;
+    }
+    case 'payment_intent.payment_failed': {
+      const pi = obj;
+      await pool.query(
+        `INSERT INTO collections_payments
+         (family_id, stripe_payment_intent_id, stripe_customer_email, amount, currency,
+          status, failure_reason, link_type, raw_event)
+         VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9)
+         ON CONFLICT (stripe_payment_intent_id) DO UPDATE
+           SET status='failed', failure_reason=EXCLUDED.failure_reason`,
+        [familyId, pi.id, pi.receipt_email || null, (pi.amount || 0) / 100, pi.currency || 'usd',
+         'failed', pi.last_payment_error?.message || 'Unknown failure',
+         pi.metadata?.link_type || null, JSON.stringify(event)]
+      );
+      break;
+    }
+    case 'charge.refunded': {
+      const ch = obj;
+      await pool.query(
+        `UPDATE collections_payments
+         SET amount_refunded=$1, status=CASE WHEN $1 >= amount*100 THEN 'refunded' ELSE status END
+         WHERE stripe_charge_id=$2`,
+        [(ch.amount_refunded || 0) / 100, ch.id]
+      );
+      break;
+    }
+  }
+}
+
+function describeEvent(event) {
+  const obj = event.data.object;
+  switch (event.type) {
+    case 'payment_intent.succeeded':
+    case 'checkout.session.completed':
+      return `Payment of $${((obj.amount_received||obj.amount||0)/100).toFixed(2)} received`;
+    case 'payment_intent.payment_failed':
+      return `Payment of $${((obj.amount||0)/100).toFixed(2)} FAILED: ${obj.last_payment_error?.message || 'unknown'}`;
+    case 'charge.refunded':
+      return `Refund of $${((obj.amount_refunded||0)/100).toFixed(2)}`;
+    default:
+      return event.type;
+  }
+}
+
+function eventAmount(event) {
+  const obj = event.data.object;
+  const cents = obj.amount_received || obj.amount || obj.amount_refunded || 0;
+  return cents / 100;
+}
+
+async function familyWithBalance(familyId) {
+  const { rows: fRows } = await pool.query(`SELECT * FROM collections_families WHERE id=$1`, [familyId]);
+  if (!fRows[0]) return null;
+  const family = fRows[0];
+  const { rows: pRows } = await pool.query(
+    `SELECT COALESCE(SUM(amount - amount_refunded), 0) AS total_paid
+     FROM collections_payments WHERE family_id=$1 AND status='succeeded'`,
+    [familyId]
+  );
+  const totalPaid = parseFloat(pRows[0].total_paid) || 0;
+  const original = parseFloat(family.original_balance) || 0;
+  const remaining = Math.max(0, original - totalPaid);
+  return {
+    ...family,
+    total_paid: totalPaid,
+    remaining_balance: remaining,
+    discount_pay_in_full: remaining / 2,
+  };
+}
+
+app.get('/api/collections/families', ssoAuth, async (req, res) => {
+  const { status } = req.query;
+  const params = [];
+  let q = `SELECT f.*,
+             COALESCE((SELECT SUM(amount - amount_refunded) FROM collections_payments
+                       WHERE family_id=f.id AND status='succeeded'), 0) AS total_paid,
+             COALESCE((SELECT COUNT(*) FROM collections_payments
+                       WHERE family_id=f.id AND status='failed'), 0) AS failed_count
+           FROM collections_families f WHERE 1=1`;
+  if (status) { params.push(status); q += ` AND f.status=$${params.length}`; }
+  q += ` ORDER BY f.status ASC, f.family_name ASC`;
+  const { rows } = await pool.query(q, params);
+  res.json(rows.map(r => ({
+    ...r,
+    total_paid: parseFloat(r.total_paid),
+    remaining_balance: Math.max(0, parseFloat(r.original_balance) - parseFloat(r.total_paid)),
+    discount_pay_in_full: Math.max(0, parseFloat(r.original_balance) - parseFloat(r.total_paid)) / 2,
+    failed_count: parseInt(r.failed_count),
+  })));
+});
+
+app.get('/api/collections/families/:id', ssoAuth, async (req, res) => {
+  const family = await familyWithBalance(req.params.id);
+  if (!family) return res.status(404).json({ error: 'Not found' });
+  const { rows: payments } = await pool.query(
+    `SELECT * FROM collections_payments WHERE family_id=$1 ORDER BY created_at DESC`, [req.params.id]);
+  const { rows: events } = await pool.query(
+    `SELECT * FROM collections_events WHERE family_id=$1 ORDER BY created_at DESC LIMIT 50`, [req.params.id]);
+  res.json({ family, payments, events });
+});
+
+app.post('/api/collections/families', ssoAuth, async (req, res) => {
+  const { family_name, primary_contact_email, primary_contact_phone, children_names,
+          original_balance, center, left_date, notes } = req.body;
+  if (!family_name || !original_balance) return res.status(400).json({ error: 'family_name and original_balance required' });
+  const { rows } = await pool.query(
+    `INSERT INTO collections_families
+     (family_name, primary_contact_email, primary_contact_phone, children_names,
+      original_balance, center, left_date, notes)
+     VALUES ($1,$2,$3,$4,$5,$6,$7,$8) RETURNING *`,
+    [family_name, primary_contact_email||null, primary_contact_phone||null, children_names||null,
+     original_balance, center||null, left_date||null, notes||null]
+  );
+  res.json(rows[0]);
+});
+
+app.put('/api/collections/families/:id', ssoAuth, async (req, res) => {
+  const { family_name, primary_contact_email, primary_contact_phone, children_names,
+          original_balance, center, left_date, status, notes } = req.body;
+  const { rows } = await pool.query(
+    `UPDATE collections_families SET
+       family_name=COALESCE($1, family_name),
+       primary_contact_email=$2, primary_contact_phone=$3, children_names=$4,
+       original_balance=COALESCE($5, original_balance),
+       center=$6, left_date=$7,
+       status=COALESCE($8, status), notes=$9, updated_at=NOW()
+     WHERE id=$10 RETURNING *`,
+    [family_name||null, primary_contact_email||null, primary_contact_phone||null, children_names||null,
+     original_balance==null ? null : original_balance, center||null, left_date||null,
+     status||null, notes||null, req.params.id]
+  );
+  res.json(rows[0]);
+});
+
+app.delete('/api/collections/families/:id', ssoAuth, async (req, res) => {
+  await pool.query(`DELETE FROM collections_families WHERE id=$1`, [req.params.id]);
+  res.json({ success: true });
+});
+
+app.post('/api/collections/families/import', ssoAuth, upload.single('file'), async (req, res) => {
+  if (!req.file) return res.status(400).json({ error: 'No file uploaded' });
+  let records;
+  try {
+    records = parse(req.file.buffer.toString(), { columns: true, skip_empty_lines: true, trim: true });
+  } catch (e) { return res.status(400).json({ error: 'CSV parse error: ' + e.message }); }
+
+  let created = 0, skipped = 0;
+  const errors = [];
+  for (let i = 0; i < records.length; i++) {
+    const row = records[i];
+    const name = row['Family Name'] || row['family_name'] || row['Name'] || '';
+    const balance = parseFloat(row['Balance'] || row['Original Balance'] || row['original_balance'] || row['Amount Owed'] || 0);
+    if (!name || !balance) { skipped++; continue; }
+    try {
+      await pool.query(
+        `INSERT INTO collections_families
+         (family_name, primary_contact_email, primary_contact_phone, children_names,
+          original_balance, center, left_date, notes)
+         VALUES ($1,$2,$3,$4,$5,$6,$7,$8)`,
+        [name,
+         row['Email'] || row['email'] || null,
+         row['Phone'] || row['phone'] || null,
+         row['Children'] || row['children'] || row['Children Names'] || null,
+         balance,
+         row['Center'] || row['center'] || null,
+         row['Left Date'] || row['left_date'] || null,
+         row['Notes'] || row['notes'] || null]
+      );
+      created++;
+    } catch (e) {
+      errors.push(`Row ${i+2}: ${e.message}`);
+    }
+  }
+  res.json({ created, skipped, errors });
+});
+
+app.post('/api/collections/families/:id/create-links', ssoAuth, async (req, res) => {
+  if (!stripe) return res.status(503).json({ error: 'Stripe not configured. Set STRIPE_SECRET_KEY in Render environment variables.' });
+
+  const family = await familyWithBalance(req.params.id);
+  if (!family) return res.status(404).json({ error: 'Family not found' });
+
+  const remainingCents = Math.round(family.remaining_balance * 100);
+  if (remainingCents <= 0) return res.status(400).json({ error: 'No remaining balance' });
+
+  const discountCents = Math.round(remainingCents / 2);
+
+  try {
+    const payInFullPrice = await stripe.prices.create({
+      currency: 'usd',
+      unit_amount: discountCents,
+      product_data: { name: `Pay in Full — 50% off — ${family.family_name}` },
+    });
+    const payInFullLink = await stripe.paymentLinks.create({
+      line_items: [{ price: payInFullPrice.id, quantity: 1 }],
+      metadata: { family_id: String(family.id), link_type: 'pay_in_full' },
+      payment_intent_data: {
+        metadata: { family_id: String(family.id), link_type: 'pay_in_full' },
+      },
+      after_completion: { type: 'hosted_confirmation', hosted_confirmation: {
+        custom_message: `Thank you! Your balance of $${family.remaining_balance.toFixed(2)} has been paid in full (with 50% discount applied). You will receive a receipt by email.`,
+      }},
+    });
+
+    const pwycPrice = await stripe.prices.create({
+      currency: 'usd',
+      custom_unit_amount: {
+        enabled: true,
+        minimum: COLLECTIONS_MIN_PAYMENT_CENTS,
+        preset: Math.min(remainingCents, 10000),
+      },
+      product_data: { name: `Payment Toward Balance — ${family.family_name}` },
+    });
+    const pwycLink = await stripe.paymentLinks.create({
+      line_items: [{ price: pwycPrice.id, quantity: 1 }],
+      metadata: { family_id: String(family.id), link_type: 'pay_what_you_can' },
+      payment_intent_data: {
+        metadata: { family_id: String(family.id), link_type: 'pay_what_you_can' },
+      },
+      after_completion: { type: 'hosted_confirmation', hosted_confirmation: {
+        custom_message: `Thank you for your payment! Every contribution helps settle your balance with The Children's Center.`,
+      }},
+    });
+
+    const { rows } = await pool.query(
+      `UPDATE collections_families SET
+         payinfull_link_url=$1, payinfull_link_id=$2,
+         paywhatyoucan_link_url=$3, paywhatyoucan_link_id=$4,
+         updated_at=NOW()
+       WHERE id=$5 RETURNING *`,
+      [payInFullLink.url, payInFullLink.id, pwycLink.url, pwycLink.id, family.id]
+    );
+
+    res.json({
+      pay_in_full: { url: payInFullLink.url, amount: discountCents / 100 },
+      pay_what_you_can: { url: pwycLink.url, minimum: COLLECTIONS_MIN_PAYMENT_CENTS / 100 },
+      family: rows[0],
+    });
+  } catch (e) {
+    console.error('Stripe link creation failed:', e);
+    res.status(500).json({ error: 'Stripe error: ' + e.message });
+  }
+});
+
+app.post('/api/collections/families/:id/deactivate-links', ssoAuth, async (req, res) => {
+  if (!stripe) return res.status(503).json({ error: 'Stripe not configured' });
+  const { rows } = await pool.query(`SELECT payinfull_link_id, paywhatyoucan_link_id FROM collections_families WHERE id=$1`, [req.params.id]);
+  if (!rows[0]) return res.status(404).json({ error: 'Not found' });
+  const deactivated = [];
+  for (const linkId of [rows[0].payinfull_link_id, rows[0].paywhatyoucan_link_id]) {
+    if (!linkId) continue;
+    try {
+      await stripe.paymentLinks.update(linkId, { active: false });
+      deactivated.push(linkId);
+    } catch (e) { /* skip */ }
+  }
+  await pool.query(
+    `UPDATE collections_families SET payinfull_link_url=NULL, payinfull_link_id=NULL,
+       paywhatyoucan_link_url=NULL, paywhatyoucan_link_id=NULL, updated_at=NOW() WHERE id=$1`,
+    [req.params.id]
+  );
+  res.json({ deactivated });
+});
+
+app.get('/api/collections/dashboard', ssoAuth, async (req, res) => {
+  const [familiesQ, paymentsQ, failedQ, recentQ] = await Promise.all([
+    pool.query(`SELECT
+      COUNT(*) FILTER (WHERE status='active') as active_count,
+      COUNT(*) FILTER (WHERE status='settled') as settled_count,
+      COALESCE(SUM(original_balance) FILTER (WHERE status='active'), 0) as total_owed
+     FROM collections_families`),
+    pool.query(`SELECT
+      COALESCE(SUM(amount - amount_refunded), 0) as collected_total,
+      COALESCE(SUM(amount - amount_refunded) FILTER (WHERE paid_at >= date_trunc('month', NOW())), 0) as collected_this_month,
+      COUNT(*) FILTER (WHERE paid_at >= date_trunc('month', NOW())) as payments_this_month
+     FROM collections_payments WHERE status='succeeded'`),
+    pool.query(`SELECT p.*, f.family_name FROM collections_payments p
+                LEFT JOIN collections_families f ON p.family_id=f.id
+                WHERE p.status='failed' AND p.created_at > NOW() - INTERVAL '30 days'
+                ORDER BY p.created_at DESC LIMIT 20`),
+    pool.query(`SELECT e.*, f.family_name FROM collections_events e
+                LEFT JOIN collections_families f ON e.family_id=f.id
+                ORDER BY e.created_at DESC LIMIT 20`),
+  ]);
+
+  const totalOwed = parseFloat(familiesQ.rows[0].total_owed) || 0;
+  const collectedTotal = parseFloat(paymentsQ.rows[0].collected_total) || 0;
+
+  res.json({
+    stripe_configured: !!stripe,
+    summary: {
+      active_families: parseInt(familiesQ.rows[0].active_count),
+      settled_families: parseInt(familiesQ.rows[0].settled_count),
+      total_owed: totalOwed,
+      collected_total: collectedTotal,
+      collected_this_month: parseFloat(paymentsQ.rows[0].collected_this_month) || 0,
+      payments_this_month: parseInt(paymentsQ.rows[0].payments_this_month),
+      outstanding: Math.max(0, totalOwed - collectedTotal),
+    },
+    failed_payments: failedQ.rows,
+    recent_events: recentQ.rows,
+  });
+});
+
+// ── Serve frontend ───────────────────────────────────────────────────────────
+app.get('*', (req, res) => res.sendFile(path.join(__dirname, 'public', 'index.html')));
 
 initDB().then(() => {
   const PORT = process.env.PORT || 3000;
