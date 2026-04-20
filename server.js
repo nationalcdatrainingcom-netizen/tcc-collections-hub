@@ -679,15 +679,53 @@ app.post('/api/upload/cdc-statement', ssoAuth, upload.single('file'), async (req
 });
 
 // ── Routes: Upload Attendance CSV ─────────────────────────────────────────────
+// ── Helper: robust CSV parsing for Playground attendance exports ─────────────
+// Playground's CSV has quirks:
+//   1. BOM (\uFEFF) at the start of the header row — breaks column lookups
+//   2. Duplicate column names: "Signer" appears twice (after Check-in AND after
+//      Check-out), and "Signature" appears twice. csv-parse's default columns:true
+//      silently drops duplicates, so the second value overwrites the first.
+//   3. Huge signature URL columns (thousands of chars) we don't care about
+// This parser strips BOM, handles duplicate headers by suffixing _2, _3, etc.,
+// and also accepts the older lowercase "last_name" / "first_name" format.
+function parsePlaygroundAttendanceCSV(buffer) {
+  let text = buffer.toString();
+  if (text.charCodeAt(0) === 0xFEFF) text = text.slice(1); // strip BOM
+
+  // Use array-mode parse so we can process headers manually
+  const rows = parse(text, { skip_empty_lines: true, trim: true });
+  if (!rows.length) return [];
+
+  // Build unique column names (append _2, _3 for duplicates)
+  const rawHeaders = rows[0].map(h => String(h || '').trim());
+  const seen = {};
+  const headers = rawHeaders.map(h => {
+    seen[h] = (seen[h] || 0) + 1;
+    return seen[h] === 1 ? h : `${h}_${seen[h]}`;
+  });
+
+  // Convert remaining rows into objects keyed by unique headers
+  return rows.slice(1).map(row => {
+    const obj = {};
+    for (let i = 0; i < headers.length; i++) obj[headers[i]] = row[i] || '';
+    return obj;
+  });
+}
+
+// Pull a value using any of the given header-name variants
+function pickAttendanceField(row, names) {
+  for (const n of names) if (row[n] !== undefined && row[n] !== '') return row[n];
+  return '';
+}
+
+
 app.post('/api/upload/attendance', ssoAuth, upload.single('file'), async (req, res) => {
   const { center } = req.body;
   if (!req.file || !center) return res.status(400).json({ error: 'Missing center or file' });
 
   let records;
   try {
-    records = parse(req.file.buffer.toString(), {
-      columns: true, skip_empty_lines: true, trim: true
-    });
+    records = parsePlaygroundAttendanceCSV(req.file.buffer);
   } catch (e) { return res.status(400).json({ error: 'CSV parse error: ' + e.message }); }
 
   const centerKey = center.toLowerCase().replace(/\s+/g,'').replace('peace','peace').replace('niles','niles').replace('montessori','montessori');
@@ -696,11 +734,11 @@ app.post('/api/upload/attendance', ssoAuth, upload.single('file'), async (req, r
   const flags = [];
 
   for (const row of records) {
-    const lastName = row['Last name'] || row['last_name'] || '';
-    const firstName = row['First name'] || row['first_name'] || '';
-    const dateStr = row['Date'] || row['date'] || '';
-    const checkin = row['Check-in'] || row['checkin'] || '';
-    const checkout = row['Check-out'] || row['checkout'] || '';
+    const lastName = pickAttendanceField(row, ['Last name','Last Name','last_name','LastName']);
+    const firstName = pickAttendanceField(row, ['First name','First Name','first_name','FirstName']);
+    const dateStr = pickAttendanceField(row, ['Date','date']);
+    const checkin = pickAttendanceField(row, ['Check-in','Check In','checkin','CheckIn']);
+    const checkout = pickAttendanceField(row, ['Check-out','Check Out','checkout','CheckOut']);
     if (!lastName || !dateStr) continue;
 
     const isAbsent = /absent/i.test(checkin) || checkin === '-' || !checkin;
@@ -1303,18 +1341,18 @@ app.post('/api/cdc-filing/upload-attendance', ssoAuth, upload.single('file'), as
 
   let records;
   try {
-    records = parse(req.file.buffer.toString(), { columns: true, skip_empty_lines: true, trim: true });
+    records = parsePlaygroundAttendanceCSV(req.file.buffer);
   } catch (e) { return res.status(400).json({ error: 'CSV parse error: ' + e.message }); }
 
   let processed = 0, autoCreated = 0, rowsWithBlocks = 0;
   const flagsList = [];
 
   for (const row of records) {
-    const lastName = row['Last name'] || row['last_name'] || row['Last Name'] || '';
-    const firstName = row['First name'] || row['first_name'] || row['First Name'] || '';
-    const dateStr = row['Date'] || row['date'] || '';
-    const checkin = row['Check-in'] || row['checkin'] || row['Check In'] || '';
-    const checkout = row['Check-out'] || row['checkout'] || row['Check Out'] || '';
+    const lastName = pickAttendanceField(row, ['Last name','Last Name','last_name','LastName']);
+    const firstName = pickAttendanceField(row, ['First name','First Name','first_name','FirstName']);
+    const dateStr = pickAttendanceField(row, ['Date','date']);
+    const checkin = pickAttendanceField(row, ['Check-in','Check In','checkin','CheckIn']);
+    const checkout = pickAttendanceField(row, ['Check-out','Check Out','checkout','CheckOut']);
     if (!lastName || !dateStr) continue;
 
     const dateObj = new Date(dateStr);
