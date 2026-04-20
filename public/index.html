@@ -1136,7 +1136,7 @@ pages['upload-attendance'] = async () => {
   window.__UPLOAD_PERIODS = Object.fromEntries(periods.map(p => [p.period_number, p]));
 
   content.innerHTML = `
-    ${centerSelector('document.getElementById("att-center-label").textContent=currentCenter;updateUploadInstructions()')}
+    ${centerSelector("pages['upload-attendance']()")}
 
     <div class="card">
       <div class="card-title">📅 Step 1 — Select the billing period</div>
