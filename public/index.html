@@ -1105,36 +1105,133 @@ async function saveCDCRow(id) {
 }
 
 // ── Upload Attendance ─────────────────────────────────────────────────────────
-pages['upload-attendance'] = () => {
+pages['upload-attendance'] = async () => {
   document.getElementById('page-title').textContent = 'Upload Timesheets';
   document.getElementById('topbar-actions').innerHTML = '';
-  document.getElementById('content').innerHTML = `
-    ${centerSelector('document.getElementById("att-center-label").textContent=currentCenter')}
+  const content = document.getElementById('content');
+  content.innerHTML = '<div class="loading">Loading billing periods…</div>';
+
+  // Pull periods to drive the dropdown (same pattern as the wizard and billing engine)
+  const periods = await api('GET', '/billing-periods');
+  periods.sort((a,b) => String(a.start_date).localeCompare(String(b.start_date)));
+
+  // Default to the period whose dates contain today, or the most recent ended period
+  const today = new Date().toISOString().split('T')[0];
+  let defaultPeriod = periods.find(p => {
+    const s = String(p.start_date).split('T')[0];
+    const e = String(p.end_date).split('T')[0];
+    return s <= today && today <= e;
+  });
+  if (!defaultPeriod) {
+    defaultPeriod = [...periods].reverse().find(p => String(p.end_date).split('T')[0] <= today) || periods[0];
+  }
+
+  const periodOptions = periods.map(p => {
+    const s = String(p.start_date).split('T')[0];
+    const e = String(p.end_date).split('T')[0];
+    const label = `Period ${p.period_number}: ${fmtDateShort(s)} – ${fmtDateShort(e)}`;
+    return `<option value="${p.period_number}" ${defaultPeriod && p.period_number === defaultPeriod.period_number ? 'selected' : ''}>${label}</option>`;
+  }).join('');
+
+  window.__UPLOAD_PERIODS = Object.fromEntries(periods.map(p => [p.period_number, p]));
+
+  content.innerHTML = `
+    ${centerSelector('document.getElementById("att-center-label").textContent=currentCenter;updateUploadInstructions()')}
+
     <div class="card">
-      <div class="card-title">📤 Upload Playground Attendance CSV</div>
-      <p style="font-size:13.5px;color:var(--gray);margin-bottom:20px">
-        Upload the Playground daily attendance export for <strong id="att-center-label">${currentCenter}</strong>.
-        The system will process each child's check-in/out times and apply billing rules automatically.
+      <div class="card-title">📅 Step 1 — Select the billing period</div>
+      <p style="font-size:13.5px;color:var(--gray);margin-bottom:12px;line-height:1.6">
+        Pick the CDC period you're filing for. The exact dates to enter in Playground will update below.
+      </p>
+      <div class="form-group" style="max-width:600px;margin-bottom:0">
+        <select id="att-period" style="font-size:14px" onchange="updateUploadInstructions()">${periodOptions}</select>
+      </div>
+    </div>
+
+    <div class="card">
+      <div class="card-title">📋 Step 2 — Pull the attendance CSV from Playground for <span id="att-center-label">${currentCenter}</span></div>
+      <div id="att-instructions"></div>
+    </div>
+
+    <div class="card">
+      <div class="card-title">📤 Step 3 — Upload the CSV</div>
+      <p style="font-size:13.5px;color:var(--gray);margin-bottom:12px;line-height:1.6">
+        Once you've exported the CSV from Playground following the steps above, drop it here.
+        Repeat this process for each center (switch the tab at the top).
       </p>
       <div class="upload-zone" id="att-drop" onclick="document.getElementById('att-file').click()">
         <div style="font-size:40px">⬆️</div>
-        <p><strong>Click to upload attendance CSV</strong></p>
-        <p>Columns expected: Last name, First name, Date, Check-in, Check-out</p>
+        <p style="margin:8px 0 4px"><strong>Click to upload Playground attendance CSV</strong></p>
+        <p id="att-drop-dates" style="font-size:12.5px;color:var(--gray);margin:0"></p>
       </div>
       <input type="file" id="att-file" accept=".csv" onchange="handleAttUpload(this)">
       <div id="att-result" style="margin-top:20px"></div>
     </div>
+
     <div class="card">
-      <div class="card-title">ℹ️ How It Works</div>
-      <p style="font-size:13.5px;color:var(--gray);line-height:1.7">
-        When you upload, the system:<br>
-        1. Matches each child to the roster, auto-creating unknowns with a flag<br>
-        2. Detects late pickups after 6pm and logs them with fee calculations<br>
-        3. Flags any children with unknown subsidy status so you can set them<br>
-        4. Records all check-in/out times for the billing engine to process
-      </p>
+      <div class="card-title">ℹ️ What happens after upload</div>
+      <ul style="font-size:13.5px;color:var(--gray);line-height:1.9;padding-left:22px;margin:0">
+        <li>Each child is matched to the roster — unknowns are auto-created and flagged</li>
+        <li>Late pickups after 6pm are logged with fee calculations</li>
+        <li>Children with unknown subsidy status are flagged for you to review</li>
+        <li>All check-in/out times are stored for the Billing Engine and CDC Filing Wizard to process</li>
+      </ul>
     </div>`;
+
+  updateUploadInstructions();
 };
+
+function updateUploadInstructions() {
+  const sel = document.getElementById('att-period');
+  if (!sel) return;
+  const p = window.__UPLOAD_PERIODS[sel.value];
+  if (!p) return;
+
+  const start = String(p.start_date).split('T')[0];
+  const end = String(p.end_date).split('T')[0];
+  const deadline = String(p.reporting_deadline).split('T')[0];
+
+  // VA-friendly deadline (1 day earlier for timezone)
+  const vaDeadlineDate = new Date(deadline + 'T00:00:00Z');
+  vaDeadlineDate.setUTCDate(vaDeadlineDate.getUTCDate() - 1);
+  const vaDeadline = vaDeadlineDate.toISOString().split('T')[0];
+
+  // Format dates in the format Playground typically accepts: MM/DD/YYYY
+  const toMMDDYYYY = (iso) => {
+    const d = new Date(iso + 'T00:00:00Z');
+    return `${String(d.getUTCMonth()+1).padStart(2,'0')}/${String(d.getUTCDate()).padStart(2,'0')}/${d.getUTCFullYear()}`;
+  };
+  const startMMDD = toMMDDYYYY(start);
+  const endMMDD = toMMDDYYYY(end);
+
+  document.getElementById('att-instructions').innerHTML = `
+    <div style="background:var(--blue-light);border-left:3px solid var(--blue);padding:16px 20px;border-radius:6px">
+      <div style="font-weight:600;color:var(--blue);font-size:14px;margin-bottom:10px">
+        Period ${p.period_number}: ${fmtDate(start)} – ${fmtDate(end)}
+      </div>
+      <ol style="font-size:13.5px;line-height:2;color:var(--navy);padding-left:22px;margin:0">
+        <li>Log into <strong>Playground</strong></li>
+        <li>Switch to the <strong>${currentCenter}</strong> center</li>
+        <li>Go to <strong>Reports → Attendance Daily with Sign In/Out</strong></li>
+        <li>Set <strong>Start Date</strong> to <strong style="color:var(--red);background:#fff;padding:2px 8px;border-radius:4px;font-family:monospace">${startMMDD}</strong></li>
+        <li>Set <strong>End Date</strong> to <strong style="color:var(--red);background:#fff;padding:2px 8px;border-radius:4px;font-family:monospace">${endMMDD}</strong></li>
+        <li>Select <strong>All Students</strong></li>
+        <li>Click <strong>Generate</strong> to run the report</li>
+        <li>Click <strong>Export</strong> and save the CSV file</li>
+        <li>Come back here and upload the CSV in Step 3 below</li>
+      </ol>
+    </div>
+    <div style="background:var(--red-light);border:1px solid var(--red);border-radius:6px;padding:10px 14px;margin-top:10px;font-size:13px;line-height:1.6">
+      📅 <strong>Must be filed by: ${fmtDate(deadline)}${p.deadline_is_4pm ? ' (4:00 PM ET)' : ''}</strong>
+      <div style="margin-top:4px">🌏 <strong>VA target deadline: ${fmtDate(vaDeadline)}</strong>
+        <span style="color:var(--gray)">— 1 day early to account for timezone differences.</span>
+      </div>
+    </div>`;
+
+  // Update the drop-zone hint
+  const hint = document.getElementById('att-drop-dates');
+  if (hint) hint.textContent = `Period ${p.period_number} · ${fmtDateShort(start)} – ${fmtDateShort(end)} · ${currentCenter}`;
+}
 
 async function handleAttUpload(input) {
   const file = input.files[0];
