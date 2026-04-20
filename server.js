@@ -7,6 +7,8 @@ const jwt = require('jsonwebtoken');
 const cors = require('cors');
 const path = require('path');
 const fs = require('fs');
+const os = require('os');
+const { execFile } = require('child_process');
 
 // Stripe is optional — only used for the Collections/Pay-What-You-Can feature.
 // If STRIPE_SECRET_KEY isn't set, the Collections UI still works but payment
@@ -679,6 +681,254 @@ app.post('/api/upload/cdc-statement', ssoAuth, upload.single('file'), async (req
   }
 
   res.json({ inserted: inserted.length, flags });
+});
+
+// ═════════════════════════════════════════════════════════════════════════════
+// ── CDC Statement PDF Upload (auto-detect CDC status) ───────────────────────
+// ═════════════════════════════════════════════════════════════════════════════
+// Accepts a DHS-1381 Statement of Payments PDF, shells out to parse_cdc.py,
+// and auto-applies CDC status to children based on whether they got paid.
+//
+// Rules:
+//   • paid > 0       → set is_cdc=true, subsidy_type='cdc'/'cdc_gsrp', fill case_no,
+//                       child_id_number, authorized_hours (overwrite existing values)
+//   • no_auth or $0  → flag for review, leave is_cdc alone
+//   • not in roster + paid → auto-create as CDC child
+//   • not in roster + no_auth → auto-create as 'unknown', flag
+//   • CDC child on roster but NOT on this statement → flag MISSING_FROM_STATEMENT
+
+function runCDCStatementParser(pdfBuffer) {
+  return new Promise((resolve, reject) => {
+    // Write PDF to a temp file so Python can read it
+    const tmpPath = path.join(os.tmpdir(), `cdc_${Date.now()}_${Math.random().toString(36).slice(2)}.pdf`);
+    try {
+      fs.writeFileSync(tmpPath, pdfBuffer);
+    } catch (e) {
+      return reject(new Error(`Could not write temp PDF: ${e.message}`));
+    }
+
+    const script = path.join(__dirname, 'parse_cdc.py');
+    execFile('python3', [script, tmpPath], { maxBuffer: 20 * 1024 * 1024, timeout: 60000 }, (err, stdout, stderr) => {
+      try { fs.unlinkSync(tmpPath); } catch {}
+      if (err) {
+        return reject(new Error(`Parser failed: ${stderr || err.message}`));
+      }
+      try {
+        resolve(JSON.parse(stdout));
+      } catch (e) {
+        reject(new Error(`Parser returned invalid JSON: ${e.message}\nOutput: ${stdout.slice(0, 300)}`));
+      }
+    });
+  });
+}
+
+// Normalize a CDC-statement name ("LAST, FIRST MIDDLE" or "LAST FIRST") to
+// {firstName, lastName} so we can match against the roster.
+function splitStatementName(raw) {
+  if (!raw) return null;
+  let s = String(raw).trim();
+  // Most DHS PDFs use "LASTNAME, FIRSTNAME [MIDDLE]"
+  if (s.includes(',')) {
+    const [last, rest] = s.split(',').map(x => x.trim());
+    const firstParts = rest.split(/\s+/);
+    return { firstName: firstParts[0] || '', lastName: last };
+  }
+  // Fallback: "FIRST LAST"
+  const parts = s.split(/\s+/);
+  if (parts.length < 2) return { firstName: parts[0] || '', lastName: '' };
+  return { firstName: parts[0], lastName: parts.slice(1).join(' ') };
+}
+
+app.post('/api/upload/cdc-statement-pdf', ssoAuth, upload.single('file'), async (req, res) => {
+  const startTime = Date.now();
+  const { center, period_number } = req.body;
+  if (!req.file || !center || !period_number) {
+    return res.status(400).json({ error: 'Missing center, period_number, or PDF file' });
+  }
+  if (!/\.pdf$/i.test(req.file.originalname || '') && req.file.mimetype !== 'application/pdf') {
+    return res.status(400).json({ error: 'File must be a PDF' });
+  }
+
+  let parsed;
+  try {
+    parsed = await runCDCStatementParser(req.file.buffer);
+  } catch (e) {
+    console.error('[cdc-statement-pdf] parser error:', e);
+    return res.status(500).json({ error: e.message });
+  }
+
+  if (parsed.errors?.length) {
+    // Non-fatal — parser may still have extracted children even with warnings
+    console.warn('[cdc-statement-pdf] parser warnings:', parsed.errors);
+  }
+
+  const results = {
+    parsed_children: parsed.children?.length || 0,
+    paid_matched: 0,       // in roster AND paid — is_cdc set to true
+    paid_created: 0,       // NOT in roster, paid — auto-created as CDC
+    no_auth_flagged: 0,    // on statement but no_auth or $0
+    missing_from_statement: 0, // CDC in roster but not on this statement
+    details: [],           // per-child outcome for the UI
+    flags: [],
+    statement_info: {
+      voucher: parsed.voucher || '',
+      statement_date: parsed.statement_date || '',
+      pay_period: parsed.pay_period || '',
+      total_pay: parsed.total_pay || 0,
+      net_total_pay: parsed.net_total_pay || 0,
+      detected_center: parsed.center || '',
+    },
+  };
+
+  // Track which children we saw on the statement, for the missing-from-statement check
+  const seenChildIds = new Set();
+
+  for (const entry of parsed.children || []) {
+    const name = splitStatementName(entry.name);
+    if (!name || !name.lastName) {
+      results.details.push({
+        name: entry.name, status: 'UNPARSEABLE_NAME', amount: entry.amount_paid,
+      });
+      continue;
+    }
+
+    // Find by name first
+    let childRow = await pool.query(
+      `SELECT id, is_cdc, is_gsrp, subsidy_type, child_id_number, case_number
+       FROM children
+       WHERE center=$1 AND LOWER(first_name)=LOWER($2) AND LOWER(last_name)=LOWER($3)`,
+      [center, name.firstName, name.lastName]
+    );
+
+    // If no name match but we have a Child ID Number, try matching by that
+    if (!childRow.rows[0] && entry.child_id) {
+      childRow = await pool.query(
+        `SELECT id, is_cdc, is_gsrp, subsidy_type, child_id_number, case_number
+         FROM children WHERE center=$1 AND child_id_number=$2`,
+        [center, entry.child_id]
+      );
+    }
+
+    let childId = childRow.rows[0]?.id || null;
+    const existing = childRow.rows[0];
+    const isPaid = entry.amount_paid > 0 && !entry.is_no_auth;
+    const fullName = `${name.firstName} ${name.lastName}`.trim();
+
+    // ── Not in roster ────────────────────────────────────────────────────────
+    if (!childId) {
+      if (isPaid) {
+        // Auto-create as CDC child
+        const ins = await pool.query(
+          `INSERT INTO children (center, first_name, last_name, subsidy_type, is_cdc, is_active,
+             child_id_number, case_number, authorized_hours, notes)
+           VALUES ($1,$2,$3,'cdc',true,true,$4,$5,$6,'Auto-created from CDC statement PDF')
+           ON CONFLICT (center, first_name, last_name) DO UPDATE
+             SET is_cdc=true, subsidy_type=EXCLUDED.subsidy_type,
+                 child_id_number=EXCLUDED.child_id_number,
+                 case_number=EXCLUDED.case_number,
+                 authorized_hours=EXCLUDED.authorized_hours,
+                 updated_at=NOW()
+           RETURNING id`,
+          [center, name.firstName, name.lastName,
+           entry.child_id || null, entry.case_no || null, entry.hours_auth || null]
+        );
+        childId = ins.rows[0].id;
+        results.paid_created++;
+        results.details.push({
+          name: fullName, status: 'CREATED_AND_SET_CDC', amount: entry.amount_paid,
+          child_id: entry.child_id, case_no: entry.case_no,
+        });
+      } else {
+        // On statement but not paid — create as 'unknown' so the name lookup works next time
+        const ins = await pool.query(
+          `INSERT INTO children (center, first_name, last_name, subsidy_type, notes)
+           VALUES ($1,$2,$3,'unknown','On CDC statement (no auth / $0) — please review')
+           ON CONFLICT (center, first_name, last_name) DO UPDATE SET notes=EXCLUDED.notes RETURNING id`,
+          [center, name.firstName, name.lastName]
+        );
+        childId = ins.rows[0].id;
+        const flagType = entry.is_no_auth ? 'NO_AUTHORIZATION' : 'NOT_FOUND_IN_DHS';
+        await createFlag(center, childId, fullName, flagType,
+          `${entry.is_no_auth ? 'No authorization' : entry.error || '$0 paid'} on CDC statement for period ${period_number}`,
+          period_number);
+        results.no_auth_flagged++;
+        results.flags.push({ childName: fullName, type: flagType });
+        results.details.push({
+          name: fullName, status: 'FLAGGED_NO_AUTH', amount: entry.amount_paid, reason: entry.error || 'no auth / $0',
+        });
+      }
+    }
+    // ── Already in roster ───────────────────────────────────────────────────
+    else if (isPaid) {
+      // Paid → set is_cdc=true, overwrite statement fields
+      const newSubsidy = existing.is_gsrp ? 'cdc_gsrp' : 'cdc';
+      await pool.query(
+        `UPDATE children SET
+           is_cdc=true,
+           subsidy_type=$1,
+           child_id_number=$2,
+           case_number=$3,
+           authorized_hours=$4,
+           updated_at=NOW()
+         WHERE id=$5`,
+        [newSubsidy, entry.child_id || null, entry.case_no || null, entry.hours_auth || null, childId]
+      );
+      results.paid_matched++;
+      results.details.push({
+        name: fullName, status: 'MATCHED_AND_SET_CDC', amount: entry.amount_paid,
+        previously_cdc: existing.is_cdc, child_id: entry.child_id, case_no: entry.case_no,
+      });
+    }
+    // In roster + not paid → flag, don't change is_cdc
+    else {
+      const flagType = entry.is_no_auth ? 'NO_AUTHORIZATION' : 'NOT_FOUND_IN_DHS';
+      await createFlag(center, childId, fullName, flagType,
+        `${entry.is_no_auth ? 'No authorization' : entry.error || '$0 paid'} on CDC statement for period ${period_number}`,
+        period_number);
+      results.no_auth_flagged++;
+      results.flags.push({ childName: fullName, type: flagType });
+      results.details.push({
+        name: fullName, status: 'FLAGGED_NO_AUTH', amount: entry.amount_paid, reason: entry.error || 'no auth / $0',
+      });
+    }
+
+    // Record the cdc_periods entry for reconciliation page
+    if (childId) {
+      seenChildIds.add(childId);
+      await pool.query(
+        `INSERT INTO cdc_periods (period_number, center, child_id, child_name, billed, amount_paid, status, notes)
+         VALUES ($1,$2,$3,$4,$5,$6,$7,$8)
+         ON CONFLICT DO NOTHING`,
+        [period_number, center, childId, fullName, true, entry.amount_paid || null,
+         entry.is_no_auth ? 'no_auth' : isPaid ? 'paid' : 'unknown',
+         entry.error || null]
+      );
+    }
+  }
+
+  // ── Children marked CDC in roster but NOT on this statement ──────────────
+  const cdcKids = await pool.query(
+    `SELECT id, first_name, last_name FROM children
+     WHERE center=$1 AND is_cdc=true AND is_active=true`,
+    [center]
+  );
+  for (const c of cdcKids.rows) {
+    if (seenChildIds.has(c.id)) continue;
+    const fullName = `${c.first_name} ${c.last_name}`;
+    await createFlag(center, c.id, fullName, 'MISSING_FROM_STATEMENT',
+      `CDC child not on statement for period ${period_number} — family should be billed directly`,
+      period_number);
+    results.missing_from_statement++;
+    results.flags.push({ childName: fullName, type: 'MISSING_FROM_STATEMENT' });
+    results.details.push({ name: fullName, status: 'MISSING_FROM_STATEMENT' });
+  }
+
+  const ms = Date.now() - startTime;
+  console.log(`[cdc-statement-pdf] ${center} period ${period_number}: parsed ${results.parsed_children}, ` +
+              `matched ${results.paid_matched}, created ${results.paid_created}, ` +
+              `flagged ${results.no_auth_flagged}, missing ${results.missing_from_statement} (${ms}ms)`);
+
+  res.json({ ...results, elapsed_ms: ms });
 });
 
 // ── Routes: Upload Attendance CSV ─────────────────────────────────────────────
