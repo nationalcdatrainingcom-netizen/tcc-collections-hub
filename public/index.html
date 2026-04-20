@@ -1805,6 +1805,8 @@ async function renderWizard() {
 async function renderWizardStep1(body) {
   body.innerHTML = '<div class="loading">Loading billing periods…</div>';
   const periods = await api('GET', '/billing-periods');
+  // Sort ascending (oldest first) to match Upload Timesheets and Billing Engine
+  periods.sort((a,b) => String(a.start_date).localeCompare(String(b.start_date)));
 
   // Find the most likely "current" period (the one whose reporting deadline is nearest today)
   const today = new Date().toISOString().split('T')[0];
@@ -1812,7 +1814,7 @@ async function renderWizardStep1(body) {
     const end = new Date(p.end_date).toISOString().split('T')[0];
     const deadline = new Date(p.reporting_deadline).toISOString().split('T')[0];
     return end <= today && deadline >= today;
-  }) || periods.find(p => new Date(p.end_date).toISOString().split('T')[0] <= today);
+  }) || [...periods].reverse().find(p => new Date(p.end_date).toISOString().split('T')[0] <= today);
 
   body.innerHTML = `
     <div class="card">
