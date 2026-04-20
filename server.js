@@ -18,14 +18,38 @@ app.use(express.json());
 app.use(express.static(path.join(__dirname, 'public')));
 
 // ── SSO Middleware ──────────────────────────────────────────────────────────
+// ALLOW_DIRECT_ACCESS (default true) lets Mary hit the app without going
+// through the TCC Hub. If a token is present and valid it's used; otherwise
+// requests are authorized as the owner. Set ALLOW_DIRECT_ACCESS=false in Render
+// once Hub SSO is wired up for billing coordinators.
+const ALLOW_DIRECT_ACCESS = (process.env.ALLOW_DIRECT_ACCESS || 'true').toLowerCase() === 'true';
+const DIRECT_ACCESS_USER = { email: 'mary@childrenscenterinc.com', name: 'Mary Wardlaw', role: 'owner', direct: true };
+
 function ssoAuth(req, res, next) {
   const token = req.query.token || req.headers['authorization']?.replace('Bearer ', '');
-  if (!token) return res.status(401).json({ error: 'Unauthorized' });
-  try {
-    req.user = jwt.verify(token, JWT_SECRET);
-    next();
-  } catch { res.status(401).json({ error: 'Invalid token' }); }
+  if (token && token !== 'null' && token !== 'undefined') {
+    try {
+      req.user = jwt.verify(token, JWT_SECRET);
+      return next();
+    } catch (e) {
+      if (ALLOW_DIRECT_ACCESS) {
+        req.user = DIRECT_ACCESS_USER;
+        return next();
+      }
+      return res.status(401).json({ error: 'Invalid token' });
+    }
+  }
+  if (ALLOW_DIRECT_ACCESS) {
+    req.user = DIRECT_ACCESS_USER;
+    return next();
+  }
+  return res.status(401).json({ error: 'Unauthorized' });
 }
+
+// Public endpoint so frontend can know whether direct access is allowed
+app.get('/api/auth/mode', (req, res) => {
+  res.json({ allowDirectAccess: ALLOW_DIRECT_ACCESS, user: ALLOW_DIRECT_ACCESS ? DIRECT_ACCESS_USER : null });
+});
 
 // ── DB Init ─────────────────────────────────────────────────────────────────
 async function initDB() {
@@ -221,7 +245,193 @@ app.post('/api/children', ssoAuth, async (req, res) => {
   res.json(rows[0]);
 });
 
-// ── Routes: Upload CDC Statement ─────────────────────────────────────────────
+// ── Routes: Bulk Roster Import (Playground CSV) ───────────────────────────────
+// Playground exports typically include columns like:
+//   "First Name", "Last Name", "Date of Birth", "Classroom", "Status",
+//   "Enrollment Status", "Funding Source", "Subsidy", "Tags", etc.
+// This endpoint accepts the raw Playground CSV and maps it into our children
+// table. It supports a dry-run preview (no DB writes) and a commit mode.
+
+function normHeader(h) {
+  return String(h || '').toLowerCase().replace(/[^a-z0-9]/g, '');
+}
+
+function pickField(row, candidates) {
+  const normMap = {};
+  for (const key of Object.keys(row)) normMap[normHeader(key)] = key;
+  for (const cand of candidates) {
+    const nk = normHeader(cand);
+    if (normMap[nk] !== undefined) {
+      const v = row[normMap[nk]];
+      if (v !== undefined && v !== null && String(v).trim() !== '') return String(v).trim();
+    }
+  }
+  return '';
+}
+
+function inferSubsidy(fundingText, tagsText) {
+  const combined = `${fundingText} ${tagsText}`.toLowerCase();
+  const hasCdc = /\bcdc\b|child\s*development\s*and\s*care|subsidy/i.test(combined);
+  const hasGsrp = /gsrp|great\s*start/i.test(combined);
+  const hasTri = /tri[\s-]?share/i.test(combined);
+  if (hasCdc && hasGsrp) return { subsidy_type: 'cdc_gsrp', is_cdc: true, is_gsrp: true };
+  if (hasCdc) return { subsidy_type: 'cdc', is_cdc: true, is_gsrp: false };
+  if (hasGsrp) return { subsidy_type: 'gsrp', is_cdc: false, is_gsrp: true };
+  if (hasTri) return { subsidy_type: 'private_pay', is_cdc: false, is_gsrp: false }; // Tri-Share tracked separately
+  if (combined.trim()) return { subsidy_type: 'private_pay', is_cdc: false, is_gsrp: false };
+  return { subsidy_type: 'unknown', is_cdc: false, is_gsrp: false };
+}
+
+function inferSchoolAge(classroomText, dobText) {
+  const c = (classroomText || '').toLowerCase();
+  if (/school.?age|sa\b|kinder|before\s*&?\s*after|bns/i.test(c)) return true;
+  if (dobText) {
+    const dob = new Date(dobText);
+    if (!isNaN(dob)) {
+      const ageYears = (Date.now() - dob.getTime()) / (365.25 * 24 * 3600 * 1000);
+      if (ageYears >= 5.5) return true;
+    }
+  }
+  return false;
+}
+
+function parseRosterRow(row) {
+  const first = pickField(row, ['First Name', 'first_name', 'Child First Name', 'firstname', 'Given Name']);
+  const last  = pickField(row, ['Last Name', 'last_name', 'Child Last Name', 'lastname', 'Family Name', 'Surname']);
+  if (!first || !last) return null;
+
+  const dob       = pickField(row, ['Date of Birth', 'DOB', 'Birth Date', 'birthdate']);
+  const classroom = pickField(row, ['Classroom', 'Room', 'Class', 'Program', 'Group']);
+  const status    = pickField(row, ['Status', 'Enrollment Status', 'Active Status']);
+  const funding   = pickField(row, ['Funding Source', 'Subsidy', 'Subsidy Type', 'Funding', 'Payment Source']);
+  const tags      = pickField(row, ['Tags', 'Labels', 'Notes', 'Categories']);
+
+  const subsidy = inferSubsidy(funding, tags);
+  const is_school_age = inferSchoolAge(classroom, dob);
+  const is_active = !/withdrawn|inactive|disenrolled|terminated/i.test(status);
+
+  return {
+    first_name: first,
+    last_name: last,
+    dob: dob || null,
+    classroom: classroom || null,
+    raw_status: status || null,
+    funding: funding || null,
+    tags: tags || null,
+    ...subsidy,
+    is_school_age,
+    is_active,
+    notes: [classroom && `Classroom: ${classroom}`, funding && `Funding: ${funding}`].filter(Boolean).join(' · '),
+  };
+}
+
+// Preview — parses and returns what would be imported, no DB writes
+app.post('/api/upload/roster/preview', ssoAuth, upload.single('file'), async (req, res) => {
+  const { center } = req.body;
+  if (!req.file || !center) return res.status(400).json({ error: 'Missing center or file' });
+
+  let records;
+  try {
+    records = parse(req.file.buffer.toString(), { columns: true, skip_empty_lines: true, trim: true });
+  } catch (e) { return res.status(400).json({ error: 'CSV parse error: ' + e.message }); }
+
+  if (!records.length) return res.json({ rows: [], headers: [], errors: ['CSV appears empty'] });
+
+  const headers = Object.keys(records[0]);
+  const parsed = [];
+  const errors = [];
+
+  for (let i = 0; i < records.length; i++) {
+    const r = parseRosterRow(records[i]);
+    if (!r) { errors.push(`Row ${i+2}: missing first or last name`); continue; }
+
+    // Check whether this would be a new row or an update
+    const existing = await pool.query(
+      `SELECT id,subsidy_type,is_gsrp,is_cdc,is_school_age,is_active FROM children
+       WHERE center=$1 AND LOWER(first_name)=LOWER($2) AND LOWER(last_name)=LOWER($3)`,
+      [center, r.first_name, r.last_name]
+    );
+    parsed.push({
+      ...r,
+      action: existing.rows.length ? 'update' : 'new',
+      existing: existing.rows[0] || null,
+    });
+  }
+
+  res.json({ rows: parsed, headers, errors, totalRows: records.length });
+});
+
+// Commit — writes to DB
+app.post('/api/upload/roster/commit', ssoAuth, upload.single('file'), async (req, res) => {
+  const { center, mode } = req.body; // mode: 'merge' (default) or 'replace'
+  if (!req.file || !center) return res.status(400).json({ error: 'Missing center or file' });
+
+  let records;
+  try {
+    records = parse(req.file.buffer.toString(), { columns: true, skip_empty_lines: true, trim: true });
+  } catch (e) { return res.status(400).json({ error: 'CSV parse error: ' + e.message }); }
+
+  let created = 0, updated = 0, skipped = 0;
+  const flags = [];
+  const importedNames = new Set();
+
+  for (const row of records) {
+    const r = parseRosterRow(row);
+    if (!r) { skipped++; continue; }
+    importedNames.add(`${r.first_name.toLowerCase()}|${r.last_name.toLowerCase()}`);
+
+    const existing = await pool.query(
+      `SELECT id FROM children WHERE center=$1 AND LOWER(first_name)=LOWER($2) AND LOWER(last_name)=LOWER($3)`,
+      [center, r.first_name, r.last_name]
+    );
+
+    if (existing.rows.length === 0) {
+      const { rows } = await pool.query(
+        `INSERT INTO children (center,first_name,last_name,subsidy_type,is_gsrp,is_cdc,is_school_age,is_active,notes)
+         VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9) RETURNING id`,
+        [center, r.first_name, r.last_name, r.subsidy_type, r.is_gsrp, r.is_cdc, r.is_school_age, r.is_active, r.notes]
+      );
+      created++;
+      if (r.subsidy_type === 'unknown') {
+        await createFlag(center, rows[0].id, `${r.first_name} ${r.last_name}`, 'NEW_CHILD_NO_STATUS',
+          `Imported from Playground roster with unknown funding source — please set`, null);
+        flags.push({ childName: `${r.first_name} ${r.last_name}`, type: 'NEW_CHILD_NO_STATUS' });
+      }
+    } else {
+      // Merge mode: update inferred fields but preserve manual overrides if subsidy was already set
+      await pool.query(
+        `UPDATE children SET
+           subsidy_type = CASE WHEN subsidy_type IN ('unknown','') OR subsidy_type IS NULL THEN $1 ELSE subsidy_type END,
+           is_gsrp = CASE WHEN subsidy_type IN ('unknown','') OR subsidy_type IS NULL THEN $2 ELSE is_gsrp END,
+           is_cdc  = CASE WHEN subsidy_type IN ('unknown','') OR subsidy_type IS NULL THEN $3 ELSE is_cdc END,
+           is_school_age = $4,
+           is_active = $5,
+           notes = CASE WHEN notes IS NULL OR notes = '' THEN $6 ELSE notes END,
+           updated_at = NOW()
+         WHERE id=$7`,
+        [r.subsidy_type, r.is_gsrp, r.is_cdc, r.is_school_age, r.is_active, r.notes, existing.rows[0].id]
+      );
+      updated++;
+    }
+  }
+
+  // Replace mode: deactivate children not present in the new roster
+  let deactivated = 0;
+  if (mode === 'replace') {
+    const all = await pool.query(`SELECT id,first_name,last_name FROM children WHERE center=$1 AND is_active=true`, [center]);
+    for (const c of all.rows) {
+      const key = `${c.first_name.toLowerCase()}|${c.last_name.toLowerCase()}`;
+      if (!importedNames.has(key)) {
+        await pool.query(`UPDATE children SET is_active=false,updated_at=NOW() WHERE id=$1`, [c.id]);
+        deactivated++;
+      }
+    }
+  }
+
+  res.json({ created, updated, skipped, deactivated, flags });
+});
+
+
 app.post('/api/upload/cdc-statement', ssoAuth, upload.single('file'), async (req, res) => {
   const { center, period_number } = req.body;
   if (!req.file || !center || !period_number) return res.status(400).json({ error: 'Missing required fields' });
