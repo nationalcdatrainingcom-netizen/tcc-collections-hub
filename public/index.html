@@ -1015,25 +1015,56 @@ function statusBadge(s) {
   return map[s] || `<span class="badge-pill badge-pending">${s}</span>`;
 }
 
-function showCDCUpload() {
+async function showCDCUpload() {
+  // Pull periods to drive the dropdown (same pattern as wizard)
+  let periods = [];
+  try {
+    periods = await api('GET', '/billing-periods');
+    periods.sort((a,b) => String(a.start_date).localeCompare(String(b.start_date)));
+  } catch (e) { /* fallback to plain input */ }
+
+  const today = new Date().toISOString().split('T')[0];
+  let defaultPeriod = periods.find(p => {
+    const e = String(p.end_date).split('T')[0];
+    const d = String(p.reporting_deadline).split('T')[0];
+    return e <= today && d >= today;
+  }) || [...periods].reverse().find(p => String(p.end_date).split('T')[0] <= today) || periods[0];
+
+  const periodOptions = periods.length
+    ? periods.map(p => {
+        const label = `Period ${p.period_number}: ${fmtDateShort(p.start_date)} – ${fmtDateShort(p.end_date)}`;
+        const sel = defaultPeriod && p.period_number === defaultPeriod.period_number ? 'selected' : '';
+        return `<option value="${p.period_number}" ${sel}>${label}</option>`;
+      }).join('')
+    : '<option value="">(no periods loaded)</option>';
+
   openModal(`
-    <div class="modal-title">Upload CDC Statement</div>
+    <div class="modal-title">Upload CDC Statement PDF</div>
+    <p style="font-size:13px;color:var(--gray);line-height:1.6;margin-bottom:14px">
+      Upload the DHS-1381 Statement of Payments PDF. The system will parse it, match each child
+      against your roster, and <strong>automatically set CDC status for children who were paid</strong>
+      (including their Case No., Child ID, and Authorized Hours). No-Auth and $0 entries will be flagged for review.
+    </p>
     <div class="form-row">
       <div class="form-group"><label>Center</label>
         <select id="ucenter">${CENTERS.map(c=>`<option ${c===currentCenter?'selected':''}>${c}</option>`).join('')}</select>
       </div>
-      <div class="form-group"><label>Period Number</label>
-        <input id="uperiod" placeholder="e.g. 607">
+      <div class="form-group"><label>Billing Period</label>
+        ${periods.length
+          ? `<select id="uperiod">${periodOptions}</select>`
+          : `<input id="uperiod" placeholder="e.g. 607">`
+        }
       </div>
     </div>
-    <div class="upload-zone" id="cdc-drop" onclick="document.getElementById('cdc-file').click()">
+    <div class="upload-zone" id="cdc-drop" onclick="document.getElementById('cdc-file').click()" style="margin-bottom:0">
       <div style="font-size:36px">📄</div>
-      <p>Click to upload CDC statement CSV</p>
-      <p style="font-size:12px">Columns: Child Name, Amount Paid, Status/Notes</p>
+      <p style="margin:8px 0 4px"><strong>Click to upload CDC Statement PDF</strong></p>
+      <p style="font-size:12px;color:var(--gray);margin:0">DHS-1381 Statement of Payments</p>
     </div>
-    <input type="file" id="cdc-file" accept=".csv" onchange="handleCDCUpload(this)">
+    <input type="file" id="cdc-file" accept=".pdf" onchange="handleCDCUpload(this)">
+    <div id="cdc-upload-result" style="margin-top:14px"></div>
     <div class="modal-footer">
-      <button class="btn btn-ghost" onclick="closeModal()">Cancel</button>
+      <button class="btn btn-ghost" onclick="closeModal()">Close</button>
     </div>`);
 }
 
@@ -1041,19 +1072,100 @@ async function handleCDCUpload(input) {
   const file = input.files[0];
   if (!file) return;
   const center = document.getElementById('ucenter').value;
-  const period = document.getElementById('uperiod').value.trim();
-  if (!period) return toast('Enter a period number','error');
+  const periodEl = document.getElementById('uperiod');
+  const period = (periodEl.value || '').trim();
+  if (!period) return toast('Select a billing period','error');
+
+  const resultDiv = document.getElementById('cdc-upload-result');
+  resultDiv.innerHTML = '<div class="loading">Parsing PDF and matching children… this may take a few seconds</div>';
+
   const fd = new FormData();
   fd.append('file', file);
   fd.append('center', center);
   fd.append('period_number', period);
+
   try {
-    const result = await uploadFile('/upload/cdc-statement', fd);
-    toast(`Uploaded ${result.inserted} records. ${result.flags.length} flags raised.`,
-      result.flags.length > 0 ? 'warning' : 'success');
-    closeModal();
-    pages['cdc-reconciliation']();
-  } catch(e) { toast('Upload error: '+e.message,'error'); }
+    const r = await uploadFile('/upload/cdc-statement-pdf', fd);
+    renderCDCUploadResult(r);
+    toast(`Parsed ${r.parsed_children} children · ${r.paid_matched + r.paid_created} set as CDC · ${r.no_auth_flagged + r.missing_from_statement} flagged`, 'success');
+  } catch (e) {
+    resultDiv.innerHTML = `<div style="background:var(--red-light);border:1px solid var(--red);border-radius:8px;padding:14px;color:var(--red)">Error: ${e.message}</div>`;
+  }
+}
+
+function renderCDCUploadResult(r) {
+  const s = r.statement_info || {};
+  const detailRow = (d) => {
+    const map = {
+      MATCHED_AND_SET_CDC:   { icon:'✅', label:'Paid + set CDC', color:'var(--green)' },
+      CREATED_AND_SET_CDC:   { icon:'🆕', label:'Created + set CDC', color:'var(--green)' },
+      FLAGGED_NO_AUTH:       { icon:'⚠️', label:'Flagged (no auth / $0)', color:'var(--amber)' },
+      MISSING_FROM_STATEMENT:{ icon:'🚨', label:'Missing from statement', color:'var(--red)' },
+      UNPARSEABLE_NAME:      { icon:'❓', label:'Name unparseable', color:'var(--gray)' },
+    };
+    const info = map[d.status] || { icon:'•', label:d.status, color:'var(--gray)' };
+    return `<tr>
+      <td style="padding:6px 10px">${info.icon}</td>
+      <td style="padding:6px 10px"><strong>${d.name}</strong></td>
+      <td style="padding:6px 10px;color:${info.color};font-size:12.5px">${info.label}</td>
+      <td style="padding:6px 10px;font-size:12.5px">${d.amount != null && d.amount > 0 ? '$' + parseFloat(d.amount).toFixed(2) : ''}</td>
+      <td style="padding:6px 10px;font-size:12px;color:var(--gray)">${d.reason || d.case_no || ''}</td>
+    </tr>`;
+  };
+
+  document.getElementById('cdc-upload-result').innerHTML = `
+    <div style="background:var(--cream);border-left:3px solid var(--gold);padding:12px 16px;border-radius:6px;margin-bottom:12px;font-size:13px;line-height:1.7">
+      <strong style="color:var(--navy)">Statement: ${s.voucher || '?'}</strong> ·
+      ${s.statement_date || ''} · Pay period ${s.pay_period || '?'} ·
+      Total paid: <strong>$${(s.net_total_pay || s.total_pay || 0).toFixed(2)}</strong>
+      ${s.detected_center ? `<br>Detected center: <strong>${s.detected_center}</strong>` : ''}
+    </div>
+
+    <div style="display:grid;grid-template-columns:repeat(auto-fit,minmax(120px,1fr));gap:8px;margin-bottom:12px">
+      <div style="padding:10px;background:var(--green-light);border-radius:6px;text-align:center">
+        <div style="font-size:22px;font-weight:600;color:var(--green)">${r.paid_matched + r.paid_created}</div>
+        <div style="font-size:11px;color:var(--green);text-transform:uppercase;letter-spacing:.5px">Set as CDC</div>
+      </div>
+      <div style="padding:10px;background:var(--amber-light);border-radius:6px;text-align:center">
+        <div style="font-size:22px;font-weight:600;color:var(--amber)">${r.no_auth_flagged}</div>
+        <div style="font-size:11px;color:var(--amber);text-transform:uppercase;letter-spacing:.5px">Flagged</div>
+      </div>
+      <div style="padding:10px;background:var(--red-light);border-radius:6px;text-align:center">
+        <div style="font-size:22px;font-weight:600;color:var(--red)">${r.missing_from_statement}</div>
+        <div style="font-size:11px;color:var(--red);text-transform:uppercase;letter-spacing:.5px">Missing</div>
+      </div>
+      <div style="padding:10px;background:var(--cream);border-radius:6px;text-align:center">
+        <div style="font-size:22px;font-weight:600">${r.paid_created}</div>
+        <div style="font-size:11px;color:var(--gray);text-transform:uppercase;letter-spacing:.5px">Auto-created</div>
+      </div>
+    </div>
+
+    <details open>
+      <summary style="cursor:pointer;color:var(--blue);font-size:13px;font-weight:500;margin-bottom:8px">
+        Show per-child breakdown (${r.details.length})
+      </summary>
+      <div style="max-height:380px;overflow-y:auto;border:1px solid var(--border);border-radius:6px">
+        <table style="width:100%;border-collapse:collapse;font-size:13px">
+          <thead style="position:sticky;top:0;background:var(--cream);box-shadow:0 1px 0 var(--border)">
+            <tr>
+              <th style="padding:8px 10px;text-align:left;width:30px"></th>
+              <th style="padding:8px 10px;text-align:left">Name</th>
+              <th style="padding:8px 10px;text-align:left">Outcome</th>
+              <th style="padding:8px 10px;text-align:left">Paid</th>
+              <th style="padding:8px 10px;text-align:left">Notes</th>
+            </tr>
+          </thead>
+          <tbody>
+            ${r.details.map(detailRow).join('')}
+          </tbody>
+        </table>
+      </div>
+    </details>
+
+    <div style="margin-top:12px;display:flex;gap:8px">
+      <button class="btn btn-sm btn-primary" onclick="closeModal();pages['cdc-reconciliation']()">View Reconciliation →</button>
+      ${r.flags.length > 0 ? `<button class="btn btn-sm btn-ghost" onclick="closeModal();showPage('flags')">Review ${r.flags.length} flags →</button>` : ''}
+    </div>`;
 }
 
 function editCDCRow(r) {
