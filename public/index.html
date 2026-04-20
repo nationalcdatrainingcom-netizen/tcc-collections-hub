@@ -398,6 +398,9 @@ input[type="file"] { display:none; }
   </div>
   <div class="nav-section">
     <div class="nav-label">CDC Billing</div>
+    <div class="nav-item" onclick="showPage('cdc-filing-wizard')">
+      <span class="nav-icon">🪄</span> CDC Filing Wizard
+    </div>
     <div class="nav-item" onclick="showPage('cdc-reconciliation')">
       <span class="nav-icon">📋</span> Reconciliation
     </div>
@@ -816,6 +819,8 @@ async function saveNewChild() {
 }
 
 function editChild(child) {
+  const inactiveDate = child.inactive_date ? String(child.inactive_date).split('T')[0] : '';
+  const cdcStart = child.cdc_start_date ? String(child.cdc_start_date).split('T')[0] : '';
   openModal(`
     <div class="modal-title">Edit: ${child.first_name} ${child.last_name}</div>
     <div class="form-row">
@@ -837,6 +842,55 @@ function editChild(child) {
         <div class="checkbox-row"><input type="checkbox" id="eia" ${child.is_active?'checked':''}>Active</div>
       </div>
     </div>
+    <div class="form-row">
+      <div class="form-group">
+        <label>Enrolled Hours/Day <span style="color:var(--gray);font-weight:400">(used for absence filing)</span></label>
+        <input type="number" id="ehrs" step="0.25" min="0" max="12" value="${child.enrolled_hours_per_day||9}">
+      </div>
+      <div class="form-group">
+        <label>Inactive Date <span style="color:var(--gray);font-weight:400">(no filing past this date)</span></label>
+        <input type="date" id="einact" value="${inactiveDate}">
+      </div>
+    </div>
+
+    <div style="margin-top:16px;padding-top:12px;border-top:1px solid var(--border)">
+      <div style="font-size:12px;font-weight:600;color:var(--navy);text-transform:uppercase;letter-spacing:.5px;margin-bottom:10px">DHS / CDC Filing Fields</div>
+      <div class="form-row">
+        <div class="form-group">
+          <label>Child's ID Number</label>
+          <input type="text" id="ecidnum" value="${child.child_id_number||''}" placeholder="e.g. 1294620416">
+        </div>
+        <div class="form-group">
+          <label>Case Number</label>
+          <input type="text" id="ecase" value="${child.case_number||''}" placeholder="e.g. 114282898">
+        </div>
+      </div>
+      <div class="form-row">
+        <div class="form-group">
+          <label>Authorized Hours</label>
+          <input type="number" id="eauth" step="1" min="0" value="${child.authorized_hours||''}" placeholder="90">
+        </div>
+        <div class="form-group">
+          <label>CDC Start Date</label>
+          <input type="date" id="ecdcstart" value="${cdcStart}">
+        </div>
+        <div class="form-group">
+          <label>CDC End Date</label>
+          <input type="text" id="ecdcend" value="${child.cdc_end_date||'ONGOING'}" placeholder="ONGOING">
+        </div>
+      </div>
+      <div class="form-row">
+        <div class="form-group">
+          <label>Family Contribution ($)</label>
+          <input type="number" id="efam" step="0.01" min="0" value="${child.family_contribution||0}">
+        </div>
+        <div class="form-group">
+          <label>Child Care Fees ($)</label>
+          <input type="number" id="efees" step="0.01" min="0" value="${child.child_care_fees||0}">
+        </div>
+      </div>
+    </div>
+
     <div class="form-group"><label>Notes</label><textarea id="enotes" rows="2">${child.notes||''}</textarea></div>
     <div class="modal-footer">
       <button class="btn btn-ghost" onclick="closeModal()">Cancel</button>
@@ -851,6 +905,15 @@ async function saveEditChild(id) {
     is_cdc: document.getElementById('eic').checked,
     is_school_age: document.getElementById('eisa').checked,
     is_active: document.getElementById('eia').checked,
+    enrolled_hours_per_day: parseFloat(document.getElementById('ehrs').value)||9,
+    inactive_date: document.getElementById('einact').value || null,
+    child_id_number: document.getElementById('ecidnum').value.trim() || null,
+    case_number: document.getElementById('ecase').value.trim() || null,
+    authorized_hours: parseFloat(document.getElementById('eauth').value) || null,
+    cdc_start_date: document.getElementById('ecdcstart').value || null,
+    cdc_end_date: document.getElementById('ecdcend').value.trim() || 'ONGOING',
+    family_contribution: parseFloat(document.getElementById('efam').value) || 0,
+    child_care_fees: parseFloat(document.getElementById('efees').value) || 0,
     notes: document.getElementById('enotes').value.trim(),
   };
   try {
@@ -1470,7 +1533,422 @@ async function saveRate() {
   } catch(e) { toast('Error: '+e.message,'error'); }
 }
 
-// ── Instructions Page ────────────────────────────────────────────────────────
+// ── CDC Filing Wizard ─────────────────────────────────────────────────────────
+// Multi-step wizard that walks Mary's VA through uploading attendance for
+// each center for a specific CDC period, then generates the DHS filing file.
+let WIZARD_STATE = {
+  step: 1,
+  periodNumber: null,
+  periodStart: null,
+  periodEnd: null,
+  reportingDeadline: null,
+  centerStatus: { Niles: null, Peace: null, Montessori: null },
+  generatedFiling: null,
+};
+
+function fmtDateShort(d) {
+  if (!d) return '';
+  const dt = new Date(d);
+  return dt.toLocaleDateString('en-US', { month:'short', day:'numeric', year:'numeric', timeZone:'UTC' });
+}
+
+pages['cdc-filing-wizard'] = async () => {
+  document.getElementById('page-title').textContent = 'CDC Filing Wizard';
+  document.getElementById('topbar-actions').innerHTML = '';
+
+  // Reset wizard state if first time, but preserve in-progress state on re-entry
+  if (!WIZARD_STATE.periodNumber) WIZARD_STATE.step = 1;
+
+  renderWizard();
+};
+
+async function renderWizard() {
+  const content = document.getElementById('content');
+
+  // Refresh status if we have a period selected
+  if (WIZARD_STATE.periodNumber) {
+    try {
+      const s = await api('GET', `/cdc-filing/status?period_number=${WIZARD_STATE.periodNumber}`);
+      WIZARD_STATE.centerStatus = s.status;
+    } catch (e) { /* non-fatal */ }
+  }
+
+  const step = WIZARD_STATE.step;
+  const stepLabels = ['Pick Period', 'Upload Niles', 'Upload Peace', 'Upload Montessori', 'Generate & Download'];
+
+  const stepsHtml = `
+    <div style="display:flex;gap:6px;margin-bottom:24px;background:var(--white);padding:14px;border-radius:10px;box-shadow:var(--shadow)">
+      ${stepLabels.map((label, i) => {
+        const n = i + 1;
+        const isActive = n === step;
+        const isDone = n < step;
+        const color = isDone ? 'var(--green)' : isActive ? 'var(--gold)' : 'var(--border)';
+        const textColor = isDone ? 'var(--green)' : isActive ? 'var(--navy)' : 'var(--gray)';
+        return `
+          <div style="flex:1;display:flex;align-items:center;gap:8px;padding:8px 10px;border-radius:6px;
+                      background:${isActive ? 'var(--cream)' : 'transparent'};cursor:pointer"
+               onclick="WIZARD_STATE.step=${n};renderWizard()">
+            <div style="width:28px;height:28px;border-radius:50%;background:${color};color:${isDone||isActive?'var(--white)':'var(--gray)'};
+                        display:flex;align-items:center;justify-content:center;font-weight:600;font-size:13px;flex-shrink:0">
+              ${isDone ? '✓' : n}
+            </div>
+            <div style="font-size:12.5px;font-weight:${isActive?'600':'400'};color:${textColor}">${label}</div>
+          </div>`;
+      }).join('')}
+    </div>`;
+
+  content.innerHTML = stepsHtml + `<div id="wizard-body"></div>`;
+  const body = document.getElementById('wizard-body');
+
+  if (step === 1) renderWizardStep1(body);
+  else if (step === 2) renderWizardStep_UploadCenter(body, 'Niles');
+  else if (step === 3) renderWizardStep_UploadCenter(body, 'Peace');
+  else if (step === 4) renderWizardStep_UploadCenter(body, 'Montessori');
+  else if (step === 5) renderWizardStep5(body);
+}
+
+async function renderWizardStep1(body) {
+  body.innerHTML = '<div class="loading">Loading billing periods…</div>';
+  const periods = await api('GET', '/billing-periods');
+
+  // Find the most likely "current" period (the one whose reporting deadline is nearest today)
+  const today = new Date().toISOString().split('T')[0];
+  const current = periods.find(p => {
+    const end = new Date(p.end_date).toISOString().split('T')[0];
+    const deadline = new Date(p.reporting_deadline).toISOString().split('T')[0];
+    return end <= today && deadline >= today;
+  }) || periods.find(p => new Date(p.end_date).toISOString().split('T')[0] <= today);
+
+  body.innerHTML = `
+    <div class="card">
+      <div style="font-family:'DM Serif Display',serif;font-size:26px;color:var(--navy);margin-bottom:8px">
+        Step 1 — Pick the CDC Period
+      </div>
+      <p style="color:var(--gray);font-size:14px;line-height:1.7;margin-bottom:20px">
+        Select the billing period you're filing for. The period's date range will be used for all three attendance uploads.
+      </p>
+
+      <div class="form-group" style="max-width:600px">
+        <label>CDC Billing Period</label>
+        <select id="wiz-period" style="font-size:14px">
+          <option value="">— Select a period —</option>
+          ${periods.map(p => {
+            const sel = current && p.period_number === current.period_number ? 'selected' : '';
+            return `<option value="${p.period_number}" ${sel}
+              data-start="${p.start_date}" data-end="${p.end_date}"
+              data-deadline="${p.reporting_deadline}">
+              Period ${p.period_number}: ${fmtDateShort(p.start_date)} – ${fmtDateShort(p.end_date)}
+              (file by ${fmtDateShort(p.reporting_deadline)})
+            </option>`;
+          }).join('')}
+        </select>
+      </div>
+
+      <div id="wiz-period-info" style="margin-top:16px"></div>
+
+      <div style="margin-top:24px;display:flex;gap:10px">
+        <button class="btn btn-gold" onclick="wizardConfirmPeriod()">Continue to Niles Upload →</button>
+      </div>
+    </div>`;
+
+  document.getElementById('wiz-period').addEventListener('change', updatePeriodInfo);
+  updatePeriodInfo();
+}
+
+function updatePeriodInfo() {
+  const sel = document.getElementById('wiz-period');
+  const opt = sel.options[sel.selectedIndex];
+  const info = document.getElementById('wiz-period-info');
+  if (!sel.value) { info.innerHTML = ''; return; }
+  info.innerHTML = `
+    <div style="background:var(--cream);border-left:3px solid var(--gold);padding:14px 18px;border-radius:6px;font-size:14px;line-height:1.8">
+      <strong style="color:var(--navy)">Period ${sel.value}</strong><br>
+      Start Date: <strong>${fmtDateShort(opt.dataset.start)}</strong><br>
+      End Date: <strong>${fmtDateShort(opt.dataset.end)}</strong><br>
+      Reporting Deadline: <strong style="color:var(--red)">${fmtDateShort(opt.dataset.deadline)}</strong>
+    </div>`;
+}
+
+async function wizardConfirmPeriod() {
+  const sel = document.getElementById('wiz-period');
+  if (!sel.value) return toast('Please pick a period', 'error');
+  const opt = sel.options[sel.selectedIndex];
+  WIZARD_STATE.periodNumber = sel.value;
+  WIZARD_STATE.periodStart = opt.dataset.start;
+  WIZARD_STATE.periodEnd = opt.dataset.end;
+  WIZARD_STATE.reportingDeadline = opt.dataset.deadline;
+  WIZARD_STATE.step = 2;
+  await renderWizard();
+}
+
+function renderWizardStep_UploadCenter(body, center) {
+  const status = WIZARD_STATE.centerStatus[center];
+  const already = status && status.records > 0;
+
+  body.innerHTML = `
+    <div class="card">
+      <div style="font-family:'DM Serif Display',serif;font-size:26px;color:var(--navy);margin-bottom:8px">
+        Step ${WIZARD_STATE.step} — Upload ${center} Attendance
+      </div>
+      <div style="background:var(--blue-light);border-left:3px solid var(--blue);padding:14px 18px;border-radius:6px;margin-bottom:20px">
+        <div style="font-weight:600;color:var(--blue);margin-bottom:8px;font-size:14px">📋 Follow these steps in Playground:</div>
+        <ol style="font-size:13.5px;line-height:1.9;color:var(--navy);padding-left:22px;margin:0">
+          <li>Log into <strong>Playground</strong> and switch to the <strong>${center}</strong> center</li>
+          <li>Go to <strong>Reports → Attendance Daily with Sign In/Out</strong></li>
+          <li>Set <strong>Start Date</strong> to <strong style="color:var(--red)">${fmtDateShort(WIZARD_STATE.periodStart)}</strong></li>
+          <li>Set <strong>End Date</strong> to <strong style="color:var(--red)">${fmtDateShort(WIZARD_STATE.periodEnd)}</strong></li>
+          <li>Select <strong>All Students</strong></li>
+          <li>Click <strong>Generate</strong>, then <strong>Export as CSV</strong></li>
+          <li>Upload the CSV below</li>
+        </ol>
+      </div>
+
+      ${already ? `
+        <div style="background:var(--green-light);border:1px solid var(--green);padding:14px 18px;border-radius:8px;margin-bottom:16px">
+          <strong style="color:var(--green)">✅ ${center} attendance already uploaded for this period</strong>
+          <div style="margin-top:6px;font-size:13px;color:var(--navy)">
+            ${status.records} attendance records · ${status.children} children
+          </div>
+          <button class="btn btn-sm btn-ghost" style="margin-top:10px" onclick="wizardClearCenter('${center}')">Clear and re-upload</button>
+        </div>
+      ` : ''}
+
+      <div class="upload-zone" onclick="document.getElementById('wiz-file').click()">
+        <div style="font-size:40px">📤</div>
+        <p><strong>Click to upload ${center} Playground attendance CSV</strong></p>
+        <p>Period ${WIZARD_STATE.periodNumber}: ${fmtDateShort(WIZARD_STATE.periodStart)} – ${fmtDateShort(WIZARD_STATE.periodEnd)}</p>
+      </div>
+      <input type="file" id="wiz-file" accept=".csv" onchange="wizardUploadAttendance(this, '${center}')">
+      <div id="wiz-upload-result" style="margin-top:16px"></div>
+
+      <div style="margin-top:24px;display:flex;gap:10px;justify-content:space-between">
+        <button class="btn btn-ghost" onclick="WIZARD_STATE.step=${WIZARD_STATE.step-1};renderWizard()">← Back</button>
+        <button class="btn btn-gold" onclick="WIZARD_STATE.step=${WIZARD_STATE.step+1};renderWizard()">
+          ${already ? `Continue →` : `Skip ${center} →`}
+        </button>
+      </div>
+    </div>`;
+}
+
+async function wizardClearCenter(center) {
+  if (!confirm(`Delete all ${center} attendance for period ${WIZARD_STATE.periodNumber}?`)) return;
+  try {
+    const r = await fetch(`/api/cdc-filing/attendance?period_number=${WIZARD_STATE.periodNumber}&center=${encodeURIComponent(center)}`, {
+      method: 'DELETE',
+      headers: TOKEN ? { 'Authorization': `Bearer ${TOKEN}` } : {},
+    });
+    const j = await r.json();
+    toast(`Cleared ${j.deleted} records`, 'success');
+    await renderWizard();
+  } catch (e) { toast('Error: ' + e.message, 'error'); }
+}
+
+async function wizardUploadAttendance(input, center) {
+  const file = input.files[0];
+  if (!file) return;
+  const fd = new FormData();
+  fd.append('file', file);
+  fd.append('center', center);
+  fd.append('period_number', WIZARD_STATE.periodNumber);
+
+  document.getElementById('wiz-upload-result').innerHTML = '<div class="loading">Uploading…</div>';
+  try {
+    const result = await uploadFile('/cdc-filing/upload-attendance', fd);
+    document.getElementById('wiz-upload-result').innerHTML = `
+      <div style="background:var(--green-light);border:1px solid var(--green);border-radius:8px;padding:16px">
+        <strong style="color:var(--green);font-size:15px">✅ ${center} attendance uploaded</strong>
+        <div style="margin-top:8px;font-size:13.5px">
+          ${result.processed} attendance records processed ·
+          ${result.autoCreated} new children auto-created ·
+          ${result.flags.length} flag${result.flags.length!==1?'s':''} raised
+        </div>
+        ${result.flags.length > 0 ? `
+          <div style="margin-top:10px;font-size:13px">
+            ${result.flags.slice(0,10).map(f => `<div>🔵 ${f.childName} — ${FLAG_LABELS[f.type]||f.type}</div>`).join('')}
+            ${result.flags.length > 10 ? `<div style="margin-top:6px;color:var(--gray)">…and ${result.flags.length-10} more. Review in <strong>All Flags</strong> before submitting.</div>` : ''}
+          </div>` : ''}
+        <div style="margin-top:12px">
+          <button class="btn btn-sm btn-primary" onclick="WIZARD_STATE.step=${WIZARD_STATE.step+1};renderWizard()">Continue →</button>
+        </div>
+      </div>`;
+    // Refresh center status
+    const s = await api('GET', `/cdc-filing/status?period_number=${WIZARD_STATE.periodNumber}`);
+    WIZARD_STATE.centerStatus = s.status;
+  } catch (e) {
+    document.getElementById('wiz-upload-result').innerHTML =
+      `<div style="background:var(--red-light);border:1px solid var(--red);border-radius:8px;padding:16px;color:var(--red)">Error: ${e.message}</div>`;
+  }
+}
+
+async function renderWizardStep5(body) {
+  body.innerHTML = '<div class="loading">Running rules engine…</div>';
+
+  const centersWithData = Object.entries(WIZARD_STATE.centerStatus)
+    .filter(([_, s]) => s && s.records > 0)
+    .map(([c]) => c);
+
+  if (centersWithData.length === 0) {
+    body.innerHTML = `
+      <div class="card">
+        <div class="empty">
+          <div class="empty-icon">📭</div>
+          <p>No attendance uploaded yet for period ${WIZARD_STATE.periodNumber}. Go back and upload at least one center.</p>
+          <button class="btn btn-ghost" style="margin-top:12px" onclick="WIZARD_STATE.step=2;renderWizard()">← Back to Niles</button>
+        </div>
+      </div>`;
+    return;
+  }
+
+  try {
+    const filing = await api('POST', '/cdc-filing/generate', {
+      period_number: WIZARD_STATE.periodNumber,
+      centers: centersWithData,
+    });
+    WIZARD_STATE.generatedFiling = filing;
+    renderFilingSummary(body, filing, centersWithData);
+  } catch (e) {
+    body.innerHTML = `<div class="card"><div style="color:var(--red)">Error: ${e.message}</div></div>`;
+  }
+}
+
+function renderFilingSummary(body, filing, centersWithData) {
+  const centerCards = centersWithData.map(center => {
+    const data = filing.centers[center];
+    if (!data) return '';
+    const kids = data.children;
+    const totalKids = kids.length;
+    const totalHours = kids.reduce((s, k) => s + (k.total_hours||0), 0);
+    const excludedKids = kids.filter(k => k.excluded_after).length;
+    const inactiveKids = kids.filter(k => k.inactive_after).length;
+    const holidayAbsent = kids.filter(k => k.holiday_absent_hours > 0).length;
+
+    return `
+      <div class="card">
+        <div style="display:flex;align-items:center;justify-content:space-between;margin-bottom:14px">
+          <div style="font-family:'DM Serif Display',serif;font-size:22px;color:var(--navy)">${center}</div>
+          <div style="display:flex;gap:8px;flex-wrap:wrap">
+            <button class="btn btn-sm btn-primary" onclick="wizardPrint('${center}')">🖨 Print DHS Form</button>
+            <button class="btn btn-sm btn-primary" onclick="wizardDownloadPDF('${center}')">📄 Download PDF</button>
+            <button class="btn btn-sm btn-gold" onclick="wizardDownload('${center}','totals')">⬇ Totals CSV</button>
+            <button class="btn btn-sm btn-ghost" onclick="wizardDownload('${center}','daily')">⬇ Per-Day CSV</button>
+          </div>
+        </div>
+        <div style="display:grid;grid-template-columns:repeat(auto-fit,minmax(140px,1fr));gap:10px;margin-bottom:14px">
+          <div style="padding:10px;background:var(--cream);border-radius:6px">
+            <div style="font-size:11px;color:var(--gray);text-transform:uppercase;letter-spacing:.5px">CDC Kids</div>
+            <div style="font-size:22px;font-weight:600;color:var(--navy)">${totalKids}</div>
+          </div>
+          <div style="padding:10px;background:var(--cream);border-radius:6px">
+            <div style="font-size:11px;color:var(--gray);text-transform:uppercase;letter-spacing:.5px">Total Hours</div>
+            <div style="font-size:22px;font-weight:600;color:var(--navy)">${totalHours.toFixed(1)}</div>
+          </div>
+          ${holidayAbsent > 0 ? `<div style="padding:10px;background:var(--amber-light);border-radius:6px">
+            <div style="font-size:11px;color:var(--amber);text-transform:uppercase;letter-spacing:.5px">Holiday/Absent</div>
+            <div style="font-size:22px;font-weight:600;color:var(--amber)">${holidayAbsent}</div>
+          </div>` : ''}
+          ${excludedKids > 0 ? `<div style="padding:10px;background:var(--red-light);border-radius:6px">
+            <div style="font-size:11px;color:var(--red);text-transform:uppercase;letter-spacing:.5px">Excluded (21+)</div>
+            <div style="font-size:22px;font-weight:600;color:var(--red)">${excludedKids}</div>
+          </div>` : ''}
+          ${inactiveKids > 0 ? `<div style="padding:10px;background:var(--red-light);border-radius:6px">
+            <div style="font-size:11px;color:var(--red);text-transform:uppercase;letter-spacing:.5px">Inactive Cutoff</div>
+            <div style="font-size:22px;font-weight:600;color:var(--red)">${inactiveKids}</div>
+          </div>` : ''}
+        </div>
+
+        <details>
+          <summary style="cursor:pointer;color:var(--blue);font-size:13px;font-weight:500">Show per-child breakdown (${totalKids} children)</summary>
+          <div class="table-wrap" style="margin-top:10px;max-height:400px;overflow-y:auto">
+            <table>
+              <thead><tr>
+                <th>Child</th>
+                <th>GSRP</th>
+                <th>Enrolled Hrs/Day</th>
+                <th>Total Hours</th>
+                <th>Normal</th>
+                <th>Holiday/Absent</th>
+                <th>Status</th>
+              </tr></thead>
+              <tbody>
+              ${kids.map(k => `
+                <tr>
+                  <td><strong>${k.last_name}, ${k.first_name}</strong></td>
+                  <td>${k.is_gsrp ? '✅' : '—'}</td>
+                  <td>${k.enrolled_hours_per_day}</td>
+                  <td><strong>${k.total_hours.toFixed(2)}</strong></td>
+                  <td>${k.normal_hours.toFixed(2)}</td>
+                  <td style="color:${k.holiday_absent_hours>0?'var(--amber)':'var(--gray)'}">${k.holiday_absent_hours.toFixed(2)}</td>
+                  <td style="font-size:12px">
+                    ${k.excluded_after ? `<span style="color:var(--red)">Excluded from ${fmtDateShort(k.excluded_after)}</span>` :
+                      k.inactive_after ? `<span style="color:var(--red)">Inactive ${fmtDateShort(k.inactive_after)}</span>` :
+                      `<span style="color:var(--green)">Filing</span>`}
+                  </td>
+                </tr>`).join('')}
+              </tbody>
+            </table>
+          </div>
+        </details>
+      </div>`;
+  }).join('');
+
+  body.innerHTML = `
+    <div class="card">
+      <div style="font-family:'DM Serif Display',serif;font-size:26px;color:var(--navy);margin-bottom:8px">
+        Step 5 — Generate &amp; Download
+      </div>
+      <p style="color:var(--gray);font-size:14px;line-height:1.7;margin-bottom:0">
+        Rules applied: GSRP carve-outs, Friday full-day for Niles/Peace, multiple in/out blocks summed,
+        absence streak (1–10 normal, 11–20 holiday/absent, 21+ excluded), and inactive-date cutoffs.
+      </p>
+    </div>
+
+    ${centerCards}
+
+    <div class="card" style="background:var(--cream)">
+      <div style="font-weight:600;color:var(--navy);margin-bottom:8px;font-size:14px">📝 What to file in MiLogin/CDC Portal</div>
+      <p style="font-size:13.5px;color:var(--gray);line-height:1.7;margin-bottom:10px">
+        Download the Totals CSV for each center above. Each row is one child's total billable hours for
+        period ${WIZARD_STATE.periodNumber}. Submit these to CDC by <strong style="color:var(--red)">${fmtDateShort(WIZARD_STATE.reportingDeadline)}</strong>.
+      </p>
+      <p style="font-size:12.5px;color:var(--gray);line-height:1.6;margin:0">
+        <em>Note: DHS-exact format will be added once Mary uploads a sample filing form. The current
+        CSV includes all data needed for the filing; just copy column values into the DHS form.</em>
+      </p>
+    </div>
+
+    <div style="display:flex;gap:10px;justify-content:space-between;margin-top:16px">
+      <button class="btn btn-ghost" onclick="WIZARD_STATE.step=4;renderWizard()">← Back</button>
+      <button class="btn btn-gold" onclick="wizardReset()">Start New Filing</button>
+    </div>
+  `;
+}
+
+function wizardDownload(center, format) {
+  const url = `/api/cdc-filing/download?period_number=${WIZARD_STATE.periodNumber}&center=${encodeURIComponent(center)}&format=${format}${TOKEN?'&token='+TOKEN:''}`;
+  window.open(url, '_blank');
+}
+
+function wizardPrint(center) {
+  const url = `/api/cdc-filing/print?period_number=${WIZARD_STATE.periodNumber}&center=${encodeURIComponent(center)}${TOKEN?'&token='+TOKEN:''}`;
+  window.open(url, '_blank');
+}
+
+function wizardDownloadPDF(center) {
+  const url = `/api/cdc-filing/pdf?period_number=${WIZARD_STATE.periodNumber}&center=${encodeURIComponent(center)}${TOKEN?'&token='+TOKEN:''}`;
+  window.open(url, '_blank');
+}
+
+function wizardReset() {
+  WIZARD_STATE = {
+    step: 1, periodNumber: null, periodStart: null, periodEnd: null,
+    reportingDeadline: null,
+    centerStatus: { Niles: null, Peace: null, Montessori: null },
+    generatedFiling: null,
+  };
+  renderWizard();
+}
+
+
 pages['instructions'] = () => {
   document.getElementById('page-title').textContent = 'Instructions';
   document.getElementById('topbar-actions').innerHTML = '';
@@ -1538,6 +2016,15 @@ pages['instructions'] = () => {
 
     <div class="card" style="max-width:900px">
       <div class="card-title">📅 Every Two Weeks (your regular billing workflow)</div>
+
+      <div style="background:var(--gold);color:var(--white);padding:14px 18px;border-radius:8px;margin-bottom:18px">
+        <div style="font-weight:600;font-size:15px;margin-bottom:4px">🪄 Fastest path: Use the CDC Filing Wizard</div>
+        <div style="font-size:13.5px;line-height:1.6">
+          Click <strong>CDC Filing Wizard</strong> in the sidebar. It walks you through uploading attendance for each center,
+          automatically applies all the billing rules (GSRP carve-outs, absence tracking, inactive cutoffs, etc.), and
+          generates the CDC filing file. Use the steps below only if you want to dig into the individual tools.
+        </div>
+      </div>
 
       <div style="display:flex;gap:14px;margin-bottom:18px;padding:14px;background:#fff;border:1px solid var(--border);border-radius:8px">
         <div style="flex-shrink:0;width:32px;height:32px;background:var(--gold);color:var(--white);border-radius:50%;display:flex;align-items:center;justify-content:center;font-weight:600">A</div>
