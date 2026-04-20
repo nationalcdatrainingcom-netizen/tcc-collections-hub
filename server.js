@@ -26,7 +26,10 @@ try {
 
 const app = express();
 const pool = new Pool({ connectionString: process.env.DATABASE_URL, ssl: { rejectUnauthorized: false } });
-const upload = multer({ storage: multer.memoryStorage() });
+const upload = multer({
+  storage: multer.memoryStorage(),
+  limits: { fileSize: 25 * 1024 * 1024 }, // 25MB — Playground CSVs with signatures can be large
+});
 const JWT_SECRET = process.env.HUB_JWT_SECRET || 'tcc-hub-jwt-2026';
 
 app.use(cors());
@@ -720,87 +723,158 @@ function pickAttendanceField(row, names) {
 
 
 app.post('/api/upload/attendance', ssoAuth, upload.single('file'), async (req, res) => {
+  const startTime = Date.now();
   const { center } = req.body;
   if (!req.file || !center) return res.status(400).json({ error: 'Missing center or file' });
 
-  let records;
   try {
-    records = parsePlaygroundAttendanceCSV(req.file.buffer);
-  } catch (e) { return res.status(400).json({ error: 'CSV parse error: ' + e.message }); }
+    let records;
+    try {
+      records = parsePlaygroundAttendanceCSV(req.file.buffer);
+    } catch (e) { return res.status(400).json({ error: 'CSV parse error: ' + e.message }); }
 
-  const centerKey = center.toLowerCase().replace(/\s+/g,'').replace('peace','peace').replace('niles','niles').replace('montessori','montessori');
-  const gsrp = GSRP_CONFIG[centerKey] || GSRP_CONFIG['niles'];
-  const inserted = [];
-  const flags = [];
+    const centerKey = center.toLowerCase().replace(/\s+/g,'');
+    const gsrp = GSRP_CONFIG[centerKey] || GSRP_CONFIG['niles'];
+    const flags = [];
 
-  for (const row of records) {
-    const lastName = pickAttendanceField(row, ['Last name','Last Name','last_name','LastName']);
-    const firstName = pickAttendanceField(row, ['First name','First Name','first_name','FirstName']);
-    const dateStr = pickAttendanceField(row, ['Date','date']);
-    const checkin = pickAttendanceField(row, ['Check-in','Check In','checkin','CheckIn']);
-    const checkout = pickAttendanceField(row, ['Check-out','Check Out','checkout','CheckOut']);
-    if (!lastName || !dateStr) continue;
+    // ── PASS 1: extract rows + collect unique children ────────────────────────
+    const cleanRows = [];
+    const uniqueChildren = new Map();
+    for (const row of records) {
+      const lastName = pickAttendanceField(row, ['Last name','Last Name','last_name','LastName']);
+      const firstName = pickAttendanceField(row, ['First name','First Name','first_name','FirstName']);
+      const dateStr = pickAttendanceField(row, ['Date','date']);
+      const checkin = pickAttendanceField(row, ['Check-in','Check In','checkin','CheckIn']);
+      const checkout = pickAttendanceField(row, ['Check-out','Check Out','checkout','CheckOut']);
+      if (!lastName || !dateStr) continue;
 
-    const isAbsent = /absent/i.test(checkin) || checkin === '-' || !checkin;
-    const dateObj = new Date(dateStr);
-    const dayOfWeek = dateObj.getDay(); // 0=Sun,1=Mon...
+      const dateObj = new Date(dateStr);
+      if (isNaN(dateObj)) continue;
+      const isAbsent = /absent/i.test(checkin) || checkin === '-' || !checkin;
+      const key = `${firstName.toLowerCase()}|${lastName.toLowerCase()}`;
+      uniqueChildren.set(key, { first: firstName, last: lastName });
 
-    // Find or auto-create child
-    let childRow = await pool.query(
-      `SELECT id,is_gsrp,is_cdc,is_school_age FROM children
-       WHERE center=$1 AND LOWER(first_name)=LOWER($2) AND LOWER(last_name)=LOWER($3)`,
-      [center, firstName, lastName]
-    );
-    let childId = childRow.rows[0]?.id || null;
-    if (!childId) {
-      const inserted = await pool.query(
-        `INSERT INTO children (center,first_name,last_name,subsidy_type,notes)
-         VALUES ($1,$2,$3,'unknown','Auto-created from attendance upload — set subsidy type')
-         ON CONFLICT (center,first_name,last_name) DO UPDATE SET notes=EXCLUDED.notes RETURNING id`,
-        [center, firstName, lastName]
-      );
-      childId = inserted.rows[0].id;
-      await createFlag(center, childId, `${firstName} ${lastName}`, 'NEW_CHILD_NO_STATUS',
-        `Child added from attendance upload with unknown subsidy status — please set status`, null);
-      flags.push({ childName: `${firstName} ${lastName}`, type: 'NEW_CHILD_NO_STATUS' });
+      // Strip signature URLs — keep raw_row small
+      const cleanRow = {};
+      for (const [k, v] of Object.entries(row)) {
+        if (/^Signature/i.test(k)) continue;
+        cleanRow[k] = v;
+      }
+
+      cleanRows.push({
+        firstName, lastName, dateObj, checkin, checkout, isAbsent, cleanRow, key,
+        dayOfWeek: dateObj.getDay(),
+        attendDateISO: dateObj.toISOString().split('T')[0],
+      });
     }
 
-    await pool.query(
-      `INSERT INTO attendance_records (center,child_id,child_first,child_last,attend_date,checkin_time,checkout_time,is_absent,raw_row)
-       VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9)`,
-      [center, childId, firstName, lastName, dateObj.toISOString().split('T')[0],
-       isAbsent ? null : parseTime12(checkin),
-       isAbsent ? null : parseTime12(checkout),
-       isAbsent, JSON.stringify(row)]
-    );
+    // ── PASS 2: bulk resolve + create children ────────────────────────────────
+    const childEntries = [...uniqueChildren.values()];
+    const childIdMap = new Map();
+    const childMetaMap = new Map(); // key → {is_gsrp, is_cdc, is_school_age}
+    let autoCreated = 0;
 
-    // GSRP late pickup check
-    const child = childRow.rows[0];
-    if (child?.is_gsrp && !isAbsent && checkout) {
-      const gsrpEndMin = toMinutes(gsrp.end + ' AM') || (gsrp.end.includes(':') ? parseInt(gsrp.end)*60+parseInt(gsrp.end.split(':')[1]) : 0);
-      const checkoutMin = toMinutes(checkout);
-      const closingMin = toMinutes(CLOSING_TIME + ' PM') || 18*60;
-
-      if (checkoutMin && gsrp.days.includes(dayOfWeek)) {
-        const gsrpEndMinutes = timeStrToMin(gsrp.end);
-        const checkoutMinutes = toMinutes(checkout);
-        if (checkoutMinutes > gsrpEndMinutes) {
-          // This is tracked as wraparound, not a late fee — only flag if after closing
+    if (childEntries.length) {
+      const firstNames = childEntries.map(c => c.first);
+      const lastNames = childEntries.map(c => c.last);
+      const existingQ = await pool.query(
+        `SELECT id, first_name, last_name, is_gsrp, is_cdc, is_school_age FROM children
+         WHERE center=$1 AND (LOWER(first_name), LOWER(last_name)) = ANY(
+           SELECT LOWER(unnest($2::text[])), LOWER(unnest($3::text[]))
+         )`,
+        [center, firstNames, lastNames]
+      );
+      for (const r of existingQ.rows) {
+        const k = `${r.first_name.toLowerCase()}|${r.last_name.toLowerCase()}`;
+        childIdMap.set(k, r.id);
+        childMetaMap.set(k, { is_gsrp: r.is_gsrp, is_cdc: r.is_cdc, is_school_age: r.is_school_age });
+      }
+      const missing = childEntries.filter(c => !childIdMap.has(`${c.first.toLowerCase()}|${c.last.toLowerCase()}`));
+      if (missing.length) {
+        const placeholders = missing.map((_, i) => `($1, $${i*2+2}, $${i*2+3}, 'unknown', 'Auto-created from attendance upload — set subsidy type')`).join(',');
+        const params = [center];
+        for (const m of missing) params.push(m.first, m.last);
+        const insertedQ = await pool.query(
+          `INSERT INTO children (center, first_name, last_name, subsidy_type, notes)
+           VALUES ${placeholders}
+           ON CONFLICT (center, first_name, last_name) DO UPDATE SET notes=EXCLUDED.notes
+           RETURNING id, first_name, last_name`,
+          params
+        );
+        for (const r of insertedQ.rows) {
+          const k = `${r.first_name.toLowerCase()}|${r.last_name.toLowerCase()}`;
+          childIdMap.set(k, r.id);
+          childMetaMap.set(k, { is_gsrp: false, is_cdc: false, is_school_age: false });
         }
-        // Check after-closing late pickup (after 6pm)
-        if (checkoutMinutes > 18*60) {
-          const minsLate = checkoutMinutes - 18*60;
-          await createFlag(center, childId, `${firstName} ${lastName}`, 'AFTER_CLOSING_PICKUP',
-            `Picked up ${minsLate} min after 6pm on ${dateStr}. Fee: $${calcLateFee(minsLate)}`,
-            null, dateObj.toISOString().split('T')[0]);
-          flags.push({ childName: `${firstName} ${lastName}`, type: 'AFTER_CLOSING_PICKUP', minsLate });
+        autoCreated = missing.length;
+        await Promise.all(insertedQ.rows.map(r => createFlag(
+          center, r.id, `${r.first_name} ${r.last_name}`, 'NEW_CHILD_NO_STATUS',
+          `Child added from attendance upload with unknown subsidy status — please set status`, null
+        )));
+        for (const r of insertedQ.rows) {
+          flags.push({ childName: `${r.first_name} ${r.last_name}`, type: 'NEW_CHILD_NO_STATUS' });
         }
       }
     }
-    inserted.push(`${firstName} ${lastName}`);
-  }
 
-  res.json({ processed: inserted.length, flags });
+    // ── PASS 3: bulk insert attendance records ────────────────────────────────
+    const CHUNK_SIZE = 200;
+    let processed = 0;
+    for (let s = 0; s < cleanRows.length; s += CHUNK_SIZE) {
+      const chunk = cleanRows.slice(s, s + CHUNK_SIZE);
+      const valuesSql = [];
+      const params = [];
+      let p = 0;
+      for (const r of chunk) {
+        const childId = childIdMap.get(r.key);
+        if (!childId) continue;
+        params.push(
+          center, childId, r.firstName, r.lastName, r.attendDateISO,
+          r.isAbsent ? null : parseTime12(r.checkin),
+          r.isAbsent ? null : parseTime12(r.checkout),
+          r.isAbsent, JSON.stringify(r.cleanRow)
+        );
+        valuesSql.push(`($${p+1},$${p+2},$${p+3},$${p+4},$${p+5},$${p+6},$${p+7},$${p+8},$${p+9})`);
+        p += 9;
+        processed++;
+      }
+      if (valuesSql.length) {
+        await pool.query(
+          `INSERT INTO attendance_records
+             (center, child_id, child_first, child_last, attend_date, checkin_time, checkout_time, is_absent, raw_row)
+           VALUES ${valuesSql.join(',')}`,
+          params
+        );
+      }
+    }
+
+    // ── PASS 4: check late pickups for GSRP kids (parallelized) ───────────────
+    const latePickupPromises = [];
+    for (const r of cleanRows) {
+      const meta = childMetaMap.get(r.key);
+      if (!meta?.is_gsrp || r.isAbsent || !r.checkout) continue;
+      if (!gsrp.days.includes(r.dayOfWeek)) continue;
+      const checkoutMinutes = toMinutes(r.checkout);
+      if (checkoutMinutes && checkoutMinutes > 18*60) {
+        const minsLate = checkoutMinutes - 18*60;
+        const childId = childIdMap.get(r.key);
+        latePickupPromises.push(createFlag(
+          center, childId, `${r.firstName} ${r.lastName}`, 'AFTER_CLOSING_PICKUP',
+          `Picked up ${minsLate} min after 6pm on ${r.attendDateISO}. Fee: $${calcLateFee(minsLate)}`,
+          null, r.attendDateISO
+        ));
+        flags.push({ childName: `${r.firstName} ${r.lastName}`, type: 'AFTER_CLOSING_PICKUP', minsLate });
+      }
+    }
+    await Promise.all(latePickupPromises);
+
+    const ms = Date.now() - startTime;
+    console.log(`[upload/attendance] ${center}: ${processed} records, ${autoCreated} new kids, ${ms}ms`);
+    res.json({ processed, autoCreated, elapsed_ms: ms, flags });
+  } catch (e) {
+    console.error(`[upload/attendance] ERROR for ${center}:`, e);
+    res.status(500).json({ error: 'Upload failed: ' + e.message });
+  }
 });
 
 function timeStrToMin(t) {
@@ -1332,81 +1406,190 @@ function minToTimeAMPM(mins) {
 // Separate from the regular /api/upload/attendance because this one is scoped
 // to a specific CDC period and is part of the wizard flow.
 app.post('/api/cdc-filing/upload-attendance', ssoAuth, upload.single('file'), async (req, res) => {
+  const startTime = Date.now();
   const { center, period_number } = req.body;
   if (!req.file || !center || !period_number) return res.status(400).json({ error: 'Missing center, period_number, or file' });
 
-  const periodQ = await pool.query(`SELECT start_date,end_date FROM billing_periods WHERE period_number=$1`, [period_number]);
-  if (!periodQ.rows[0]) return res.status(400).json({ error: `Unknown period: ${period_number}` });
-  const { start_date, end_date } = periodQ.rows[0];
-
-  let records;
   try {
-    records = parsePlaygroundAttendanceCSV(req.file.buffer);
-  } catch (e) { return res.status(400).json({ error: 'CSV parse error: ' + e.message }); }
+    const periodQ = await pool.query(`SELECT start_date,end_date FROM billing_periods WHERE period_number=$1`, [period_number]);
+    if (!periodQ.rows[0]) return res.status(400).json({ error: `Unknown period: ${period_number}` });
+    const { start_date, end_date } = periodQ.rows[0];
+    const periodStartISO = start_date.toISOString().split('T')[0];
+    const periodEndISO = end_date.toISOString().split('T')[0];
 
-  let processed = 0, autoCreated = 0, rowsWithBlocks = 0;
-  const flagsList = [];
+    let records;
+    try {
+      records = parsePlaygroundAttendanceCSV(req.file.buffer);
+    } catch (e) { return res.status(400).json({ error: 'CSV parse error: ' + e.message }); }
 
-  for (const row of records) {
-    const lastName = pickAttendanceField(row, ['Last name','Last Name','last_name','LastName']);
-    const firstName = pickAttendanceField(row, ['First name','First Name','first_name','FirstName']);
-    const dateStr = pickAttendanceField(row, ['Date','date']);
-    const checkin = pickAttendanceField(row, ['Check-in','Check In','checkin','CheckIn']);
-    const checkout = pickAttendanceField(row, ['Check-out','Check Out','checkout','CheckOut']);
-    if (!lastName || !dateStr) continue;
+    // ── PASS 1: extract clean rows, collect unique children ────────────────────
+    const cleanRows = [];
+    const uniqueChildren = new Map(); // "first|last" → {first, last}
 
-    const dateObj = new Date(dateStr);
-    if (isNaN(dateObj)) continue;
-    const attendDateISO = dateObj.toISOString().split('T')[0];
+    for (const row of records) {
+      const lastName = pickAttendanceField(row, ['Last name','Last Name','last_name','LastName']);
+      const firstName = pickAttendanceField(row, ['First name','First Name','first_name','FirstName']);
+      const dateStr = pickAttendanceField(row, ['Date','date']);
+      const checkin = pickAttendanceField(row, ['Check-in','Check In','checkin','CheckIn']);
+      const checkout = pickAttendanceField(row, ['Check-out','Check Out','checkout','CheckOut']);
+      if (!lastName || !dateStr) continue;
 
-    // Skip rows outside the period
-    if (attendDateISO < start_date.toISOString().split('T')[0]) continue;
-    if (attendDateISO > end_date.toISOString().split('T')[0]) continue;
+      const dateObj = new Date(dateStr);
+      if (isNaN(dateObj)) continue;
+      const attendDateISO = dateObj.toISOString().split('T')[0];
+      if (attendDateISO < periodStartISO || attendDateISO > periodEndISO) continue;
 
-    const isAbsent = /absent/i.test(checkin) || checkin === '-' || !checkin;
+      const isAbsent = /absent/i.test(checkin) || checkin === '-' || !checkin;
+      const key = `${firstName.toLowerCase()}|${lastName.toLowerCase()}`;
+      uniqueChildren.set(key, { first: firstName, last: lastName });
 
-    // Find or auto-create child
-    let childRow = await pool.query(
-      `SELECT id FROM children WHERE center=$1 AND LOWER(first_name)=LOWER($2) AND LOWER(last_name)=LOWER($3)`,
-      [center, firstName, lastName]
-    );
-    let childId = childRow.rows[0]?.id;
-    if (!childId) {
-      const inserted = await pool.query(
-        `INSERT INTO children (center,first_name,last_name,subsidy_type,notes)
-         VALUES ($1,$2,$3,'unknown','Auto-created from CDC filing wizard attendance upload')
-         ON CONFLICT (center,first_name,last_name) DO UPDATE SET notes=EXCLUDED.notes RETURNING id`,
-        [center, firstName, lastName]
-      );
-      childId = inserted.rows[0].id;
-      autoCreated++;
-      await createFlag(center, childId, `${firstName} ${lastName}`, 'NEW_CHILD_NO_STATUS',
-        `Child added from CDC filing attendance upload — please set subsidy status`, period_number);
-      flagsList.push({ childName: `${firstName} ${lastName}`, type: 'NEW_CHILD_NO_STATUS' });
+      // Strip the giant signature URLs before storing raw_row to keep DB small
+      const cleanRow = {};
+      for (const [k, v] of Object.entries(row)) {
+        if (/^Signature/i.test(k)) continue; // skip signature URL columns
+        cleanRow[k] = v;
+      }
+
+      cleanRows.push({
+        firstName, lastName, attendDateISO, checkin, checkout, isAbsent, cleanRow, key,
+      });
     }
 
-    await pool.query(
-      `INSERT INTO attendance_records (center,child_id,child_first,child_last,attend_date,checkin_time,checkout_time,is_absent,raw_row)
-       VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9)`,
-      [center, childId, firstName, lastName, attendDateISO,
-       isAbsent ? null : parseTime12(checkin),
-       isAbsent ? null : parseTime12(checkout),
-       isAbsent, JSON.stringify(row)]
-    );
-    processed++;
-    if (!isAbsent) rowsWithBlocks++;
-  }
+    // ── PASS 2: bulk upsert children — one query for all ────────────────────────
+    // Use a VALUES clause with all unique children, then ON CONFLICT to get IDs back
+    const childEntries = [...uniqueChildren.values()];
+    const childIdMap = new Map(); // key → id
+    let autoCreated = 0;
 
-  res.json({
-    center,
-    period_number,
-    period_start: start_date,
-    period_end: end_date,
-    processed,
-    autoCreated,
-    rowsWithBlocks,
-    flags: flagsList,
-  });
+    if (childEntries.length) {
+      // Check which children exist first (single query)
+      const firstNames = childEntries.map(c => c.first);
+      const lastNames = childEntries.map(c => c.last);
+      const existingQ = await pool.query(
+        `SELECT id, first_name, last_name FROM children
+         WHERE center=$1 AND (LOWER(first_name), LOWER(last_name)) = ANY(
+           SELECT LOWER(unnest($2::text[])), LOWER(unnest($3::text[]))
+         )`,
+        [center, firstNames, lastNames]
+      );
+      for (const r of existingQ.rows) {
+        childIdMap.set(`${r.first_name.toLowerCase()}|${r.last_name.toLowerCase()}`, r.id);
+      }
+
+      // Insert missing children in one multi-values statement
+      const missing = childEntries.filter(c => !childIdMap.has(`${c.first.toLowerCase()}|${c.last.toLowerCase()}`));
+      if (missing.length) {
+        const placeholders = missing.map((_, i) => `($1, $${i*2+2}, $${i*2+3}, 'unknown', 'Auto-created from CDC filing wizard attendance upload')`).join(',');
+        const params = [center];
+        for (const m of missing) params.push(m.first, m.last);
+        const insertedQ = await pool.query(
+          `INSERT INTO children (center, first_name, last_name, subsidy_type, notes)
+           VALUES ${placeholders}
+           ON CONFLICT (center, first_name, last_name) DO UPDATE SET notes=EXCLUDED.notes
+           RETURNING id, first_name, last_name`,
+          params
+        );
+        for (const r of insertedQ.rows) {
+          childIdMap.set(`${r.first_name.toLowerCase()}|${r.last_name.toLowerCase()}`, r.id);
+        }
+        autoCreated = missing.length;
+      }
+    }
+
+    // ── PASS 3: create flags for auto-created children (one bulk insert) ──────
+    const flagsList = [];
+    const missingWithIds = childEntries.filter(c => {
+      const key = `${c.first.toLowerCase()}|${c.last.toLowerCase()}`;
+      return childIdMap.has(key);
+    });
+    // Only flag children we just auto-created — distinguish by checking if they already had flags
+    // Simpler: just create flags for children that got inserted as 'unknown' — they'll all have that note
+    if (autoCreated > 0) {
+      const unknownKidsQ = await pool.query(
+        `SELECT id, first_name, last_name FROM children
+         WHERE center=$1 AND subsidy_type='unknown' AND id = ANY($2::int[])`,
+        [center, [...childIdMap.values()]]
+      );
+      if (unknownKidsQ.rows.length) {
+        const flagPlaceholders = unknownKidsQ.rows.map((_, i) => `($1, $${i*2+2}, $${i*2+3}, 'NEW_CHILD_NO_STATUS', $${childEntries.length*2+2}, $${childEntries.length*2+3})`).join(',');
+        const flagParams = [center];
+        for (const kid of unknownKidsQ.rows) {
+          flagParams.push(kid.id, `${kid.first_name} ${kid.last_name}`);
+        }
+        flagParams.push(`Child added from CDC filing attendance upload — please set subsidy status`, period_number);
+
+        // Simpler approach: loop but in parallel with Promise.all — way faster than serial
+        await Promise.all(unknownKidsQ.rows.map(kid => pool.query(
+          `INSERT INTO billing_flags (center, child_id, child_name, flag_type, flag_detail, period_number)
+           VALUES ($1, $2, $3, 'NEW_CHILD_NO_STATUS', $4, $5)`,
+          [center, kid.id, `${kid.first_name} ${kid.last_name}`,
+           `Child added from CDC filing attendance upload — please set subsidy status`,
+           period_number]
+        )));
+
+        for (const kid of unknownKidsQ.rows) {
+          flagsList.push({ childName: `${kid.first_name} ${kid.last_name}`, type: 'NEW_CHILD_NO_STATUS' });
+        }
+      }
+    }
+
+    // ── PASS 4: bulk insert all attendance records in chunks ────────────────────
+    // One big INSERT with multi-values is ~100x faster than 500 sequential INSERTs
+    const CHUNK_SIZE = 200;
+    let processed = 0, rowsWithBlocks = 0;
+
+    for (let chunkStart = 0; chunkStart < cleanRows.length; chunkStart += CHUNK_SIZE) {
+      const chunk = cleanRows.slice(chunkStart, chunkStart + CHUNK_SIZE);
+      const valuesSql = [];
+      const params = [];
+      let p = 0;
+      for (const r of chunk) {
+        const childId = childIdMap.get(r.key);
+        if (!childId) continue;
+        params.push(
+          center,                           // $p+1
+          childId,                          // $p+2
+          r.firstName,                      // $p+3
+          r.lastName,                       // $p+4
+          r.attendDateISO,                  // $p+5
+          r.isAbsent ? null : parseTime12(r.checkin),  // $p+6
+          r.isAbsent ? null : parseTime12(r.checkout), // $p+7
+          r.isAbsent,                       // $p+8
+          JSON.stringify(r.cleanRow)        // $p+9
+        );
+        valuesSql.push(`($${p+1},$${p+2},$${p+3},$${p+4},$${p+5},$${p+6},$${p+7},$${p+8},$${p+9})`);
+        p += 9;
+        processed++;
+        if (!r.isAbsent) rowsWithBlocks++;
+      }
+      if (valuesSql.length) {
+        await pool.query(
+          `INSERT INTO attendance_records
+             (center, child_id, child_first, child_last, attend_date, checkin_time, checkout_time, is_absent, raw_row)
+           VALUES ${valuesSql.join(',')}`,
+          params
+        );
+      }
+    }
+
+    const ms = Date.now() - startTime;
+    console.log(`[cdc-filing upload] ${center} period ${period_number}: ${processed} records, ${autoCreated} new kids, ${ms}ms`);
+
+    res.json({
+      center,
+      period_number,
+      period_start: start_date,
+      period_end: end_date,
+      processed,
+      autoCreated,
+      rowsWithBlocks,
+      elapsed_ms: ms,
+      flags: flagsList,
+    });
+  } catch (e) {
+    console.error(`[cdc-filing upload] ERROR for ${center} period ${period_number}:`, e);
+    res.status(500).json({ error: 'Upload failed: ' + e.message, stack: e.stack?.split('\n').slice(0,3).join('\n') });
+  }
 });
 
 // ── Wizard Endpoint: Generate the filing ─────────────────────────────────────
