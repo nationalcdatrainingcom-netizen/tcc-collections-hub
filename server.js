@@ -885,14 +885,18 @@ function timeStrToMin(t) {
 function parseTime12(str) {
   if (!str || str === '-' || /absent/i.test(str)) return null;
   try {
-    const clean = str.trim().toUpperCase();
-    const isPM = clean.includes('PM');
-    const isAM = clean.includes('AM');
-    const timePart = clean.replace(/\s*(AM|PM)/, '').trim();
-    let [h, m] = timePart.split(':').map(Number);
-    if (isPM && h !== 12) h += 12;
-    if (isAM && h === 12) h = 0;
-    return `${String(h).padStart(2,'0')}:${String(m||0).padStart(2,'0')}`;
+    const clean = String(str).trim().toUpperCase();
+    const match = clean.match(/^(\d{1,2}):(\d{2})\s*(AM|PM)?/);
+    if (!match) return null;
+    let h = parseInt(match[1]);
+    const m = parseInt(match[2]);
+    const suf = (match[3] || '').toUpperCase();
+    // Reject impossible values outright
+    if (isNaN(h) || isNaN(m) || h < 0 || h > 23 || m < 0 || m > 59) return null;
+    if (suf === 'PM' && h !== 12) h += 12;
+    if (suf === 'AM' && h === 12) h = 0;
+    if (h > 23) return null;
+    return `${String(h).padStart(2,'0')}:${String(m).padStart(2,'0')}`;
   } catch { return null; }
 }
 
@@ -1159,7 +1163,7 @@ function centerKey(center) {
   return 'niles';
 }
 
-function parseTime12(t) {
+function parseTimeToMinutes(t) {
   if (!t || t === '-' || /absent/i.test(t)) return null;
   const s = String(t).trim();
   const m = s.match(/(\d{1,2}):(\d{2})\s*(AM|PM)?/i);
@@ -1306,13 +1310,13 @@ function computeCDCFiling(children, attendance, noSchoolSet, center, periodStart
       const blockDetails = [];
       // Sort blocks by check-in time so "primary" block is first
       const sortedBlocks = [...presentBlocks].sort((a, b) => {
-        const aIn = typeof a.checkin_time === 'string' ? parseTime12(a.checkin_time) : timeStrToMin(a.checkin_time);
-        const bIn = typeof b.checkin_time === 'string' ? parseTime12(b.checkin_time) : timeStrToMin(b.checkin_time);
+        const aIn = typeof a.checkin_time === 'string' ? parseTimeToMinutes(a.checkin_time) : timeStrToMin(a.checkin_time);
+        const bIn = typeof b.checkin_time === 'string' ? parseTimeToMinutes(b.checkin_time) : timeStrToMin(b.checkin_time);
         return (aIn||0) - (bIn||0);
       });
       for (const b of sortedBlocks) {
-        const inM  = typeof b.checkin_time  === 'string' ? parseTime12(b.checkin_time)  : timeStrToMin(b.checkin_time);
-        const outM = typeof b.checkout_time === 'string' ? parseTime12(b.checkout_time) : timeStrToMin(b.checkout_time);
+        const inM  = typeof b.checkin_time  === 'string' ? parseTimeToMinutes(b.checkin_time)  : timeStrToMin(b.checkin_time);
+        const outM = typeof b.checkout_time === 'string' ? parseTimeToMinutes(b.checkout_time) : timeStrToMin(b.checkout_time);
         if (inM == null || outM == null || outM <= inM) continue;
         totalMins += (outM - inM);
         blockDetails.push({
@@ -1384,12 +1388,8 @@ function computeCDCFiling(children, attendance, noSchoolSet, center, periodStart
 
 function timeStrToMin(t) {
   if (!t) return null;
-  if (typeof t === 'string') return parseTime12(t);
-  // Postgres TIME returns like "13:45:00"
-  const s = String(t);
-  const m = s.match(/(\d{1,2}):(\d{2})/);
-  if (!m) return null;
-  return parseInt(m[1])*60 + parseInt(m[2]);
+  // Handles both "8:14 AM" and Postgres TIME format "13:45:00"
+  return parseTimeToMinutes(t);
 }
 
 function minToTimeAMPM(mins) {
