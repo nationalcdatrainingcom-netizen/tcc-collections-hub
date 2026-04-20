@@ -392,6 +392,9 @@ input[type="file"] { display:none; }
       <span class="nav-icon">📊</span> Dashboard
       <span class="badge" id="flag-badge" style="display:none">0</span>
     </div>
+    <div class="nav-item" onclick="showPage('instructions')">
+      <span class="nav-icon">📖</span> Instructions
+    </div>
   </div>
   <div class="nav-section">
     <div class="nav-label">CDC Billing</div>
@@ -413,6 +416,9 @@ input[type="file"] { display:none; }
   </div>
   <div class="nav-section">
     <div class="nav-label">Management</div>
+    <div class="nav-item" onclick="showPage('import-roster')">
+      <span class="nav-icon">📥</span> Import Roster
+    </div>
     <div class="nav-item" onclick="showPage('children')">
       <span class="nav-icon">👶</span> Child Roster
     </div>
@@ -448,8 +454,17 @@ input[type="file"] { display:none; }
 
 <script>
 // ── Config ────────────────────────────────────────────────────────────────────
-const TOKEN = new URLSearchParams(location.search).get('token') || localStorage.getItem('tcc_token') || '';
-if (TOKEN) localStorage.setItem('tcc_token', TOKEN);
+// URL token wins. If it's present, store it. Otherwise use any stored token.
+// If a stored token is invalid the server will tell us and we'll clear it.
+const URL_TOKEN = new URLSearchParams(location.search).get('token');
+if (URL_TOKEN) localStorage.setItem('tcc_token', URL_TOKEN);
+let TOKEN = URL_TOKEN || localStorage.getItem('tcc_token') || '';
+let AUTH_MODE = { allowDirectAccess: false, user: null };
+
+function clearStoredToken() {
+  localStorage.removeItem('tcc_token');
+  TOKEN = '';
+}
 
 const CENTERS = ['Niles', 'Peace', 'Montessori'];
 let currentCenter = 'Niles';
@@ -473,20 +488,30 @@ const FLAG_LABELS = {
 async function api(method, path, body) {
   const opts = {
     method,
-    headers: { 'Content-Type':'application/json', 'Authorization': `Bearer ${TOKEN}` }
+    headers: { 'Content-Type':'application/json' }
   };
+  if (TOKEN) opts.headers['Authorization'] = `Bearer ${TOKEN}`;
   if (body) opts.body = JSON.stringify(body);
-  const res = await fetch('/api' + path, opts);
+  let res = await fetch('/api' + path, opts);
+  if (res.status === 401 && TOKEN) {
+    // Stale token — clear it and retry once (server may allow direct access)
+    clearStoredToken();
+    delete opts.headers['Authorization'];
+    res = await fetch('/api' + path, opts);
+  }
   if (!res.ok) throw new Error(await res.text());
   return res.json();
 }
 
 async function uploadFile(path, formData) {
-  const res = await fetch('/api' + path, {
-    method: 'POST',
-    headers: { 'Authorization': `Bearer ${TOKEN}` },
-    body: formData
-  });
+  const headers = {};
+  if (TOKEN) headers['Authorization'] = `Bearer ${TOKEN}`;
+  let res = await fetch('/api' + path, { method: 'POST', headers, body: formData });
+  if (res.status === 401 && TOKEN) {
+    clearStoredToken();
+    delete headers['Authorization'];
+    res = await fetch('/api' + path, { method: 'POST', headers, body: formData });
+  }
   if (!res.ok) throw new Error(await res.text());
   return res.json();
 }
@@ -1445,7 +1470,343 @@ async function saveRate() {
   } catch(e) { toast('Error: '+e.message,'error'); }
 }
 
-// ── Utils ─────────────────────────────────────────────────────────────────────
+// ── Instructions Page ────────────────────────────────────────────────────────
+pages['instructions'] = () => {
+  document.getElementById('page-title').textContent = 'Instructions';
+  document.getElementById('topbar-actions').innerHTML = '';
+  document.getElementById('content').innerHTML = `
+    <div class="card" style="max-width:900px">
+      <div style="font-family:'DM Serif Display',serif;font-size:28px;color:var(--navy);margin-bottom:6px">
+        Welcome to the TCC Billing Hub
+      </div>
+      <p style="color:var(--gray);font-size:14px;line-height:1.7;margin-bottom:0">
+        This app replaces the manual DHS spreadsheet and catches families who slip through Playground's billing gaps.
+        Follow the steps below in order the first time you set up a new center. After setup, you'll mostly work in the
+        <strong>Upload Timesheets</strong>, <strong>Reconciliation</strong>, and <strong>All Flags</strong> sections on an ongoing basis.
+      </p>
+    </div>
+
+    <div class="card" style="max-width:900px">
+      <div class="card-title">🚀 First-Time Setup (do these once per center)</div>
+
+      <div style="display:flex;gap:14px;margin-bottom:18px;padding:14px;background:var(--cream);border-radius:8px">
+        <div style="flex-shrink:0;width:32px;height:32px;background:var(--navy);color:var(--gold-light);border-radius:50%;display:flex;align-items:center;justify-content:center;font-weight:600">1</div>
+        <div>
+          <strong style="color:var(--navy);font-size:15px">Import your roster from Playground</strong>
+          <p style="color:var(--gray);font-size:13px;line-height:1.6;margin-top:4px">
+            Go to <strong>Import Roster</strong> in the sidebar. Export the children list from Playground as a CSV, pick the center,
+            click <em>Preview</em>, verify the data looks right, then click <em>Commit Import</em>.
+            The system auto-detects CDC, GSRP, and school-age status from the Playground funding source column.
+          </p>
+        </div>
+      </div>
+
+      <div style="display:flex;gap:14px;margin-bottom:18px;padding:14px;background:var(--cream);border-radius:8px">
+        <div style="flex-shrink:0;width:32px;height:32px;background:var(--navy);color:var(--gold-light);border-radius:50%;display:flex;align-items:center;justify-content:center;font-weight:600">2</div>
+        <div>
+          <strong style="color:var(--navy);font-size:15px">Review the Child Roster &amp; fix "Unknown" statuses</strong>
+          <p style="color:var(--gray);font-size:13px;line-height:1.6;margin-top:4px">
+            Open <strong>Child Roster</strong> and click the center tabs. Any child imported with an unknown funding source
+            will appear with a yellow flag — click <em>Edit</em> and set their subsidy type (CDC, GSRP, CDC+GSRP, or Private Pay).
+          </p>
+        </div>
+      </div>
+
+      <div style="display:flex;gap:14px;margin-bottom:18px;padding:14px;background:var(--cream);border-radius:8px">
+        <div style="flex-shrink:0;width:32px;height:32px;background:var(--navy);color:var(--gold-light);border-radius:50%;display:flex;align-items:center;justify-content:center;font-weight:600">3</div>
+        <div>
+          <strong style="color:var(--navy);font-size:15px">Enter tuition rates</strong>
+          <p style="color:var(--gray);font-size:13px;line-height:1.6;margin-top:4px">
+            Go to <strong>Tuition Rates</strong> and add the current weekly rates for each age group at each center
+            (infant, toddler, preschool, school-age). These are used when the billing engine calculates private-pay charges
+            and no-school day fees.
+          </p>
+        </div>
+      </div>
+
+      <div style="display:flex;gap:14px;margin-bottom:0;padding:14px;background:var(--cream);border-radius:8px">
+        <div style="flex-shrink:0;width:32px;height:32px;background:var(--navy);color:var(--gold-light);border-radius:50%;display:flex;align-items:center;justify-content:center;font-weight:600">4</div>
+        <div>
+          <strong style="color:var(--navy);font-size:15px">Add known no-school days</strong>
+          <p style="color:var(--gray);font-size:13px;line-height:1.6;margin-top:4px">
+            Go to <strong>No-School Days</strong> and enter any already-known school closure dates (spring break, snow days, etc.).
+            You can add more throughout the year as they come up. The billing engine uses these to apply no-school day rates.
+          </p>
+        </div>
+      </div>
+    </div>
+
+    <div class="card" style="max-width:900px">
+      <div class="card-title">📅 Every Two Weeks (your regular billing workflow)</div>
+
+      <div style="display:flex;gap:14px;margin-bottom:18px;padding:14px;background:#fff;border:1px solid var(--border);border-radius:8px">
+        <div style="flex-shrink:0;width:32px;height:32px;background:var(--gold);color:var(--white);border-radius:50%;display:flex;align-items:center;justify-content:center;font-weight:600">A</div>
+        <div>
+          <strong style="color:var(--navy);font-size:15px">Upload Playground timesheets</strong>
+          <p style="color:var(--gray);font-size:13px;line-height:1.6;margin-top:4px">
+            Go to <strong>Upload Timesheets</strong>. Pick the center, drop in the attendance CSV. The system records every check-in
+            and check-out, flags late pickups after 6pm, and flags any child with unknown subsidy status.
+          </p>
+        </div>
+      </div>
+
+      <div style="display:flex;gap:14px;margin-bottom:18px;padding:14px;background:#fff;border:1px solid var(--border);border-radius:8px">
+        <div style="flex-shrink:0;width:32px;height:32px;background:var(--gold);color:var(--white);border-radius:50%;display:flex;align-items:center;justify-content:center;font-weight:600">B</div>
+        <div>
+          <strong style="color:var(--navy);font-size:15px">Upload the CDC statement</strong>
+          <p style="color:var(--gray);font-size:13px;line-height:1.6;margin-top:4px">
+            When the CDC statement arrives (roughly 2–3 weeks after each billing period ends), go to <strong>Reconciliation</strong>,
+            click <em>Upload CDC Statement</em>, pick the period number and center, and upload. The system compares it against your
+            CDC roster and raises flags for <span style="color:var(--red)">No Authorization</span>, <span style="color:var(--red)">Missing from Statement</span>,
+            and <span style="color:var(--amber)">Not Found in DHS</span> — these are the families who would have slipped through Playground.
+          </p>
+        </div>
+      </div>
+
+      <div style="display:flex;gap:14px;margin-bottom:18px;padding:14px;background:#fff;border:1px solid var(--border);border-radius:8px">
+        <div style="flex-shrink:0;width:32px;height:32px;background:var(--gold);color:var(--white);border-radius:50%;display:flex;align-items:center;justify-content:center;font-weight:600">C</div>
+        <div>
+          <strong style="color:var(--navy);font-size:15px">Review flags and act on them</strong>
+          <p style="color:var(--gray);font-size:13px;line-height:1.6;margin-top:4px">
+            Go to <strong>All Flags</strong>. Work through each flag:
+          </p>
+          <ul style="color:var(--gray);font-size:13px;line-height:1.8;margin-top:6px;padding-left:20px">
+            <li>🔴 <strong>No Authorization</strong> — bill the family directly for that period</li>
+            <li>🔴 <strong>Missing from Statement</strong> — child is CDC but not on the DHS pay — contact DHS or bill family</li>
+            <li>🟡 <strong>Late Pickup</strong> — issue a late fee ($10 + $1/min after 10-min grace)</li>
+            <li>🔵 <strong>Unknown Subsidy Status</strong> — edit the child and set their funding type</li>
+          </ul>
+          <p style="color:var(--gray);font-size:13px;line-height:1.6;margin-top:6px">
+            Click <em>Resolve</em> on each flag once you've handled it.
+          </p>
+        </div>
+      </div>
+
+      <div style="display:flex;gap:14px;margin-bottom:18px;padding:14px;background:#fff;border:1px solid var(--border);border-radius:8px">
+        <div style="flex-shrink:0;width:32px;height:32px;background:var(--gold);color:var(--white);border-radius:50%;display:flex;align-items:center;justify-content:center;font-weight:600">D</div>
+        <div>
+          <strong style="color:var(--navy);font-size:15px">Run the Billing Engine</strong>
+          <p style="color:var(--gray);font-size:13px;line-height:1.6;margin-top:4px">
+            Go to <strong>Billing Engine</strong>, pick the date range for the billing period, click <em>Calculate Billing</em>.
+            The engine applies GSRP carve-outs (Niles/Peace M–Th 8:30–3:30 window, Montessori M–F 8:00–3:00), Friday full-day
+            CDC billing for Niles/Peace, school-ager splits, and no-school day fees. Output shows what each child owes CDC vs. privately.
+          </p>
+        </div>
+      </div>
+
+      <div style="display:flex;gap:14px;padding:14px;background:#fff;border:1px solid var(--border);border-radius:8px">
+        <div style="flex-shrink:0;width:32px;height:32px;background:var(--gold);color:var(--white);border-radius:50%;display:flex;align-items:center;justify-content:center;font-weight:600">E</div>
+        <div>
+          <strong style="color:var(--navy);font-size:15px">Mark the billing period complete</strong>
+          <p style="color:var(--gray);font-size:13px;line-height:1.6;margin-top:4px">
+            Once you've submitted to DHS and billed families, go to <strong>Billing Periods</strong> and mark the period's
+            billing status and crediting status as complete.
+          </p>
+        </div>
+      </div>
+    </div>
+
+    <div class="card" style="max-width:900px">
+      <div class="card-title">💡 Tips &amp; Rules the System Uses</div>
+      <div style="font-size:13.5px;color:var(--gray);line-height:1.8">
+        <p style="margin-bottom:10px"><strong style="color:var(--navy)">GSRP hours (auto-applied):</strong></p>
+        <ul style="padding-left:20px;margin-bottom:14px">
+          <li>Niles &amp; Peace: Monday–Thursday, 8:30 AM – 3:30 PM (Fridays bill full-day to CDC)</li>
+          <li>Montessori: Monday–Friday, 8:00 AM – 3:00 PM</li>
+        </ul>
+        <p style="margin-bottom:10px"><strong style="color:var(--navy)">Late pickup fees:</strong> $10 base + $1 per minute after 6:00 PM closing, with a 10-minute grace window.</p>
+        <p style="margin-bottom:10px"><strong style="color:var(--navy)">School-ager split-block logic:</strong> On school days, billable hours are before and after the school block. On no-school days, full-day attendance is billed at the hourly school-age rate.</p>
+        <p style="margin-bottom:10px"><strong style="color:var(--navy)">CDC and Tri-Share are mutually exclusive.</strong> Tri-Share families are tracked separately at uwnwmi.chobiit.us.</p>
+        <p style="margin-bottom:0"><strong style="color:var(--navy)">If a child gets added to attendance but isn't in the roster:</strong> the system auto-creates them with "Unknown" subsidy status and flags it. Always review the roster after uploading timesheets.</p>
+      </div>
+    </div>
+
+    <div class="card" style="max-width:900px;background:var(--blue-light);border:1px solid var(--blue)">
+      <div style="font-size:15px;color:var(--blue);font-weight:600;margin-bottom:8px">🧭 Need help or stuck?</div>
+      <p style="font-size:13.5px;color:var(--navy);line-height:1.7;margin:0">
+        Upload issues? Check that your CSV has the Playground-standard columns (First Name, Last Name, Date of Birth, Classroom, Funding Source).
+        Wrong data? You can always re-run <strong>Import Roster</strong> in <em>Merge</em> mode — it won't overwrite subsidy types you've already set manually.
+      </p>
+    </div>
+  `;
+};
+
+// ── Import Roster Page ───────────────────────────────────────────────────────
+pages['import-roster'] = () => {
+  document.getElementById('page-title').textContent = 'Import Roster';
+  document.getElementById('topbar-actions').innerHTML = '';
+  document.getElementById('content').innerHTML = `
+    ${centerSelector('document.getElementById("ir-center-label").textContent=currentCenter')}
+
+    <div class="card">
+      <div class="card-title">📥 Bulk Import from Playground CSV</div>
+      <p style="font-size:13.5px;color:var(--gray);margin-bottom:16px;line-height:1.7">
+        Upload the Playground children export for <strong id="ir-center-label">${currentCenter}</strong>.
+        The system will auto-detect CDC, GSRP, and school-age status from the funding source and classroom columns.
+        You'll see a preview before anything is saved.
+      </p>
+
+      <div class="form-row" style="margin-bottom:16px">
+        <div class="form-group">
+          <label>Import Mode</label>
+          <select id="ir-mode">
+            <option value="merge">Merge — add new children, update inferred fields, preserve manual subsidy overrides</option>
+            <option value="replace">Replace — also deactivate children not in the new file</option>
+          </select>
+        </div>
+      </div>
+
+      <div class="upload-zone" onclick="document.getElementById('ir-file').click()">
+        <div style="font-size:40px">📥</div>
+        <p><strong>Click to upload Playground roster CSV</strong></p>
+        <p>Expected columns: First Name, Last Name, Date of Birth, Classroom, Funding Source</p>
+      </div>
+      <input type="file" id="ir-file" accept=".csv" onchange="handleRosterPreview(this)">
+      <div id="ir-preview" style="margin-top:20px"></div>
+    </div>
+
+    <div class="card">
+      <div class="card-title">ℹ️ How the auto-detection works</div>
+      <div style="font-size:13.5px;color:var(--gray);line-height:1.8">
+        <p style="margin-bottom:8px"><strong style="color:var(--navy)">Funding Source → Subsidy Type:</strong></p>
+        <ul style="padding-left:20px;margin-bottom:12px">
+          <li>"CDC" or "Child Development and Care" → CDC</li>
+          <li>"GSRP" or "Great Start" → GSRP</li>
+          <li>Both mentioned → CDC + GSRP</li>
+          <li>"Tri-Share" → Private Pay (Tri-Share tracked separately)</li>
+          <li>Blank → Unknown (will raise a flag to review)</li>
+        </ul>
+        <p style="margin-bottom:8px"><strong style="color:var(--navy)">Classroom → School Age:</strong> Rooms containing "school age", "SA", "kinder", or "before &amp; after" are marked school-age. Children 5.5+ years old are also auto-marked.</p>
+        <p style="margin-bottom:0"><strong style="color:var(--navy)">Status → Active:</strong> Anything containing "withdrawn", "inactive", "disenrolled", or "terminated" is marked inactive.</p>
+      </div>
+    </div>
+  `;
+};
+
+let LAST_ROSTER_FILE = null;
+
+async function handleRosterPreview(input) {
+  const file = input.files[0];
+  if (!file) return;
+  LAST_ROSTER_FILE = file;
+
+  const fd = new FormData();
+  fd.append('file', file);
+  fd.append('center', currentCenter);
+
+  document.getElementById('ir-preview').innerHTML = '<div class="loading">Parsing preview…</div>';
+  try {
+    const result = await uploadFile('/upload/roster/preview', fd);
+    renderRosterPreview(result);
+  } catch (e) {
+    document.getElementById('ir-preview').innerHTML =
+      `<div style="background:var(--red-light);border:1px solid var(--red);border-radius:8px;padding:16px;color:var(--red)">Error: ${e.message}</div>`;
+  }
+}
+
+function renderRosterPreview(result) {
+  const { rows, headers, errors, totalRows } = result;
+  const newCount = rows.filter(r => r.action === 'new').length;
+  const updateCount = rows.filter(r => r.action === 'update').length;
+  const unknownCount = rows.filter(r => r.subsidy_type === 'unknown').length;
+
+  const rowsHtml = rows.slice(0, 200).map(r => `
+    <tr style="${r.action==='new' ? 'background:var(--green-light)' : ''}">
+      <td>${r.action === 'new'
+        ? '<span class="badge-pill badge-paid">NEW</span>'
+        : '<span class="badge-pill badge-pending">Update</span>'}</td>
+      <td><strong>${r.last_name}, ${r.first_name}</strong></td>
+      <td>${subsidyBadge(r.subsidy_type)}</td>
+      <td>${r.is_gsrp ? '✅' : '—'}</td>
+      <td>${r.is_cdc ? '✅' : '—'}</td>
+      <td>${r.is_school_age ? '✅' : '—'}</td>
+      <td>${r.is_active ? '✅' : '<span style="color:var(--red)">Inactive</span>'}</td>
+      <td style="font-size:12px;color:var(--gray)">${r.classroom || '—'}</td>
+      <td style="font-size:12px;color:var(--gray)">${r.funding || '—'}</td>
+    </tr>`).join('');
+
+  document.getElementById('ir-preview').innerHTML = `
+    <div style="background:var(--blue-light);border:1px solid var(--blue);border-radius:8px;padding:16px;margin-bottom:16px">
+      <strong style="color:var(--blue);font-size:15px">📋 Preview — nothing has been saved yet</strong>
+      <div style="margin-top:10px;display:flex;gap:20px;flex-wrap:wrap;font-size:13.5px">
+        <span><strong>${totalRows}</strong> total rows</span>
+        <span style="color:var(--green)"><strong>${newCount}</strong> new children</span>
+        <span style="color:var(--gray)"><strong>${updateCount}</strong> updates</span>
+        ${unknownCount > 0 ? `<span style="color:var(--amber)"><strong>${unknownCount}</strong> unknown subsidy (will flag)</span>` : ''}
+        ${errors.length > 0 ? `<span style="color:var(--red)"><strong>${errors.length}</strong> errors</span>` : ''}
+      </div>
+      <div style="margin-top:10px;font-size:12px;color:var(--gray)">
+        <strong>Detected columns:</strong> ${headers.join(' · ')}
+      </div>
+      ${errors.length > 0 ? `
+        <details style="margin-top:10px;font-size:12.5px;color:var(--red)">
+          <summary style="cursor:pointer">Show errors</summary>
+          <ul style="margin-top:6px;padding-left:20px">${errors.slice(0,20).map(e => `<li>${e}</li>`).join('')}</ul>
+        </details>` : ''}
+    </div>
+
+    <div class="card" style="padding:0;margin-bottom:16px">
+      <div class="table-wrap" style="max-height:500px;overflow-y:auto">
+        <table>
+          <thead><tr>
+            <th>Action</th>
+            <th>Child Name</th>
+            <th>Subsidy</th>
+            <th>GSRP</th>
+            <th>CDC</th>
+            <th>School Age</th>
+            <th>Active</th>
+            <th>Classroom</th>
+            <th>Funding</th>
+          </tr></thead>
+          <tbody>${rowsHtml}</tbody>
+        </table>
+      </div>
+      ${rows.length > 200 ? `<div style="padding:10px;text-align:center;color:var(--gray);font-size:12.5px;border-top:1px solid var(--border)">Showing first 200 of ${rows.length} rows · commit will process all</div>` : ''}
+    </div>
+
+    <div style="display:flex;gap:10px;align-items:center">
+      <button class="btn btn-gold" onclick="commitRosterImport()">✓ Commit Import to ${currentCenter}</button>
+      <button class="btn btn-ghost" onclick="document.getElementById('ir-preview').innerHTML='';document.getElementById('ir-file').value='';LAST_ROSTER_FILE=null;">Cancel</button>
+    </div>
+    <div id="ir-commit-result" style="margin-top:16px"></div>
+  `;
+}
+
+async function commitRosterImport() {
+  if (!LAST_ROSTER_FILE) return toast('No file loaded — re-upload','error');
+  const mode = document.getElementById('ir-mode').value;
+  const fd = new FormData();
+  fd.append('file', LAST_ROSTER_FILE);
+  fd.append('center', currentCenter);
+  fd.append('mode', mode);
+
+  document.getElementById('ir-commit-result').innerHTML = '<div class="loading">Importing…</div>';
+  try {
+    const r = await uploadFile('/upload/roster/commit', fd);
+    document.getElementById('ir-commit-result').innerHTML = `
+      <div style="background:var(--green-light);border:1px solid var(--green);border-radius:8px;padding:16px">
+        <strong style="color:var(--green);font-size:15px">✅ Roster imported</strong>
+        <div style="margin-top:8px;font-size:13.5px;display:flex;gap:20px;flex-wrap:wrap">
+          <span><strong>${r.created}</strong> new children added</span>
+          <span><strong>${r.updated}</strong> updated</span>
+          ${r.skipped > 0 ? `<span style="color:var(--amber)"><strong>${r.skipped}</strong> skipped (missing name)</span>` : ''}
+          ${r.deactivated > 0 ? `<span style="color:var(--red)"><strong>${r.deactivated}</strong> deactivated</span>` : ''}
+          ${r.flags.length > 0 ? `<span style="color:var(--amber)"><strong>${r.flags.length}</strong> flags raised</span>` : ''}
+        </div>
+        <div style="margin-top:12px;font-size:13px">
+          <button class="btn btn-sm btn-primary" onclick="showPage('children')">Go to Child Roster →</button>
+          ${r.flags.length > 0 ? `<button class="btn btn-sm btn-ghost" onclick="showPage('flags')">Review ${r.flags.length} flags →</button>` : ''}
+        </div>
+      </div>`;
+    toast(`Imported: ${r.created} new, ${r.updated} updated`,'success');
+  } catch (e) {
+    document.getElementById('ir-commit-result').innerHTML =
+      `<div style="background:var(--red-light);border:1px solid var(--red);border-radius:8px;padding:16px;color:var(--red)">Error: ${e.message}</div>`;
+  }
+}
+
+
 function fmtDate(d) {
   if (!d) return '—';
   return new Date(d).toLocaleDateString('en-US', { month:'short', day:'numeric', year:'numeric' });
@@ -1461,16 +1822,28 @@ function timeAgo(d) {
 }
 
 // ── Boot ──────────────────────────────────────────────────────────────────────
-if (!TOKEN) {
+(async () => {
+  // Check server auth mode — is direct access allowed?
+  try {
+    const res = await fetch('/api/auth/mode');
+    if (res.ok) AUTH_MODE = await res.json();
+  } catch (e) { /* non-fatal */ }
+
+  // If direct access is allowed, just show the app — stale tokens will be
+  // cleared automatically by api() on the first 401.
+  if (AUTH_MODE.allowDirectAccess || TOKEN) {
+    showPage('dashboard');
+    return;
+  }
+
+  // Otherwise require an SSO token
   document.getElementById('content').innerHTML = `
-    <div class="card" style="max-width:400px;margin:60px auto;text-align:center">
+    <div class="card" style="max-width:420px;margin:60px auto;text-align:center">
       <div style="font-size:48px;margin-bottom:16px">🔒</div>
       <div class="card-title">Authentication Required</div>
-      <p style="color:var(--gray);font-size:14px">Please access this app through the TCC Hub or add a <code>?token=</code> parameter.</p>
+      <p style="color:var(--gray);font-size:14px">Please launch this app from the TCC Hub.</p>
     </div>`;
-} else {
-  showPage('dashboard');
-}
+})();
 </script>
 </body>
 </html>
