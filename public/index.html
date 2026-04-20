@@ -409,6 +409,15 @@ input[type="file"] { display:none; }
     </div>
   </div>
   <div class="nav-section">
+    <div class="nav-label">Collections</div>
+    <div class="nav-item" onclick="showPage('collections-dashboard')">
+      <span class="nav-icon">💰</span> Collections Dashboard
+    </div>
+    <div class="nav-item" onclick="showPage('collections-families')">
+      <span class="nav-icon">👨‍👩‍👧</span> Past-Due Families
+    </div>
+  </div>
+  <div class="nav-section">
     <div class="nav-label">Attendance</div>
     <div class="nav-item" onclick="showPage('upload-attendance')">
       <span class="nav-icon">⬆️</span> Upload Timesheets
@@ -1157,46 +1166,135 @@ async function handleAttUpload(input) {
 }
 
 // ── Billing Engine ────────────────────────────────────────────────────────────
-pages['billing-engine'] = () => {
+pages['billing-engine'] = async () => {
   document.getElementById('page-title').textContent = 'Billing Engine';
   document.getElementById('topbar-actions').innerHTML = '';
-  document.getElementById('content').innerHTML = `
+  const content = document.getElementById('content');
+  content.innerHTML = '<div class="loading">Loading billing periods…</div>';
+
+  // Pull the CDC period schedule — start dates drive the dropdown.
+  const periods = await api('GET', '/billing-periods');
+  // Sort chronologically (DB returns DESC)
+  periods.sort((a,b) => String(a.start_date).localeCompare(String(b.start_date)));
+
+  // Pick the current period by default (today sits within [start, end] or end just passed)
+  const today = new Date().toISOString().split('T')[0];
+  let defaultPeriod = periods.find(p => {
+    const s = String(p.start_date).split('T')[0];
+    const e = String(p.end_date).split('T')[0];
+    return s <= today && today <= e;
+  });
+  if (!defaultPeriod) {
+    // Otherwise the most recent one whose end date has passed
+    defaultPeriod = [...periods].reverse().find(p => String(p.end_date).split('T')[0] <= today) || periods[0];
+  }
+
+  const periodOptions = periods.map(p => {
+    const s = String(p.start_date).split('T')[0];
+    const e = String(p.end_date).split('T')[0];
+    const label = `Period ${p.period_number}: ${fmtDateShort(s)} – ${fmtDateShort(e)}`;
+    return `<option value="${p.period_number}" ${defaultPeriod && p.period_number === defaultPeriod.period_number ? 'selected' : ''}>${label}</option>`;
+  }).join('');
+
+  content.innerHTML = `
     ${centerSelector('')}
     <div class="card">
       <div class="card-title">⚙️ Calculate Billable Hours</div>
-      <p style="font-size:13.5px;color:var(--gray);margin-bottom:16px">
-        Select a date range to calculate what should be billed to CDC vs. families for each child.
-        The engine applies GSRP carve-outs, Friday full-day rules, school-ager splits, and no-school day fees.
+      <p style="font-size:13.5px;color:var(--gray);margin-bottom:16px;line-height:1.6">
+        The engine applies the CDC billing rules (GSRP carve-outs, Friday full-day for Niles/Peace,
+        school-ager splits, no-school day fees, absence tracking) and shows what to bill CDC vs. families.
       </p>
+
       <div class="form-row">
-        <div class="form-group"><label>Start Date</label><input type="date" id="be-start"></div>
-        <div class="form-group"><label>End Date</label><input type="date" id="be-end"></div>
+        <div class="form-group" style="flex:2">
+          <label>CDC Billing Period</label>
+          <select id="be-period" style="font-size:14px" onchange="updateBillingEnginePeriodInfo()">
+            ${periodOptions}
+          </select>
+        </div>
       </div>
-      <button class="btn btn-primary" onclick="runBillingEngine()">Calculate Billing</button>
+
+      <div id="be-period-info"></div>
+
+      <button class="btn btn-primary" onclick="runBillingEngine()" style="margin-top:14px">Calculate Billing</button>
     </div>
     <div id="billing-output"></div>`;
 
-  // Default to current 2-week period
-  const now = new Date();
-  const start = new Date(now);
-  start.setDate(now.getDate() - 13);
-  document.getElementById('be-start').value = start.toISOString().split('T')[0];
-  document.getElementById('be-end').value = now.toISOString().split('T')[0];
+  // Stash the full period objects for lookup
+  window.__BE_PERIODS = Object.fromEntries(periods.map(p => [p.period_number, p]));
+  updateBillingEnginePeriodInfo();
 };
 
+function updateBillingEnginePeriodInfo() {
+  const sel = document.getElementById('be-period');
+  if (!sel) return;
+  const p = window.__BE_PERIODS[sel.value];
+  if (!p) { document.getElementById('be-period-info').innerHTML = ''; return; }
+
+  const start = String(p.start_date).split('T')[0];
+  const end = String(p.end_date).split('T')[0];
+  const deadline = String(p.reporting_deadline).split('T')[0];
+
+  // VA-friendly deadline: 1 day earlier than DHS deadline to account for timezone differences.
+  const vaDeadlineDate = new Date(deadline + 'T00:00:00Z');
+  vaDeadlineDate.setUTCDate(vaDeadlineDate.getUTCDate() - 1);
+  const vaDeadline = vaDeadlineDate.toISOString().split('T')[0];
+
+  const deadlineTimeNote = p.deadline_is_4pm
+    ? '<strong style="color:var(--red)">⚠ This deadline is 4:00 PM ET</strong> (not midnight) — a state holiday is the next day.'
+    : 'Deadline closes at midnight ET.';
+
+  const paymentNote = p.payment_delayed_holiday
+    ? '<span style="color:var(--amber)">⚠ Payment delayed due to state holiday</span>'
+    : '';
+
+  document.getElementById('be-period-info').innerHTML = `
+    <div style="background:var(--cream);border-left:3px solid var(--gold);padding:14px 18px;border-radius:6px;margin-top:14px">
+      <div style="display:flex;gap:24px;flex-wrap:wrap;font-size:13.5px;line-height:1.8">
+        <div><strong style="color:var(--navy)">Period ${p.period_number}</strong></div>
+        <div>Start: <strong>${fmtDate(start)}</strong></div>
+        <div>End: <strong>${fmtDate(end)}</strong></div>
+        <div>Expected Payment: <strong>${fmtDate(p.payment_date)}</strong> ${paymentNote}</div>
+      </div>
+      <div style="margin-top:12px;padding:10px 14px;background:var(--red-light);border:1px solid var(--red);border-radius:6px">
+        <div style="font-size:14px;font-weight:600;color:var(--red)">📅 Must be filed by: ${fmtDate(deadline)}</div>
+        <div style="font-size:12.5px;color:var(--navy);margin-top:4px">${deadlineTimeNote}</div>
+        <div style="margin-top:8px;padding-top:8px;border-top:1px dashed rgba(192,57,43,0.3);font-size:12.5px;color:var(--navy)">
+          🌏 <strong>VA target deadline: ${fmtDate(vaDeadline)}</strong>
+          <span style="color:var(--gray)">(1 day early — accounts for timezone differences for international VAs)</span>
+        </div>
+      </div>
+    </div>`;
+}
+
 async function runBillingEngine() {
-  const start = document.getElementById('be-start').value;
-  const end = document.getElementById('be-end').value;
-  if (!start || !end) return toast('Select date range','error');
+  const periodNumber = document.getElementById('be-period').value;
+  const p = window.__BE_PERIODS[periodNumber];
+  if (!p) return toast('Pick a period','error');
+  const start = String(p.start_date).split('T')[0];
+  const end = String(p.end_date).split('T')[0];
+
   document.getElementById('billing-output').innerHTML = '<div class="loading">Calculating…</div>';
   try {
     const results = await api('GET', `/billing/calculate?center=${currentCenter}&start_date=${start}&end_date=${end}`);
     if (results.length === 0) {
       document.getElementById('billing-output').innerHTML =
-        '<div class="card"><div class="empty"><div class="empty-icon">📭</div><p>No attendance records found for this period.</p></div></div>';
+        `<div class="card"><div class="empty"><div class="empty-icon">📭</div>
+          <p>No attendance records found for Period ${periodNumber} at ${currentCenter}.</p>
+          <p style="font-size:12.5px;color:var(--gray);margin-top:6px">Upload timesheets first, or try the CDC Filing Wizard which walks you through the full process.</p>
+          <button class="btn btn-gold" style="margin-top:12px" onclick="showPage('cdc-filing-wizard')">Open CDC Filing Wizard →</button>
+        </div></div>`;
       return;
     }
-    let html = `<div style="margin-bottom:16px;font-size:13.5px;color:var(--gray)">${results.length} children found · ${start} to ${end}</div>`;
+    let html = `
+      <div class="card" style="background:var(--navy);color:var(--white);padding:14px 20px;margin-bottom:16px">
+        <div style="display:flex;gap:24px;flex-wrap:wrap;align-items:center">
+          <div><span style="color:rgba(255,255,255,0.6);font-size:11px;text-transform:uppercase;letter-spacing:.5px">Period</span><br><strong style="font-size:18px">${periodNumber}</strong></div>
+          <div><span style="color:rgba(255,255,255,0.6);font-size:11px;text-transform:uppercase;letter-spacing:.5px">Range</span><br><strong>${fmtDate(start)} – ${fmtDate(end)}</strong></div>
+          <div><span style="color:rgba(255,255,255,0.6);font-size:11px;text-transform:uppercase;letter-spacing:.5px">Center</span><br><strong>${currentCenter}</strong></div>
+          <div><span style="color:rgba(255,255,255,0.6);font-size:11px;text-transform:uppercase;letter-spacing:.5px">Children</span><br><strong>${results.length}</strong></div>
+        </div>
+      </div>`;
     for (const child of results) {
       const cdcCount = child.cdcBillableBlocks.length;
       const gsrpCount = child.gsrpBlocks.length;
@@ -1660,12 +1758,22 @@ function updatePeriodInfo() {
   const opt = sel.options[sel.selectedIndex];
   const info = document.getElementById('wiz-period-info');
   if (!sel.value) { info.innerHTML = ''; return; }
+
+  // VA-friendly deadline: 1 day earlier than DHS deadline to account for timezone differences
+  const vaDeadlineDate = new Date(opt.dataset.deadline + (opt.dataset.deadline.includes('T') ? '' : 'T00:00:00Z'));
+  vaDeadlineDate.setUTCDate(vaDeadlineDate.getUTCDate() - 1);
+  const vaDeadline = vaDeadlineDate.toISOString().split('T')[0];
+
   info.innerHTML = `
     <div style="background:var(--cream);border-left:3px solid var(--gold);padding:14px 18px;border-radius:6px;font-size:14px;line-height:1.8">
       <strong style="color:var(--navy)">Period ${sel.value}</strong><br>
       Start Date: <strong>${fmtDateShort(opt.dataset.start)}</strong><br>
       End Date: <strong>${fmtDateShort(opt.dataset.end)}</strong><br>
-      Reporting Deadline: <strong style="color:var(--red)">${fmtDateShort(opt.dataset.deadline)}</strong>
+      Must be filed by: <strong style="color:var(--red)">${fmtDateShort(opt.dataset.deadline)}</strong>
+    </div>
+    <div style="background:var(--red-light);border:1px solid var(--red);border-radius:6px;padding:10px 14px;margin-top:8px;font-size:13px;line-height:1.6">
+      🌏 <strong>VA target deadline: ${fmtDateShort(vaDeadline)}</strong>
+      <span style="color:var(--gray)">— 1 day before the DHS deadline to account for timezone differences.</span>
     </div>`;
 }
 
@@ -2291,6 +2399,500 @@ async function commitRosterImport() {
     document.getElementById('ir-commit-result').innerHTML =
       `<div style="background:var(--red-light);border:1px solid var(--red);border-radius:8px;padding:16px;color:var(--red)">Error: ${e.message}</div>`;
   }
+}
+
+
+// ═════════════════════════════════════════════════════════════════════════════
+// ── Collections Pages ───────────────────────────────────────────────────────
+// ═════════════════════════════════════════════════════════════════════════════
+
+pages['collections-dashboard'] = async () => {
+  document.getElementById('page-title').textContent = 'Collections Dashboard';
+  document.getElementById('topbar-actions').innerHTML = '';
+  const content = document.getElementById('content');
+  content.innerHTML = '<div class="loading">Loading…</div>';
+
+  try {
+    const data = await api('GET', '/collections/dashboard');
+    const s = data.summary;
+
+    const stripeWarning = !data.stripe_configured ? `
+      <div style="background:var(--amber-light);border:1px solid var(--amber);border-radius:8px;padding:14px;margin-bottom:16px">
+        <strong style="color:var(--amber)">⚠ Stripe not configured</strong>
+        <p style="font-size:13px;color:var(--navy);margin-top:6px;line-height:1.6">
+          To enable payment link generation and automatic payment tracking: add <code>STRIPE_SECRET_KEY</code> to Render env vars (Stripe dashboard → Developers → API keys).
+          Add a webhook endpoint in Stripe pointing to <code>${location.origin}/api/collections/webhook</code> subscribed to: <code>payment_intent.succeeded</code>, <code>payment_intent.payment_failed</code>, <code>checkout.session.completed</code>, <code>charge.refunded</code>. Copy the signing secret into <code>STRIPE_WEBHOOK_SECRET</code>.
+        </p>
+      </div>` : '';
+
+    content.innerHTML = `
+      ${stripeWarning}
+      <div style="display:grid;grid-template-columns:repeat(auto-fit,minmax(180px,1fr));gap:14px;margin-bottom:20px">
+        <div class="card" style="padding:16px">
+          <div style="font-size:11px;color:var(--gray);text-transform:uppercase;letter-spacing:.5px;margin-bottom:4px">Active Families</div>
+          <div style="font-size:28px;font-weight:600;color:var(--navy)">${s.active_families}</div>
+        </div>
+        <div class="card" style="padding:16px">
+          <div style="font-size:11px;color:var(--gray);text-transform:uppercase;letter-spacing:.5px;margin-bottom:4px">Total Owed</div>
+          <div style="font-size:28px;font-weight:600;color:var(--red)">$${s.total_owed.toFixed(2)}</div>
+        </div>
+        <div class="card" style="padding:16px;background:var(--green-light);border:1px solid var(--green)">
+          <div style="font-size:11px;color:var(--green);text-transform:uppercase;letter-spacing:.5px;margin-bottom:4px">Collected Total</div>
+          <div style="font-size:28px;font-weight:600;color:var(--green)">$${s.collected_total.toFixed(2)}</div>
+        </div>
+        <div class="card" style="padding:16px">
+          <div style="font-size:11px;color:var(--gray);text-transform:uppercase;letter-spacing:.5px;margin-bottom:4px">This Month</div>
+          <div style="font-size:28px;font-weight:600;color:var(--navy)">$${s.collected_this_month.toFixed(2)}</div>
+          <div style="font-size:11px;color:var(--gray);margin-top:2px">${s.payments_this_month} payment${s.payments_this_month!==1?'s':''}</div>
+        </div>
+        <div class="card" style="padding:16px">
+          <div style="font-size:11px;color:var(--gray);text-transform:uppercase;letter-spacing:.5px;margin-bottom:4px">Still Outstanding</div>
+          <div style="font-size:28px;font-weight:600;color:var(--amber)">$${s.outstanding.toFixed(2)}</div>
+        </div>
+        <div class="card" style="padding:16px">
+          <div style="font-size:11px;color:var(--gray);text-transform:uppercase;letter-spacing:.5px;margin-bottom:4px">Settled Families</div>
+          <div style="font-size:28px;font-weight:600;color:var(--green)">${s.settled_families}</div>
+        </div>
+      </div>
+
+      ${data.failed_payments.length > 0 ? `
+        <div class="card">
+          <div class="card-title" style="color:var(--red)">🚨 Failed Payments (past 30 days) — follow up</div>
+          <div class="table-wrap">
+            <table>
+              <thead><tr><th>Family</th><th>Amount</th><th>Reason</th><th>When</th><th></th></tr></thead>
+              <tbody>
+                ${data.failed_payments.map(p => `
+                  <tr>
+                    <td><strong>${p.family_name||'(unknown)'}</strong></td>
+                    <td>$${parseFloat(p.amount).toFixed(2)}</td>
+                    <td style="font-size:12px;color:var(--red)">${p.failure_reason||''}</td>
+                    <td style="font-size:12px;color:var(--gray)">${timeAgo(p.created_at)}</td>
+                    <td>${p.family_id ? `<button class="btn btn-sm btn-ghost" onclick="openFamilyDetail(${p.family_id})">View →</button>` : ''}</td>
+                  </tr>`).join('')}
+              </tbody>
+            </table>
+          </div>
+        </div>` : ''}
+
+      <div class="card">
+        <div class="card-title">📜 Recent Activity</div>
+        ${data.recent_events.length === 0 ? `
+          <p style="color:var(--gray);font-size:13px;padding:20px;text-align:center">No activity yet. Once payments start coming in, they'll show here.</p>
+        ` : `
+          <div style="max-height:400px;overflow-y:auto">
+            ${data.recent_events.map(e => `
+              <div style="padding:10px 0;border-bottom:1px solid var(--border);display:flex;gap:10px;align-items:center">
+                <div style="font-size:18px">${eventIcon(e.event_type)}</div>
+                <div style="flex:1">
+                  <div style="font-size:13px"><strong>${e.family_name||'(unknown family)'}</strong> — ${e.detail||e.event_type}</div>
+                  <div style="font-size:11px;color:var(--gray)">${timeAgo(e.created_at)}</div>
+                </div>
+                ${e.family_id ? `<button class="btn btn-sm btn-ghost" onclick="openFamilyDetail(${e.family_id})">View →</button>` : ''}
+              </div>`).join('')}
+          </div>
+        `}
+      </div>`;
+  } catch (e) {
+    content.innerHTML = `<div class="card"><div style="color:var(--red)">Error: ${e.message}</div></div>`;
+  }
+};
+
+function eventIcon(type) {
+  if (type.includes('succeeded') || type.includes('completed')) return '✅';
+  if (type.includes('failed')) return '🚨';
+  if (type.includes('refund')) return '↩️';
+  return '📄';
+}
+
+pages['collections-families'] = async () => {
+  document.getElementById('page-title').textContent = 'Past-Due Families';
+  document.getElementById('topbar-actions').innerHTML = `
+    <button class="btn btn-ghost" onclick="openCollectionsImport()">📥 Import CSV</button>
+    <button class="btn btn-gold" onclick="openAddFamily()">+ Add Family</button>`;
+  const content = document.getElementById('content');
+  content.innerHTML = '<div class="loading">Loading…</div>';
+
+  try {
+    const families = await api('GET', '/collections/families');
+    const active = families.filter(f => f.status === 'active');
+    const settled = families.filter(f => f.status === 'settled');
+
+    content.innerHTML = `
+      <div class="card" style="padding:0">
+        <div style="padding:14px 20px;border-bottom:1px solid var(--border);font-family:'DM Serif Display',serif;font-size:20px">
+          Active (${active.length}) · $${active.reduce((s,f) => s + f.remaining_balance, 0).toFixed(2)} outstanding
+        </div>
+        <div class="table-wrap">
+          <table>
+            <thead><tr>
+              <th>Family</th><th>Email</th><th>Original Balance</th>
+              <th>Paid</th><th>Remaining</th><th>50% Offer</th>
+              <th>Links</th><th>Failed</th><th></th>
+            </tr></thead>
+            <tbody>
+              ${active.length === 0 ? `<tr><td colspan="9" style="text-align:center;padding:32px;color:var(--gray)">No active past-due families. Click <strong>+ Add Family</strong> or <strong>📥 Import CSV</strong> to get started.</td></tr>` :
+                active.map(f => `
+                <tr>
+                  <td><strong>${f.family_name}</strong>
+                    ${f.children_names ? `<div style="font-size:11px;color:var(--gray)">${f.children_names}</div>` : ''}
+                  </td>
+                  <td style="font-size:12.5px">${f.primary_contact_email||'—'}</td>
+                  <td>$${parseFloat(f.original_balance).toFixed(2)}</td>
+                  <td style="color:var(--green)">$${f.total_paid.toFixed(2)}</td>
+                  <td style="color:var(--red);font-weight:600">$${f.remaining_balance.toFixed(2)}</td>
+                  <td style="color:var(--gold)">$${f.discount_pay_in_full.toFixed(2)}</td>
+                  <td>${f.payinfull_link_url
+                    ? `<span class="badge-pill badge-paid">✓ Generated</span>`
+                    : `<span class="badge-pill badge-pending">Not yet</span>`}</td>
+                  <td>${f.failed_count > 0 ? `<span style="color:var(--red);font-weight:600">${f.failed_count}</span>` : '—'}</td>
+                  <td><button class="btn btn-sm btn-primary" onclick="openFamilyDetail(${f.id})">Open</button></td>
+                </tr>`).join('')}
+            </tbody>
+          </table>
+        </div>
+      </div>
+
+      ${settled.length > 0 ? `
+        <div class="card" style="padding:0;margin-top:16px">
+          <div style="padding:14px 20px;border-bottom:1px solid var(--border);font-family:'DM Serif Display',serif;font-size:20px;color:var(--green)">
+            ✅ Settled (${settled.length})
+          </div>
+          <div class="table-wrap">
+            <table>
+              <thead><tr><th>Family</th><th>Balance Paid</th><th>Settled</th><th></th></tr></thead>
+              <tbody>
+                ${settled.map(f => `
+                  <tr>
+                    <td><strong>${f.family_name}</strong></td>
+                    <td>$${f.total_paid.toFixed(2)}</td>
+                    <td style="font-size:12px;color:var(--gray)">${f.settled_at ? timeAgo(f.settled_at) : '—'}</td>
+                    <td><button class="btn btn-sm btn-ghost" onclick="openFamilyDetail(${f.id})">View</button></td>
+                  </tr>`).join('')}
+              </tbody>
+            </table>
+          </div>
+        </div>` : ''}`;
+  } catch (e) {
+    content.innerHTML = `<div class="card"><div style="color:var(--red)">Error: ${e.message}</div></div>`;
+  }
+};
+
+function openAddFamily() {
+  openModal(`
+    <div class="modal-title">Add Past-Due Family</div>
+    <div class="form-row">
+      <div class="form-group"><label>Family Name *</label><input id="fam-name" placeholder="e.g. Smith Family"></div>
+      <div class="form-group"><label>Original Balance * ($)</label><input id="fam-bal" type="number" step="0.01" min="0" placeholder="500.00"></div>
+    </div>
+    <div class="form-row">
+      <div class="form-group"><label>Primary Email</label><input id="fam-email" type="email" placeholder="parent@example.com"></div>
+      <div class="form-group"><label>Primary Phone</label><input id="fam-phone" placeholder="(555) 123-4567"></div>
+    </div>
+    <div class="form-row">
+      <div class="form-group"><label>Children Names</label><input id="fam-kids" placeholder="e.g. Joey, Lily"></div>
+      <div class="form-group"><label>Center</label>
+        <select id="fam-center">
+          <option value="">—</option>
+          <option>Niles</option><option>Peace</option><option>Montessori</option>
+        </select>
+      </div>
+    </div>
+    <div class="form-row">
+      <div class="form-group"><label>Left Date</label><input id="fam-leftdate" type="date"></div>
+    </div>
+    <div class="form-group"><label>Notes</label><textarea id="fam-notes" rows="2" placeholder="Anything relevant — why they left, special arrangements, etc."></textarea></div>
+    <div class="modal-footer">
+      <button class="btn btn-ghost" onclick="closeModal()">Cancel</button>
+      <button class="btn btn-primary" onclick="saveNewFamily()">Add</button>
+    </div>`);
+}
+
+async function saveNewFamily() {
+  const data = {
+    family_name: document.getElementById('fam-name').value.trim(),
+    original_balance: parseFloat(document.getElementById('fam-bal').value),
+    primary_contact_email: document.getElementById('fam-email').value.trim() || null,
+    primary_contact_phone: document.getElementById('fam-phone').value.trim() || null,
+    children_names: document.getElementById('fam-kids').value.trim() || null,
+    center: document.getElementById('fam-center').value || null,
+    left_date: document.getElementById('fam-leftdate').value || null,
+    notes: document.getElementById('fam-notes').value.trim() || null,
+  };
+  if (!data.family_name || !data.original_balance) return toast('Name and balance required','error');
+  try {
+    await api('POST', '/collections/families', data);
+    toast('Family added','success');
+    closeModal();
+    pages['collections-families']();
+  } catch (e) { toast('Error: '+e.message,'error'); }
+}
+
+function openCollectionsImport() {
+  openModal(`
+    <div class="modal-title">📥 Import Families from CSV</div>
+    <p style="font-size:13px;color:var(--gray);line-height:1.6;margin-bottom:14px">
+      Upload a CSV with columns: <code>Family Name</code>, <code>Email</code>, <code>Phone</code>, <code>Children</code>, <code>Balance</code>, <code>Center</code>, <code>Left Date</code>, <code>Notes</code>. Only <strong>Family Name</strong> and <strong>Balance</strong> are required.
+    </p>
+    <div class="upload-zone" onclick="document.getElementById('fam-csv').click()" style="margin-bottom:12px">
+      <div style="font-size:36px">📥</div>
+      <p><strong>Click to upload CSV</strong></p>
+    </div>
+    <input type="file" id="fam-csv" accept=".csv" onchange="handleFamilyImport(this)">
+    <div id="fam-import-result"></div>
+    <div class="modal-footer">
+      <button class="btn btn-ghost" onclick="closeModal()">Close</button>
+    </div>`);
+}
+
+async function handleFamilyImport(input) {
+  const file = input.files[0];
+  if (!file) return;
+  const fd = new FormData();
+  fd.append('file', file);
+  document.getElementById('fam-import-result').innerHTML = '<div class="loading">Importing…</div>';
+  try {
+    const r = await uploadFile('/collections/families/import', fd);
+    document.getElementById('fam-import-result').innerHTML = `
+      <div style="background:var(--green-light);border:1px solid var(--green);border-radius:8px;padding:14px">
+        <strong style="color:var(--green)">✅ Imported ${r.created} families</strong>
+        ${r.skipped ? `<div style="margin-top:6px;font-size:12px;color:var(--amber)">${r.skipped} skipped (missing name or balance)</div>` : ''}
+        ${r.errors.length ? `<details style="margin-top:6px;font-size:12px;color:var(--red)"><summary>${r.errors.length} errors</summary>${r.errors.map(e=>`<div>${e}</div>`).join('')}</details>` : ''}
+      </div>`;
+    toast(`Imported ${r.created} families`,'success');
+    setTimeout(() => { closeModal(); pages['collections-families'](); }, 1500);
+  } catch (e) {
+    document.getElementById('fam-import-result').innerHTML =
+      `<div style="background:var(--red-light);border:1px solid var(--red);border-radius:8px;padding:14px;color:var(--red)">Error: ${e.message}</div>`;
+  }
+}
+
+async function openFamilyDetail(id) {
+  const content = document.getElementById('content');
+  document.getElementById('page-title').textContent = 'Family Detail';
+  document.getElementById('topbar-actions').innerHTML =
+    `<button class="btn btn-ghost" onclick="showPage('collections-families')">← Back to list</button>`;
+  content.innerHTML = '<div class="loading">Loading…</div>';
+
+  try {
+    const { family, payments, events } = await api('GET', `/collections/families/${id}`);
+    const hasLinks = !!family.payinfull_link_url;
+    const settled = family.status === 'settled';
+
+    content.innerHTML = `
+      <div class="card">
+        <div style="display:flex;justify-content:space-between;align-items:flex-start;margin-bottom:14px">
+          <div>
+            <div style="font-family:'DM Serif Display',serif;font-size:26px;color:var(--navy)">${family.family_name}</div>
+            ${family.children_names ? `<div style="color:var(--gray);font-size:13px;margin-top:2px">Children: ${family.children_names}</div>` : ''}
+            ${family.center ? `<div style="color:var(--gray);font-size:13px">Center: ${family.center}</div>` : ''}
+            ${family.left_date ? `<div style="color:var(--gray);font-size:13px">Left: ${fmtDate(family.left_date)}</div>` : ''}
+            ${family.primary_contact_email ? `<div style="color:var(--gray);font-size:13px">📧 ${family.primary_contact_email}</div>` : ''}
+            ${family.primary_contact_phone ? `<div style="color:var(--gray);font-size:13px">📞 ${family.primary_contact_phone}</div>` : ''}
+          </div>
+          <div style="display:flex;gap:8px;align-items:center">
+            ${settled ? `<span class="badge-pill badge-paid" style="font-size:13px;padding:6px 12px">✅ SETTLED</span>` : ''}
+            <button class="btn btn-sm btn-ghost" onclick='editFamily(${JSON.stringify(family).replace(/'/g,"&#39;")})'>Edit</button>
+          </div>
+        </div>
+
+        <div style="display:grid;grid-template-columns:repeat(auto-fit,minmax(140px,1fr));gap:10px;margin-bottom:16px">
+          <div style="padding:12px;background:var(--cream);border-radius:6px">
+            <div style="font-size:11px;color:var(--gray);text-transform:uppercase;letter-spacing:.5px">Original</div>
+            <div style="font-size:20px;font-weight:600">$${parseFloat(family.original_balance).toFixed(2)}</div>
+          </div>
+          <div style="padding:12px;background:var(--green-light);border-radius:6px">
+            <div style="font-size:11px;color:var(--green);text-transform:uppercase;letter-spacing:.5px">Paid</div>
+            <div style="font-size:20px;font-weight:600;color:var(--green)">$${family.total_paid.toFixed(2)}</div>
+          </div>
+          <div style="padding:12px;background:var(--red-light);border-radius:6px">
+            <div style="font-size:11px;color:var(--red);text-transform:uppercase;letter-spacing:.5px">Remaining</div>
+            <div style="font-size:20px;font-weight:600;color:var(--red)">$${family.remaining_balance.toFixed(2)}</div>
+          </div>
+          <div style="padding:12px;background:#fff8e0;border:1px solid var(--gold);border-radius:6px">
+            <div style="font-size:11px;color:var(--gold);text-transform:uppercase;letter-spacing:.5px">50% Offer</div>
+            <div style="font-size:20px;font-weight:600;color:var(--gold)">$${family.discount_pay_in_full.toFixed(2)}</div>
+          </div>
+        </div>
+
+        ${family.notes ? `<div style="background:var(--cream);border-left:3px solid var(--gold);padding:10px 14px;font-size:13px;line-height:1.6;margin-bottom:0">${family.notes}</div>` : ''}
+      </div>
+
+      ${!settled ? `
+        <div class="card">
+          <div class="card-title">💳 Payment Links</div>
+          ${hasLinks ? `
+            <div style="background:#fff8e0;border:1px solid var(--gold);border-radius:8px;padding:16px;margin-bottom:12px">
+              <div style="font-weight:600;color:var(--navy);margin-bottom:6px">🎯 Pay in Full — 50% off ($${family.discount_pay_in_full.toFixed(2)})</div>
+              <div style="display:flex;gap:8px;align-items:center">
+                <input type="text" readonly value="${family.payinfull_link_url}" style="flex:1;font-size:12px" onclick="this.select()">
+                <button class="btn btn-sm btn-primary" onclick="copyText('${family.payinfull_link_url}')">Copy</button>
+                <a class="btn btn-sm btn-ghost" href="${family.payinfull_link_url}" target="_blank">Open</a>
+              </div>
+            </div>
+            <div style="background:var(--blue-light);border:1px solid var(--blue);border-radius:8px;padding:16px;margin-bottom:12px">
+              <div style="font-weight:600;color:var(--navy);margin-bottom:6px">💙 Pay What You Can (min $25)</div>
+              <div style="display:flex;gap:8px;align-items:center">
+                <input type="text" readonly value="${family.paywhatyoucan_link_url}" style="flex:1;font-size:12px" onclick="this.select()">
+                <button class="btn btn-sm btn-primary" onclick="copyText('${family.paywhatyoucan_link_url}')">Copy</button>
+                <a class="btn btn-sm btn-ghost" href="${family.paywhatyoucan_link_url}" target="_blank">Open</a>
+              </div>
+            </div>
+            <div style="display:flex;gap:8px">
+              <button class="btn btn-sm btn-ghost" onclick="regenerateLinks(${family.id})">♻ Regenerate Links</button>
+              <button class="btn btn-sm btn-ghost" onclick="deactivateLinks(${family.id})" style="color:var(--red)">🗑 Deactivate Links</button>
+            </div>
+          ` : `
+            <p style="color:var(--gray);font-size:13px;margin-bottom:14px">
+              Click below to generate two Stripe payment links: a 50%-off pay-in-full link and a flexible "pay what you can" link ($25 minimum).
+            </p>
+            <button class="btn btn-gold" onclick="generateLinks(${family.id})">Generate Stripe Payment Links</button>
+          `}
+        </div>
+      ` : ''}
+
+      <div class="card">
+        <div class="card-title">💰 Payment History (${payments.length})</div>
+        ${payments.length === 0 ? `
+          <p style="color:var(--gray);font-size:13px;padding:16px;text-align:center">No payments yet.</p>
+        ` : `
+          <div class="table-wrap">
+            <table>
+              <thead><tr><th>Date</th><th>Amount</th><th>Status</th><th>Type</th><th>Details</th></tr></thead>
+              <tbody>
+                ${payments.map(p => `
+                  <tr>
+                    <td style="font-size:12px">${fmtDate(p.paid_at || p.created_at)}</td>
+                    <td><strong>$${parseFloat(p.amount).toFixed(2)}</strong>${p.amount_refunded>0?` <span style="color:var(--amber);font-size:11px">(-$${parseFloat(p.amount_refunded).toFixed(2)} refunded)</span>`:''}</td>
+                    <td>${paymentStatusBadge(p.status)}</td>
+                    <td style="font-size:12px;color:var(--gray)">${p.link_type==='pay_in_full'?'Pay-in-Full':p.link_type==='pay_what_you_can'?'PWYC':'—'}</td>
+                    <td style="font-size:11px;color:var(--gray)">${p.failure_reason || p.stripe_customer_email || ''}</td>
+                  </tr>`).join('')}
+              </tbody>
+            </table>
+          </div>
+        `}
+      </div>
+
+      <div class="card">
+        <div class="card-title">📜 Event Log</div>
+        ${events.length === 0 ? `
+          <p style="color:var(--gray);font-size:13px;padding:16px;text-align:center">No events yet.</p>
+        ` : `
+          <div style="max-height:300px;overflow-y:auto">
+            ${events.map(e => `
+              <div style="padding:8px 0;border-bottom:1px solid var(--border);display:flex;gap:10px;align-items:center">
+                <div>${eventIcon(e.event_type)}</div>
+                <div style="flex:1;font-size:13px">${e.detail || e.event_type}</div>
+                <div style="font-size:11px;color:var(--gray)">${timeAgo(e.created_at)}</div>
+              </div>`).join('')}
+          </div>
+        `}
+      </div>`;
+  } catch (e) {
+    content.innerHTML = `<div class="card"><div style="color:var(--red)">Error: ${e.message}</div></div>`;
+  }
+}
+
+function paymentStatusBadge(s) {
+  const map = {
+    succeeded: '<span class="badge-pill badge-paid">Succeeded</span>',
+    failed: '<span class="badge-pill badge-noauth">Failed</span>',
+    refunded: '<span class="badge-pill badge-pending">Refunded</span>',
+  };
+  return map[s] || `<span class="badge-pill badge-pending">${s}</span>`;
+}
+
+function copyText(text) {
+  navigator.clipboard.writeText(text).then(() => toast('Copied to clipboard','success'));
+}
+
+async function generateLinks(familyId) {
+  toast('Generating Stripe payment links…','info');
+  try {
+    await api('POST', `/collections/families/${familyId}/create-links`);
+    toast('Links generated','success');
+    openFamilyDetail(familyId);
+  } catch (e) { toast('Error: '+e.message,'error'); }
+}
+
+async function regenerateLinks(familyId) {
+  if (!confirm('Deactivate current links and generate new ones?')) return;
+  try {
+    await api('POST', `/collections/families/${familyId}/deactivate-links`);
+    await api('POST', `/collections/families/${familyId}/create-links`);
+    toast('New links generated','success');
+    openFamilyDetail(familyId);
+  } catch (e) { toast('Error: '+e.message,'error'); }
+}
+
+async function deactivateLinks(familyId) {
+  if (!confirm('Deactivate payment links for this family? They will no longer work.')) return;
+  try {
+    await api('POST', `/collections/families/${familyId}/deactivate-links`);
+    toast('Links deactivated','success');
+    openFamilyDetail(familyId);
+  } catch (e) { toast('Error: '+e.message,'error'); }
+}
+
+function editFamily(family) {
+  const leftDate = family.left_date ? String(family.left_date).split('T')[0] : '';
+  openModal(`
+    <div class="modal-title">Edit: ${family.family_name}</div>
+    <div class="form-row">
+      <div class="form-group"><label>Family Name</label><input id="efam-name" value="${family.family_name||''}"></div>
+      <div class="form-group"><label>Original Balance ($)</label><input id="efam-bal" type="number" step="0.01" min="0" value="${family.original_balance||0}"></div>
+    </div>
+    <div class="form-row">
+      <div class="form-group"><label>Email</label><input id="efam-email" type="email" value="${family.primary_contact_email||''}"></div>
+      <div class="form-group"><label>Phone</label><input id="efam-phone" value="${family.primary_contact_phone||''}"></div>
+    </div>
+    <div class="form-row">
+      <div class="form-group"><label>Children</label><input id="efam-kids" value="${family.children_names||''}"></div>
+      <div class="form-group"><label>Status</label>
+        <select id="efam-status">
+          <option value="active" ${family.status==='active'?'selected':''}>Active</option>
+          <option value="settled" ${family.status==='settled'?'selected':''}>Settled</option>
+          <option value="written_off" ${family.status==='written_off'?'selected':''}>Written Off</option>
+        </select>
+      </div>
+    </div>
+    <div class="form-row">
+      <div class="form-group"><label>Center</label>
+        <select id="efam-center">
+          <option value="">—</option>
+          <option ${family.center==='Niles'?'selected':''}>Niles</option>
+          <option ${family.center==='Peace'?'selected':''}>Peace</option>
+          <option ${family.center==='Montessori'?'selected':''}>Montessori</option>
+        </select>
+      </div>
+      <div class="form-group"><label>Left Date</label><input id="efam-leftdate" type="date" value="${leftDate}"></div>
+    </div>
+    <div class="form-group"><label>Notes</label><textarea id="efam-notes" rows="3">${family.notes||''}</textarea></div>
+    <div class="modal-footer">
+      <button class="btn btn-ghost" onclick="closeModal()">Cancel</button>
+      <button class="btn btn-primary" onclick="saveEditFamily(${family.id})">Save</button>
+    </div>`);
+}
+
+async function saveEditFamily(id) {
+  const data = {
+    family_name: document.getElementById('efam-name').value.trim(),
+    original_balance: parseFloat(document.getElementById('efam-bal').value),
+    primary_contact_email: document.getElementById('efam-email').value.trim() || null,
+    primary_contact_phone: document.getElementById('efam-phone').value.trim() || null,
+    children_names: document.getElementById('efam-kids').value.trim() || null,
+    center: document.getElementById('efam-center').value || null,
+    left_date: document.getElementById('efam-leftdate').value || null,
+    status: document.getElementById('efam-status').value,
+    notes: document.getElementById('efam-notes').value.trim() || null,
+  };
+  try {
+    await api('PUT', `/collections/families/${id}`, data);
+    toast('Family updated','success');
+    closeModal();
+    openFamilyDetail(id);
+  } catch (e) { toast('Error: '+e.message,'error'); }
 }
 
 
