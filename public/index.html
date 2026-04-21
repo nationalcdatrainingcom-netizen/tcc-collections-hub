@@ -2716,6 +2716,11 @@ function eventIcon(type) {
   return '📄';
 }
 
+// Sort state is module-level so it persists across renders
+let COLL_SORT = { column: 'remaining', dir: 'desc' };
+let COLL_CENTER_FILTER = 'all';
+let COLL_SEARCH = '';
+
 pages['collections-families'] = async () => {
   document.getElementById('page-title').textContent = 'Past-Due Families';
   document.getElementById('topbar-actions').innerHTML = `
@@ -2726,68 +2731,150 @@ pages['collections-families'] = async () => {
 
   try {
     const families = await api('GET', '/collections/families');
-    const active = families.filter(f => f.status === 'active');
-    const settled = families.filter(f => f.status === 'settled');
-
-    content.innerHTML = `
-      <div class="card" style="padding:0">
-        <div style="padding:14px 20px;border-bottom:1px solid var(--border);font-family:'DM Serif Display',serif;font-size:20px">
-          Active (${active.length}) · $${active.reduce((s,f) => s + f.remaining_balance, 0).toFixed(2)} outstanding
-        </div>
-        <div class="table-wrap">
-          <table>
-            <thead><tr>
-              <th>Family</th><th>Email</th><th>Original Balance</th>
-              <th>Paid</th><th>Remaining</th><th>50% Offer</th>
-              <th>Links</th><th>Failed</th><th></th>
-            </tr></thead>
-            <tbody>
-              ${active.length === 0 ? `<tr><td colspan="9" style="text-align:center;padding:32px;color:var(--gray)">No active past-due families. Click <strong>+ Add Family</strong> or <strong>📥 Import CSV</strong> to get started.</td></tr>` :
-                active.map(f => `
-                <tr>
-                  <td><strong>${f.family_name}</strong>
-                    ${f.children_names ? `<div style="font-size:11px;color:var(--gray)">${f.children_names}</div>` : ''}
-                  </td>
-                  <td style="font-size:12.5px">${f.primary_contact_email||'—'}</td>
-                  <td>$${parseFloat(f.original_balance).toFixed(2)}</td>
-                  <td style="color:var(--green)">$${f.total_paid.toFixed(2)}</td>
-                  <td style="color:var(--red);font-weight:600">$${f.remaining_balance.toFixed(2)}</td>
-                  <td style="color:var(--gold)">$${f.discount_pay_in_full.toFixed(2)}</td>
-                  <td>${f.payinfull_link_url
-                    ? `<span class="badge-pill badge-paid">✓ Generated</span>`
-                    : `<span class="badge-pill badge-pending">Not yet</span>`}</td>
-                  <td>${f.failed_count > 0 ? `<span style="color:var(--red);font-weight:600">${f.failed_count}</span>` : '—'}</td>
-                  <td><button class="btn btn-sm btn-primary" onclick="openFamilyDetail(${f.id})">Open</button></td>
-                </tr>`).join('')}
-            </tbody>
-          </table>
-        </div>
-      </div>
-
-      ${settled.length > 0 ? `
-        <div class="card" style="padding:0;margin-top:16px">
-          <div style="padding:14px 20px;border-bottom:1px solid var(--border);font-family:'DM Serif Display',serif;font-size:20px;color:var(--green)">
-            ✅ Settled (${settled.length})
-          </div>
-          <div class="table-wrap">
-            <table>
-              <thead><tr><th>Family</th><th>Balance Paid</th><th>Settled</th><th></th></tr></thead>
-              <tbody>
-                ${settled.map(f => `
-                  <tr>
-                    <td><strong>${f.family_name}</strong></td>
-                    <td>$${f.total_paid.toFixed(2)}</td>
-                    <td style="font-size:12px;color:var(--gray)">${f.settled_at ? timeAgo(f.settled_at) : '—'}</td>
-                    <td><button class="btn btn-sm btn-ghost" onclick="openFamilyDetail(${f.id})">View</button></td>
-                  </tr>`).join('')}
-              </tbody>
-            </table>
-          </div>
-        </div>` : ''}`;
+    window.__COLL_FAMILIES = families;
+    renderCollectionsFamilies();
   } catch (e) {
     content.innerHTML = `<div class="card"><div style="color:var(--red)">Error: ${e.message}</div></div>`;
   }
 };
+
+function renderCollectionsFamilies() {
+  const content = document.getElementById('content');
+  let families = window.__COLL_FAMILIES || [];
+
+  // Apply search + center filter
+  const q = COLL_SEARCH.toLowerCase().trim();
+  const filtered = families.filter(f => {
+    if (COLL_CENTER_FILTER !== 'all' && f.center !== COLL_CENTER_FILTER) return false;
+    if (!q) return true;
+    return (f.family_name || '').toLowerCase().includes(q)
+        || (f.primary_contact_email || '').toLowerCase().includes(q)
+        || (f.children_names || '').toLowerCase().includes(q);
+  });
+
+  // Sort
+  const sorters = {
+    family: (a, b) => (a.family_name || '').localeCompare(b.family_name || ''),
+    original: (a, b) => parseFloat(a.original_balance) - parseFloat(b.original_balance),
+    paid: (a, b) => a.total_paid - b.total_paid,
+    remaining: (a, b) => a.remaining_balance - b.remaining_balance,
+    discount: (a, b) => a.discount_pay_in_full - b.discount_pay_in_full,
+    center: (a, b) => (a.center || '').localeCompare(b.center || ''),
+    failed: (a, b) => (a.failed_count||0) - (b.failed_count||0),
+  };
+  const active = filtered.filter(f => f.status === 'active');
+  const settled = filtered.filter(f => f.status === 'settled');
+  const sorter = sorters[COLL_SORT.column] || sorters.remaining;
+  active.sort(COLL_SORT.dir === 'asc' ? sorter : (a,b) => sorter(b,a));
+
+  const sortIcon = (col) => {
+    if (COLL_SORT.column !== col) return '<span style="color:var(--border);font-size:10px">▲▼</span>';
+    return COLL_SORT.dir === 'asc' ? '▲' : '▼';
+  };
+
+  // Header cell builder
+  const h = (col, label) => `<th style="cursor:pointer;user-select:none" onclick="toggleCollSort('${col}')">${label} ${sortIcon(col)}</th>`;
+
+  content.innerHTML = `
+    <div class="card" style="padding:12px 20px;display:flex;gap:12px;align-items:center;flex-wrap:wrap">
+      <div>
+        <label style="font-size:11px;color:var(--gray);text-transform:uppercase;letter-spacing:.5px;display:block;margin-bottom:3px">Center</label>
+        <select onchange="COLL_CENTER_FILTER=this.value;renderCollectionsFamilies()" style="font-size:13px">
+          <option value="all" ${COLL_CENTER_FILTER==='all'?'selected':''}>All centers</option>
+          <option value="Niles" ${COLL_CENTER_FILTER==='Niles'?'selected':''}>Niles</option>
+          <option value="Peace" ${COLL_CENTER_FILTER==='Peace'?'selected':''}>Peace</option>
+          <option value="Montessori" ${COLL_CENTER_FILTER==='Montessori'?'selected':''}>Montessori</option>
+        </select>
+      </div>
+      <div style="flex:1;min-width:220px">
+        <label style="font-size:11px;color:var(--gray);text-transform:uppercase;letter-spacing:.5px;display:block;margin-bottom:3px">Search</label>
+        <input type="text" value="${COLL_SEARCH}" oninput="COLL_SEARCH=this.value;renderCollectionsFamilies()"
+               placeholder="Family name, email, or child name" style="font-size:13px;width:100%">
+      </div>
+      <div style="margin-left:auto;text-align:right">
+        <div style="font-size:11px;color:var(--gray);text-transform:uppercase;letter-spacing:.5px">Showing</div>
+        <div style="font-size:15px;font-weight:600;color:var(--navy)">
+          ${active.length} active · <span style="color:var(--red)">$${active.reduce((s,f) => s + f.remaining_balance, 0).toFixed(2)}</span>
+        </div>
+      </div>
+    </div>
+
+    <div class="card" style="padding:0">
+      <div class="table-wrap">
+        <table>
+          <thead><tr>
+            ${h('family', 'Family')}
+            ${h('center', 'Center')}
+            <th>Email</th>
+            ${h('original', 'Original')}
+            ${h('paid', 'Paid')}
+            ${h('remaining', 'Remaining')}
+            ${h('discount', '50% Offer')}
+            <th>Links</th>
+            ${h('failed', 'Failed')}
+            <th></th>
+          </tr></thead>
+          <tbody>
+            ${active.length === 0 ? `<tr><td colspan="10" style="text-align:center;padding:32px;color:var(--gray)">
+              ${COLL_SEARCH || COLL_CENTER_FILTER !== 'all'
+                ? 'No families match the filters.'
+                : 'No active past-due families. Click <strong>+ Add Family</strong> or <strong>📥 Import CSV</strong> to get started.'}
+            </td></tr>` :
+              active.map(f => `
+              <tr>
+                <td><strong>${f.family_name}</strong>
+                  ${f.children_names ? `<div style="font-size:11px;color:var(--gray)">${f.children_names}</div>` : ''}
+                </td>
+                <td style="font-size:12.5px;color:var(--gray)">${f.center || '—'}</td>
+                <td style="font-size:12.5px">${f.primary_contact_email||'—'}</td>
+                <td style="font-family:monospace">$${parseFloat(f.original_balance).toFixed(2)}</td>
+                <td style="color:var(--green);font-family:monospace">$${f.total_paid.toFixed(2)}</td>
+                <td style="color:var(--red);font-weight:600;font-family:monospace">$${f.remaining_balance.toFixed(2)}</td>
+                <td style="color:var(--gold);font-family:monospace">$${f.discount_pay_in_full.toFixed(2)}</td>
+                <td>${f.payinfull_link_url
+                  ? `<span class="badge-pill badge-paid">✓</span>`
+                  : `<span class="badge-pill badge-pending">—</span>`}</td>
+                <td>${f.failed_count > 0 ? `<span style="color:var(--red);font-weight:600">${f.failed_count}</span>` : '—'}</td>
+                <td><button class="btn btn-sm btn-primary" onclick="openFamilyDetail(${f.id})">Open</button></td>
+              </tr>`).join('')}
+          </tbody>
+        </table>
+      </div>
+    </div>
+
+    ${settled.length > 0 ? `
+      <div class="card" style="padding:0;margin-top:16px">
+        <div style="padding:14px 20px;border-bottom:1px solid var(--border);font-family:'DM Serif Display',serif;font-size:20px;color:var(--green)">
+          ✅ Settled (${settled.length})
+        </div>
+        <div class="table-wrap">
+          <table>
+            <thead><tr><th>Family</th><th>Center</th><th>Balance Paid</th><th>Settled</th><th></th></tr></thead>
+            <tbody>
+              ${settled.map(f => `
+                <tr>
+                  <td><strong>${f.family_name}</strong></td>
+                  <td style="font-size:12px;color:var(--gray)">${f.center || '—'}</td>
+                  <td>$${f.total_paid.toFixed(2)}</td>
+                  <td style="font-size:12px;color:var(--gray)">${f.settled_at ? timeAgo(f.settled_at) : '—'}</td>
+                  <td><button class="btn btn-sm btn-ghost" onclick="openFamilyDetail(${f.id})">View</button></td>
+                </tr>`).join('')}
+            </tbody>
+          </table>
+        </div>
+      </div>` : ''}`;
+}
+
+function toggleCollSort(col) {
+  if (COLL_SORT.column === col) {
+    COLL_SORT.dir = COLL_SORT.dir === 'asc' ? 'desc' : 'asc';
+  } else {
+    COLL_SORT.column = col;
+    // Numeric columns default to descending (largest first)
+    COLL_SORT.dir = ['original','paid','remaining','discount','failed'].includes(col) ? 'desc' : 'asc';
+  }
+  renderCollectionsFamilies();
+}
 
 function openAddFamily() {
   openModal(`
@@ -2886,9 +2973,10 @@ async function openFamilyDetail(id) {
   content.innerHTML = '<div class="loading">Loading…</div>';
 
   try {
-    const { family, payments, events } = await api('GET', `/collections/families/${id}`);
+    const { family, payments, events, transactions, linked_children } = await api('GET', `/collections/families/${id}`);
     const hasLinks = !!family.payinfull_link_url;
     const settled = family.status === 'settled';
+    window.__FAMILY_DETAIL = { family, payments, events, transactions, linked_children };
 
     content.innerHTML = `
       <div class="card">
@@ -2901,8 +2989,10 @@ async function openFamilyDetail(id) {
             ${family.primary_contact_email ? `<div style="color:var(--gray);font-size:13px">📧 ${family.primary_contact_email}</div>` : ''}
             ${family.primary_contact_phone ? `<div style="color:var(--gray);font-size:13px">📞 ${family.primary_contact_phone}</div>` : ''}
           </div>
-          <div style="display:flex;gap:8px;align-items:center">
+          <div style="display:flex;gap:8px;align-items:center;flex-wrap:wrap;justify-content:flex-end">
             ${settled ? `<span class="badge-pill badge-paid" style="font-size:13px;padding:6px 12px">✅ SETTLED</span>` : ''}
+            <button class="btn btn-sm btn-primary" onclick="openStatementPrint(${family.id})">🖨 Print Statement</button>
+            <button class="btn btn-sm btn-gold" onclick="openAddAdjustment(${family.id})">+ Add Transaction</button>
             <button class="btn btn-sm btn-ghost" onclick='editFamily(${JSON.stringify(family).replace(/'/g,"&#39;")})'>Edit</button>
           </div>
         </div>
@@ -2963,9 +3053,95 @@ async function openFamilyDetail(id) {
       ` : ''}
 
       <div class="card">
-        <div class="card-title">💰 Payment History (${payments.length})</div>
+        <div class="card-title" style="display:flex;justify-content:space-between;align-items:center">
+          <span>📒 Transaction Ledger (${transactions.length})</span>
+          <button class="btn btn-sm btn-gold" onclick="openAddAdjustment(${family.id})">+ Add Transaction</button>
+        </div>
+        <p style="font-size:12.5px;color:var(--gray);margin-bottom:10px;line-height:1.5">
+          Every charge, payment, credit, and adjustment on this account. The running balance is computed from this ledger.
+          If a family challenges their balance, click <strong>🖨 Print Statement</strong> above to produce a printable version.
+        </p>
+        ${transactions.length === 0 ? `
+          <p style="color:var(--gray);font-size:13px;padding:16px;text-align:center">No transactions yet.</p>
+        ` : `
+          <div class="table-wrap">
+            <table>
+              <thead><tr>
+                <th>Date</th><th>Type</th><th>Description</th>
+                <th style="text-align:right">Amount</th><th style="text-align:right">Balance</th>
+                <th></th>
+              </tr></thead>
+              <tbody>
+                ${(() => {
+                  // Build running balance from oldest → newest
+                  const asc = [...transactions].reverse();
+                  let running = 0;
+                  const withBalance = asc.map(t => {
+                    running += parseFloat(t.amount);
+                    return { ...t, balance_owed: -running };
+                  });
+                  // Display newest first
+                  return withBalance.reverse().map(t => {
+                    const amt = parseFloat(t.amount);
+                    const cls = amt >= 0 ? 'color:var(--green)' : 'color:var(--red)';
+                    const label = txnTypeLabel(t.txn_type, t.txn_type_label);
+                    return `
+                      <tr>
+                        <td style="font-size:12.5px">${fmtDate(t.txn_date)}</td>
+                        <td><span class="badge-pill ${txnTypeBadgeClass(t.txn_type)}" style="font-size:11px">${label}</span></td>
+                        <td style="font-size:12.5px">
+                          ${t.description || ''}
+                          ${t.reason ? `<div style="font-size:11px;color:var(--gray);font-style:italic;margin-top:2px">Reason: ${t.reason}</div>` : ''}
+                        </td>
+                        <td style="text-align:right;font-family:monospace;${cls};font-weight:600">${amt >= 0 ? '+' : ''}$${Math.abs(amt).toFixed(2)}</td>
+                        <td style="text-align:right;font-family:monospace">$${t.balance_owed.toFixed(2)}</td>
+                        <td>
+                          ${t.txn_type !== 'starting_balance'
+                            ? `<button class="btn btn-sm btn-ghost" style="font-size:11px;padding:2px 8px" onclick="voidTransaction(${family.id},${t.id})">Void</button>`
+                            : ''}
+                        </td>
+                      </tr>`;
+                  }).join('');
+                })()}
+              </tbody>
+            </table>
+          </div>
+        `}
+      </div>
+
+      <div class="card">
+        <div class="card-title" style="display:flex;justify-content:space-between;align-items:center">
+          <span>👨‍👩‍👧 Linked Children (${linked_children.length})</span>
+          <button class="btn btn-sm btn-primary" onclick="openLinkChildModal(${family.id})">+ Link a child</button>
+        </div>
+        <p style="font-size:12.5px;color:var(--gray);margin-bottom:10px;line-height:1.5">
+          Link this family to children in your roster so parent contact info is automatically surfaced.
+          ${linked_children.some(c => c.parent_email)
+            ? '<strong style="color:var(--green)">✓ Parent contact info available from linked children.</strong>'
+            : ''}
+        </p>
+        ${linked_children.length === 0 ? `
+          <p style="color:var(--gray);font-size:13px;padding:10px 16px;text-align:center">No children linked yet.</p>
+        ` : `
+          <div style="display:flex;flex-direction:column;gap:8px">
+            ${linked_children.map(c => `
+              <div style="padding:10px 14px;background:var(--cream);border-radius:6px;display:flex;justify-content:space-between;align-items:center">
+                <div>
+                  <strong>${c.first_name} ${c.last_name}</strong>
+                  <span style="color:var(--gray);font-size:12px;margin-left:8px">${c.center || ''}</span>
+                  ${c.parent_email ? `<div style="font-size:12px;color:var(--gray);margin-top:2px">📧 ${c.parent_email}</div>` : ''}
+                  ${c.parent_phone ? `<div style="font-size:12px;color:var(--gray)">📞 ${c.parent_phone}</div>` : ''}
+                </div>
+                <button class="btn btn-sm btn-ghost" style="color:var(--red)" onclick="unlinkChild(${family.id},${c.id})">Unlink</button>
+              </div>`).join('')}
+          </div>
+        `}
+      </div>
+
+      <div class="card">
+        <div class="card-title">💰 Stripe Payment History (${payments.length})</div>
         ${payments.length === 0 ? `
-          <p style="color:var(--gray);font-size:13px;padding:16px;text-align:center">No payments yet.</p>
+          <p style="color:var(--gray);font-size:13px;padding:16px;text-align:center">No Stripe payments yet.</p>
         ` : `
           <div class="table-wrap">
             <table>
@@ -3012,6 +3188,212 @@ function paymentStatusBadge(s) {
     refunded: '<span class="badge-pill badge-pending">Refunded</span>',
   };
   return map[s] || `<span class="badge-pill badge-pending">${s}</span>`;
+}
+
+// ── Transaction helpers ─────────────────────────────────────────────────────
+const TXN_TYPE_LABELS = {
+  starting_balance: 'Starting Balance',
+  charge: 'Charge',
+  payment: 'Payment',
+  credit: 'Credit',
+  refund: 'Refund',
+  pay_in_full_discount: 'Pay-in-Full Discount',
+  other: 'Other',
+};
+
+function txnTypeLabel(t, customLabel) {
+  if (t === 'other' && customLabel) return customLabel;
+  return TXN_TYPE_LABELS[t] || t;
+}
+
+function txnTypeBadgeClass(t) {
+  return ({
+    starting_balance: 'badge-pending',
+    charge: 'badge-noauth',
+    payment: 'badge-paid',
+    credit: 'badge-paid',
+    refund: 'badge-pending',
+    pay_in_full_discount: 'badge-paid',
+    other: 'badge-pending',
+  })[t] || 'badge-pending';
+}
+
+function openAddAdjustment(familyId) {
+  openModal(`
+    <div class="modal-title">Add Transaction</div>
+    <p style="font-size:12.5px;color:var(--gray);margin-bottom:14px;line-height:1.5">
+      Record a payment, charge, credit, or adjustment to this family's account.
+      <strong>Enter positive dollar amounts</strong> — the app handles the sign based on type.
+    </p>
+
+    <div class="form-row">
+      <div class="form-group">
+        <label>Type *</label>
+        <select id="adj-type" onchange="handleAdjTypeChange()">
+          <option value="payment">Payment — received money</option>
+          <option value="credit">Credit / Adjustment — reduce what they owe</option>
+          <option value="charge">Charge — add to what they owe</option>
+          <option value="refund">Refund — give money back (increases owed)</option>
+          <option value="pay_in_full_discount">Pay-in-Full 50% Discount</option>
+          <option value="other">Other (custom label)</option>
+        </select>
+      </div>
+      <div class="form-group">
+        <label>Amount ($) *</label>
+        <input id="adj-amount" type="number" step="0.01" min="0.01" placeholder="0.00">
+      </div>
+    </div>
+
+    <div class="form-group" id="adj-custom-label-wrap" style="display:none">
+      <label>Custom type label</label>
+      <input id="adj-custom-label" placeholder="e.g. 'Payment Plan Adjustment'">
+    </div>
+
+    <div class="form-row">
+      <div class="form-group">
+        <label>Date</label>
+        <input id="adj-date" type="date" value="${new Date().toISOString().split('T')[0]}">
+      </div>
+      <div class="form-group">
+        <label>Description (optional)</label>
+        <input id="adj-description" placeholder="e.g. 'Check #1234' or 'Partial payment'">
+      </div>
+    </div>
+
+    <div class="form-group">
+      <label>Reason * <span style="color:var(--gray);font-weight:400">(min 5 characters — why this change?)</span></label>
+      <textarea id="adj-reason" rows="2" placeholder="e.g. 'Family agreed to settle for $500 less due to hardship' or 'Financial hardship approved by Mary'"></textarea>
+    </div>
+
+    <div class="modal-footer">
+      <button class="btn btn-ghost" onclick="closeModal()">Cancel</button>
+      <button class="btn btn-gold" onclick="saveAdjustment(${familyId})">Save Transaction</button>
+    </div>`);
+}
+
+function handleAdjTypeChange() {
+  const type = document.getElementById('adj-type').value;
+  const wrap = document.getElementById('adj-custom-label-wrap');
+  wrap.style.display = type === 'other' ? '' : 'none';
+}
+
+async function saveAdjustment(familyId) {
+  const type = document.getElementById('adj-type').value;
+  const amount = parseFloat(document.getElementById('adj-amount').value);
+  const customLabel = document.getElementById('adj-custom-label').value.trim();
+  const date = document.getElementById('adj-date').value;
+  const description = document.getElementById('adj-description').value.trim();
+  const reason = document.getElementById('adj-reason').value.trim();
+
+  if (!amount || amount <= 0) return toast('Enter a positive amount', 'error');
+  if (reason.length < 5) return toast('Reason must be at least 5 characters', 'error');
+  if (type === 'other' && !customLabel) return toast('Custom label required for "Other"', 'error');
+
+  try {
+    await api('POST', `/collections/families/${familyId}/transactions`, {
+      txn_type: type,
+      txn_type_label: type === 'other' ? customLabel : null,
+      amount, description, reason,
+      txn_date: date,
+    });
+    toast('Transaction saved', 'success');
+    closeModal();
+    openFamilyDetail(familyId);
+  } catch (e) {
+    toast('Error: ' + e.message, 'error');
+  }
+}
+
+async function voidTransaction(familyId, txnId) {
+  const reason = prompt('Why are you voiding this transaction? (min 5 characters)');
+  if (!reason || reason.trim().length < 5) {
+    if (reason !== null) toast('Void reason required (min 5 chars)', 'error');
+    return;
+  }
+  try {
+    await api('POST', `/collections/families/${familyId}/transactions/${txnId}/void`, { reason: reason.trim() });
+    toast('Transaction voided', 'success');
+    openFamilyDetail(familyId);
+  } catch (e) {
+    toast('Error: ' + e.message, 'error');
+  }
+}
+
+// ── Link Child modal ────────────────────────────────────────────────────────
+function openLinkChildModal(familyId) {
+  openModal(`
+    <div class="modal-title">Link a child to this family</div>
+    <p style="font-size:12.5px;color:var(--gray);margin-bottom:14px;line-height:1.5">
+      Search for a child in your roster. Once linked, parent contact info on that child's record
+      will appear on this family's detail page.
+    </p>
+    <div class="form-group">
+      <input id="link-search" type="text" placeholder="Type child or parent name…" oninput="searchLinkCandidates(${familyId})">
+    </div>
+    <div id="link-results" style="max-height:320px;overflow-y:auto">
+      <p style="color:var(--gray);font-size:13px;text-align:center;padding:20px">Start typing to search…</p>
+    </div>
+    <div class="modal-footer">
+      <button class="btn btn-ghost" onclick="closeModal()">Close</button>
+    </div>`);
+  setTimeout(() => searchLinkCandidates(familyId), 50);
+}
+
+let _linkSearchTimer = null;
+async function searchLinkCandidates(familyId) {
+  clearTimeout(_linkSearchTimer);
+  _linkSearchTimer = setTimeout(async () => {
+    const q = document.getElementById('link-search').value.trim();
+    const resDiv = document.getElementById('link-results');
+    try {
+      const results = await api('GET', `/collections/families/${familyId}/candidate-children${q ? `?q=${encodeURIComponent(q)}` : ''}`);
+      if (!results.length) {
+        resDiv.innerHTML = '<p style="color:var(--gray);font-size:13px;text-align:center;padding:20px">No matches.</p>';
+        return;
+      }
+      resDiv.innerHTML = results.map(c => `
+        <div style="padding:10px 12px;border-bottom:1px solid var(--border);display:flex;justify-content:space-between;align-items:center">
+          <div>
+            <strong>${c.first_name} ${c.last_name}</strong>
+            <span style="color:var(--gray);font-size:12px;margin-left:8px">${c.center || ''}</span>
+            ${c.parent_name ? `<div style="font-size:12px;color:var(--gray);margin-top:2px">Parent: ${c.parent_name}</div>` : ''}
+            ${c.parent_email ? `<div style="font-size:11px;color:var(--gray)">📧 ${c.parent_email}</div>` : ''}
+          </div>
+          <button class="btn btn-sm btn-primary" onclick="linkChild(${familyId},${c.id})">+ Link</button>
+        </div>`).join('');
+    } catch (e) {
+      resDiv.innerHTML = `<p style="color:var(--red);font-size:13px;padding:20px">Error: ${e.message}</p>`;
+    }
+  }, 250);
+}
+
+async function linkChild(familyId, childId) {
+  try {
+    await api('POST', `/collections/families/${familyId}/link-child`, { child_id: childId });
+    toast('Child linked', 'success');
+    closeModal();
+    openFamilyDetail(familyId);
+  } catch (e) {
+    toast('Error: ' + e.message, 'error');
+  }
+}
+
+async function unlinkChild(familyId, childId) {
+  if (!confirm('Unlink this child from the family?')) return;
+  try {
+    await api('POST', `/collections/families/${familyId}/unlink-child`, { child_id: childId });
+    toast('Child unlinked', 'success');
+    openFamilyDetail(familyId);
+  } catch (e) {
+    toast('Error: ' + e.message, 'error');
+  }
+}
+
+// ── Print statement ─────────────────────────────────────────────────────────
+function openStatementPrint(familyId) {
+  // Open the server-rendered HTML statement in a new window for print/PDF
+  const url = `/api/collections/families/${familyId}/statement`;
+  window.open(url, '_blank');
 }
 
 function copyText(text) {
