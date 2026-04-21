@@ -281,6 +281,41 @@ async function initDB() {
       raw_event JSONB,
       created_at TIMESTAMPTZ DEFAULT NOW()
     );
+
+    -- Full audit-trail ledger for past-due families. Every charge, payment,
+    -- adjustment, refund, and credit is one row here. Remaining balance is
+    -- computed as original_balance - SUM(signed amounts) in this table.
+    -- Positive amounts reduce what the family owes (payments, credits).
+    -- Negative amounts increase what they owe (new charges, reversals).
+    CREATE TABLE IF NOT EXISTS collections_transactions (
+      id SERIAL PRIMARY KEY,
+      family_id INTEGER REFERENCES collections_families(id) ON DELETE CASCADE,
+      txn_date DATE NOT NULL DEFAULT CURRENT_DATE,
+      txn_type TEXT NOT NULL,                        -- 'starting_balance', 'charge', 'payment', 'credit', 'refund', 'pay_in_full_discount', 'other'
+      txn_type_label TEXT,                           -- optional custom label when type='other'
+      amount NUMERIC(10,2) NOT NULL,                 -- signed: positive = reduces balance, negative = increases
+      description TEXT,                              -- required for manual adjustments
+      reason TEXT,                                   -- required for adjustments — why this change was made
+      stripe_payment_intent_id TEXT,                 -- link to Stripe payment if applicable
+      created_by TEXT,                               -- who added this (for audit)
+      created_at TIMESTAMPTZ DEFAULT NOW()
+    );
+    CREATE INDEX IF NOT EXISTS idx_coll_txn_family ON collections_transactions(family_id, txn_date DESC);
+
+    -- Link table: which roster children belong to which past-due family.
+    -- Enables email/phone to be pulled from children records (parent contact fields)
+    -- when provided, and shows the family's children on the detail page.
+    CREATE TABLE IF NOT EXISTS collections_family_children (
+      id SERIAL PRIMARY KEY,
+      family_id INTEGER REFERENCES collections_families(id) ON DELETE CASCADE,
+      child_id INTEGER REFERENCES children(id) ON DELETE CASCADE,
+      UNIQUE(family_id, child_id)
+    );
+
+    -- Parent contact fields on children — populated from roster imports later
+    ALTER TABLE children ADD COLUMN IF NOT EXISTS parent_email TEXT;
+    ALTER TABLE children ADD COLUMN IF NOT EXISTS parent_phone TEXT;
+    ALTER TABLE children ADD COLUMN IF NOT EXISTS parent_name TEXT;
   `);
 
   // Seed billing periods from the official MiLEAP CDC 2026 Payment Schedule.
@@ -2543,22 +2578,28 @@ function eventAmount(event) {
   return cents / 100;
 }
 
+// Remaining balance = -SUM(signed transaction amounts).
+// Starting balance is stored as a negative (money owed). Payments/credits are
+// positive (reduce owed). So balance_owed = -sum(amount). If sum is zero or
+// positive, the family has paid in full (or overpaid).
 async function familyWithBalance(familyId) {
   const { rows: fRows } = await pool.query(`SELECT * FROM collections_families WHERE id=$1`, [familyId]);
   if (!fRows[0]) return null;
   const family = fRows[0];
-  const { rows: pRows } = await pool.query(
-    `SELECT COALESCE(SUM(amount - amount_refunded), 0) AS total_paid
-     FROM collections_payments WHERE family_id=$1 AND status='succeeded'`,
+  const { rows: tRows } = await pool.query(
+    `SELECT COALESCE(SUM(amount), 0) AS net,
+            COALESCE(SUM(amount) FILTER (WHERE txn_type IN ('payment','refund')), 0) AS payments_net
+     FROM collections_transactions WHERE family_id=$1`,
     [familyId]
   );
-  const totalPaid = parseFloat(pRows[0].total_paid) || 0;
+  const netAmount = parseFloat(tRows[0].net) || 0;
+  const paymentsNet = parseFloat(tRows[0].payments_net) || 0;
   const original = parseFloat(family.original_balance) || 0;
-  const remaining = Math.max(0, original - totalPaid);
+  const remaining = Math.max(0, -netAmount);
   return {
     ...family,
-    total_paid: totalPaid,
-    remaining_balance: remaining,
+    total_paid: paymentsNet,                // sum of payments only (not credits/adjustments)
+    remaining_balance: remaining,           // what they still owe
     discount_pay_in_full: remaining / 2,
   };
 }
@@ -2567,21 +2608,27 @@ app.get('/api/collections/families', ssoAuth, async (req, res) => {
   const { status } = req.query;
   const params = [];
   let q = `SELECT f.*,
-             COALESCE((SELECT SUM(amount - amount_refunded) FROM collections_payments
-                       WHERE family_id=f.id AND status='succeeded'), 0) AS total_paid,
+             COALESCE((SELECT SUM(amount) FROM collections_transactions
+                       WHERE family_id=f.id), 0) AS txn_net,
+             COALESCE((SELECT SUM(amount) FROM collections_transactions
+                       WHERE family_id=f.id AND txn_type IN ('payment','refund')), 0) AS payments_net,
              COALESCE((SELECT COUNT(*) FROM collections_payments
                        WHERE family_id=f.id AND status='failed'), 0) AS failed_count
            FROM collections_families f WHERE 1=1`;
   if (status) { params.push(status); q += ` AND f.status=$${params.length}`; }
   q += ` ORDER BY f.status ASC, f.family_name ASC`;
   const { rows } = await pool.query(q, params);
-  res.json(rows.map(r => ({
-    ...r,
-    total_paid: parseFloat(r.total_paid),
-    remaining_balance: Math.max(0, parseFloat(r.original_balance) - parseFloat(r.total_paid)),
-    discount_pay_in_full: Math.max(0, parseFloat(r.original_balance) - parseFloat(r.total_paid)) / 2,
-    failed_count: parseInt(r.failed_count),
-  })));
+  res.json(rows.map(r => {
+    const net = parseFloat(r.txn_net) || 0;
+    const remaining = Math.max(0, -net);
+    return {
+      ...r,
+      total_paid: parseFloat(r.payments_net) || 0,
+      remaining_balance: remaining,
+      discount_pay_in_full: remaining / 2,
+      failed_count: parseInt(r.failed_count),
+    };
+  }));
 });
 
 app.get('/api/collections/families/:id', ssoAuth, async (req, res) => {
@@ -2591,7 +2638,24 @@ app.get('/api/collections/families/:id', ssoAuth, async (req, res) => {
     `SELECT * FROM collections_payments WHERE family_id=$1 ORDER BY created_at DESC`, [req.params.id]);
   const { rows: events } = await pool.query(
     `SELECT * FROM collections_events WHERE family_id=$1 ORDER BY created_at DESC LIMIT 50`, [req.params.id]);
-  res.json({ family, payments, events });
+  const { rows: transactions } = await pool.query(
+    `SELECT * FROM collections_transactions WHERE family_id=$1 ORDER BY txn_date DESC, created_at DESC`, [req.params.id]);
+  const { rows: linkedChildren } = await pool.query(
+    `SELECT c.id, c.first_name, c.last_name, c.center, c.parent_email, c.parent_phone, c.parent_name
+     FROM collections_family_children fc
+     JOIN children c ON c.id = fc.child_id
+     WHERE fc.family_id = $1
+     ORDER BY c.last_name, c.first_name`, [req.params.id]);
+
+  // If the family record has no email/phone but a linked child does, surface those
+  if (!family.primary_contact_email && linkedChildren.length) {
+    family.primary_contact_email = linkedChildren.find(c => c.parent_email)?.parent_email || null;
+  }
+  if (!family.primary_contact_phone && linkedChildren.length) {
+    family.primary_contact_phone = linkedChildren.find(c => c.parent_phone)?.parent_phone || null;
+  }
+
+  res.json({ family, payments, events, transactions, linked_children: linkedChildren });
 });
 
 app.post('/api/collections/families', ssoAuth, async (req, res) => {
@@ -2605,6 +2669,13 @@ app.post('/api/collections/families', ssoAuth, async (req, res) => {
      VALUES ($1,$2,$3,$4,$5,$6,$7,$8) RETURNING *`,
     [family_name, primary_contact_email||null, primary_contact_phone||null, children_names||null,
      original_balance, center||null, left_date||null, notes||null]
+  );
+  // Seed the ledger with a starting balance entry (negative = money owed)
+  await pool.query(
+    `INSERT INTO collections_transactions
+       (family_id, txn_date, txn_type, amount, description, created_by)
+     VALUES ($1, CURRENT_DATE, 'starting_balance', $2, 'Starting balance', $3)`,
+    [rows[0].id, -Math.abs(parseFloat(original_balance)), req.user?.email || 'system']
   );
   res.json(rows[0]);
 });
@@ -2647,11 +2718,11 @@ app.post('/api/collections/families/import', ssoAuth, upload.single('file'), asy
     const balance = parseFloat(row['Balance'] || row['Original Balance'] || row['original_balance'] || row['Amount Owed'] || 0);
     if (!name || !balance) { skipped++; continue; }
     try {
-      await pool.query(
+      const { rows: insRows } = await pool.query(
         `INSERT INTO collections_families
          (family_name, primary_contact_email, primary_contact_phone, children_names,
           original_balance, center, left_date, notes)
-         VALUES ($1,$2,$3,$4,$5,$6,$7,$8)`,
+         VALUES ($1,$2,$3,$4,$5,$6,$7,$8) RETURNING id`,
         [name,
          row['Email'] || row['email'] || null,
          row['Phone'] || row['phone'] || null,
@@ -2660,6 +2731,13 @@ app.post('/api/collections/families/import', ssoAuth, upload.single('file'), asy
          row['Center'] || row['center'] || null,
          row['Left Date'] || row['left_date'] || null,
          row['Notes'] || row['notes'] || null]
+      );
+      // Seed ledger with the starting balance
+      await pool.query(
+        `INSERT INTO collections_transactions
+           (family_id, txn_date, txn_type, amount, description, created_by)
+         VALUES ($1, CURRENT_DATE, 'starting_balance', $2, 'Starting balance (imported)', $3)`,
+        [insRows[0].id, -Math.abs(balance), req.user?.email || 'csv_import']
       );
       created++;
     } catch (e) {
@@ -2756,6 +2834,355 @@ app.post('/api/collections/families/:id/deactivate-links', ssoAuth, async (req, 
   );
   res.json({ deactivated });
 });
+
+// ── Transactions / Adjustments ───────────────────────────────────────────────
+const TXN_TYPES_REDUCING = new Set(['payment','credit','pay_in_full_discount']);
+const TXN_TYPES_INCREASING = new Set(['charge','refund']);
+const ALL_TXN_TYPES = new Set([...TXN_TYPES_REDUCING, ...TXN_TYPES_INCREASING, 'starting_balance','other']);
+
+// List a family's ledger
+app.get('/api/collections/families/:id/transactions', ssoAuth, async (req, res) => {
+  const { rows } = await pool.query(
+    `SELECT * FROM collections_transactions WHERE family_id=$1 ORDER BY txn_date DESC, created_at DESC`,
+    [req.params.id]
+  );
+  res.json(rows);
+});
+
+// Add a transaction (manual adjustment or payment record)
+app.post('/api/collections/families/:id/transactions', ssoAuth, async (req, res) => {
+  const familyId = req.params.id;
+  const { txn_type, txn_type_label, amount, description, reason, txn_date } = req.body;
+
+  if (!txn_type || !ALL_TXN_TYPES.has(txn_type)) {
+    return res.status(400).json({ error: 'Invalid or missing txn_type' });
+  }
+  const amt = parseFloat(amount);
+  if (isNaN(amt) || amt === 0) return res.status(400).json({ error: 'Amount must be a non-zero number' });
+  if (!reason || String(reason).trim().length < 5) {
+    return res.status(400).json({ error: 'Reason is required (at least 5 characters)' });
+  }
+
+  // Sign the amount based on type: reducing types flip to positive, increasing flip to negative.
+  // User enters a positive dollar amount; we apply the sign server-side for consistency.
+  const magnitude = Math.abs(amt);
+  let signedAmount;
+  if (TXN_TYPES_REDUCING.has(txn_type)) signedAmount = magnitude;
+  else if (TXN_TYPES_INCREASING.has(txn_type)) signedAmount = -magnitude;
+  else if (txn_type === 'starting_balance') signedAmount = -magnitude; // starting balance always owed
+  else signedAmount = amt; // 'other' — respect user's sign
+
+  const { rows } = await pool.query(
+    `INSERT INTO collections_transactions
+       (family_id, txn_date, txn_type, txn_type_label, amount, description, reason, created_by)
+     VALUES ($1, COALESCE($2::date, CURRENT_DATE), $3, $4, $5, $6, $7, $8) RETURNING *`,
+    [familyId, txn_date || null, txn_type, txn_type_label || null, signedAmount,
+     description || null, reason, req.user?.email || 'manual']
+  );
+
+  // If paying in full settled them, mark family settled
+  const check = await familyWithBalance(familyId);
+  if (check && check.remaining_balance <= 0.01) {
+    await pool.query(`UPDATE collections_families SET status='settled', settled_at=NOW() WHERE id=$1 AND status != 'settled'`, [familyId]);
+  }
+  res.json(rows[0]);
+});
+
+// Void a transaction (inserts an offsetting entry — never hard-deletes)
+app.post('/api/collections/families/:id/transactions/:txnId/void', ssoAuth, async (req, res) => {
+  const { reason } = req.body;
+  if (!reason || String(reason).trim().length < 5) return res.status(400).json({ error: 'Void reason required' });
+  const { rows: orig } = await pool.query(
+    `SELECT * FROM collections_transactions WHERE id=$1 AND family_id=$2`,
+    [req.params.txnId, req.params.id]
+  );
+  if (!orig[0]) return res.status(404).json({ error: 'Transaction not found' });
+  await pool.query(
+    `INSERT INTO collections_transactions
+       (family_id, txn_date, txn_type, amount, description, reason, created_by)
+     VALUES ($1, CURRENT_DATE, 'other', $2, $3, $4, $5)`,
+    [req.params.id, -parseFloat(orig[0].amount),
+     `VOID of txn #${orig[0].id} (${orig[0].txn_type})`,
+     reason, req.user?.email || 'manual']
+  );
+  res.json({ voided: orig[0].id });
+});
+
+// ── Child Linking ────────────────────────────────────────────────────────────
+// List candidate children (roster children not yet linked to any family)
+app.get('/api/collections/families/:id/candidate-children', ssoAuth, async (req, res) => {
+  const { q } = req.query;
+  const params = [];
+  let sql = `SELECT c.id, c.first_name, c.last_name, c.center, c.parent_name, c.parent_email
+             FROM children c
+             WHERE c.is_active = true`;
+  if (q) {
+    params.push(`%${q.toLowerCase()}%`);
+    sql += ` AND (LOWER(c.last_name) LIKE $${params.length} OR LOWER(c.first_name) LIKE $${params.length} OR LOWER(c.parent_name) LIKE $${params.length})`;
+  }
+  sql += ` ORDER BY c.last_name, c.first_name LIMIT 50`;
+  const { rows } = await pool.query(sql, params);
+  res.json(rows);
+});
+
+// Link a child to a past-due family
+app.post('/api/collections/families/:id/link-child', ssoAuth, async (req, res) => {
+  const { child_id } = req.body;
+  if (!child_id) return res.status(400).json({ error: 'child_id required' });
+  await pool.query(
+    `INSERT INTO collections_family_children (family_id, child_id)
+     VALUES ($1, $2) ON CONFLICT (family_id, child_id) DO NOTHING`,
+    [req.params.id, child_id]
+  );
+  res.json({ linked: true });
+});
+
+// Unlink
+app.post('/api/collections/families/:id/unlink-child', ssoAuth, async (req, res) => {
+  const { child_id } = req.body;
+  await pool.query(
+    `DELETE FROM collections_family_children WHERE family_id=$1 AND child_id=$2`,
+    [req.params.id, child_id]
+  );
+  res.json({ unlinked: true });
+});
+
+// ── Printable Statement ──────────────────────────────────────────────────────
+// Returns an HTML document suitable for browser print / save-as-PDF showing
+// the full transaction ledger for a family. Hand this to a family that
+// challenges their balance.
+app.get('/api/collections/families/:id/statement', ssoAuth, async (req, res) => {
+  const family = await familyWithBalance(req.params.id);
+  if (!family) return res.status(404).send('Not found');
+
+  const { rows: txns } = await pool.query(
+    `SELECT * FROM collections_transactions WHERE family_id=$1 ORDER BY txn_date ASC, created_at ASC`,
+    [req.params.id]
+  );
+  const { rows: linked } = await pool.query(
+    `SELECT c.first_name, c.last_name FROM collections_family_children fc
+     JOIN children c ON c.id = fc.child_id WHERE fc.family_id=$1
+     ORDER BY c.last_name, c.first_name`,
+    [req.params.id]
+  );
+
+  const fmtUSD = (n) => {
+    const v = parseFloat(n) || 0;
+    const sign = v < 0 ? '-' : '';
+    return `${sign}$${Math.abs(v).toFixed(2)}`;
+  };
+  const fmtDate = (d) => {
+    if (!d) return '';
+    const dt = new Date(d);
+    return dt.toLocaleDateString('en-US', { month:'short', day:'numeric', year:'numeric', timeZone:'UTC' });
+  };
+  const typeLabel = (t, label) => {
+    if (t === 'other' && label) return label;
+    return ({
+      starting_balance: 'Starting Balance',
+      charge: 'Charge',
+      payment: 'Payment',
+      credit: 'Credit / Adjustment',
+      refund: 'Refund',
+      pay_in_full_discount: 'Pay-in-Full 50% Discount',
+      other: 'Other',
+    })[t] || t;
+  };
+
+  // Running balance — starts at 0, each txn is signed so balance = -runningSum.
+  let running = 0;
+  const rows = txns.map(t => {
+    running += parseFloat(t.amount);
+    return {
+      ...t,
+      running_owed: -running,
+    };
+  });
+
+  const html = `<!DOCTYPE html>
+<html><head><meta charset="UTF-8">
+<title>Statement of Account — ${family.family_name}</title>
+<style>
+  * { box-sizing: border-box; margin: 0; padding: 0; }
+  body { font-family: Helvetica, Arial, sans-serif; color: #000; padding: 12mm; font-size: 11px; background: #fff; }
+  .header { border-bottom: 3px solid #1a2744; padding-bottom: 12px; margin-bottom: 16px; display: flex; justify-content: space-between; align-items: flex-end; }
+  .title { font-family: 'Times New Roman', serif; font-size: 26px; color: #1a2744; }
+  .subtitle { font-size: 11px; color: #555; margin-top: 4px; }
+  .meta-grid { display: grid; grid-template-columns: 1fr 1fr; gap: 14px 24px; margin-bottom: 20px; }
+  .meta-grid .label { font-size: 10px; color: #666; text-transform: uppercase; letter-spacing: .5px; }
+  .meta-grid .value { font-size: 13px; font-weight: 600; color: #1a2744; }
+  table { width: 100%; border-collapse: collapse; margin-bottom: 18px; }
+  th { background: #1a2744; color: #fff; padding: 8px 10px; text-align: left; font-size: 11px; font-weight: 600; }
+  td { padding: 7px 10px; border-bottom: 1px solid #ddd; font-size: 11px; vertical-align: top; }
+  tr:nth-child(even) td { background: #f7f7f7; }
+  .amt { text-align: right; font-family: monospace; }
+  .amt-reduce { color: #1e8449; }
+  .amt-increase { color: #c0392b; }
+  .amt-balance { font-weight: 600; }
+  .summary { border: 2px solid #1a2744; padding: 14px 18px; background: #f7f5ef; display: flex; justify-content: space-between; align-items: center; }
+  .summary .label { font-size: 11px; color: #555; text-transform: uppercase; letter-spacing: .5px; }
+  .summary .value { font-family: 'Times New Roman', serif; font-size: 28px; color: #c0392b; font-weight: 700; }
+  .footer { margin-top: 24px; padding-top: 12px; border-top: 1px solid #ccc; font-size: 10px; color: #666; line-height: 1.6; }
+  .reason-tag { font-style: italic; color: #666; font-size: 10px; display: block; margin-top: 2px; }
+  .toolbar { margin-bottom: 14px; padding-bottom: 10px; border-bottom: 1px solid #ddd; }
+  .toolbar button { padding: 6px 14px; background: #1a2744; color: #fff; border: none; border-radius: 4px; font-size: 12px; cursor: pointer; }
+  @media print {
+    .toolbar { display: none; }
+    body { padding: 8mm; }
+    @page { size: letter; margin: 12mm; }
+  }
+</style></head>
+<body>
+
+<div class="toolbar">
+  <button onclick="window.print()">🖨 Print</button>
+  <button onclick="window.close()" style="background:#fff;color:#1a2744;border:1px solid #1a2744;margin-left:8px">Close</button>
+</div>
+
+<div class="header">
+  <div>
+    <div class="title">Statement of Account</div>
+    <div class="subtitle">The Children's Center, Inc.</div>
+  </div>
+  <div style="text-align:right;font-size:11px;color:#666">
+    Generated ${fmtDate(new Date().toISOString())}<br>
+    Account #${family.id}
+  </div>
+</div>
+
+<div class="meta-grid">
+  <div>
+    <div class="label">Account Holder</div>
+    <div class="value">${family.family_name}</div>
+  </div>
+  <div>
+    <div class="label">Center</div>
+    <div class="value">${family.center || '—'}</div>
+  </div>
+  ${linked.length ? `
+  <div>
+    <div class="label">Children</div>
+    <div class="value">${linked.map(c => `${c.first_name} ${c.last_name}`).join(', ')}</div>
+  </div>` : ''}
+  ${family.left_date ? `
+  <div>
+    <div class="label">Left Date</div>
+    <div class="value">${fmtDate(family.left_date)}</div>
+  </div>` : ''}
+  ${family.primary_contact_email ? `
+  <div>
+    <div class="label">Email</div>
+    <div class="value" style="font-weight:400">${family.primary_contact_email}</div>
+  </div>` : ''}
+  ${family.primary_contact_phone ? `
+  <div>
+    <div class="label">Phone</div>
+    <div class="value" style="font-weight:400">${family.primary_contact_phone}</div>
+  </div>` : ''}
+</div>
+
+<table>
+  <thead><tr>
+    <th>Date</th>
+    <th>Type</th>
+    <th>Description</th>
+    <th class="amt">Amount</th>
+    <th class="amt">Balance Owed</th>
+  </tr></thead>
+  <tbody>
+    ${rows.length === 0 ? `<tr><td colspan="5" style="text-align:center;color:#888;padding:20px">No transactions recorded.</td></tr>` : ''}
+    ${rows.map(t => {
+      const amt = parseFloat(t.amount);
+      const cls = amt >= 0 ? 'amt-reduce' : 'amt-increase';
+      return `<tr>
+        <td>${fmtDate(t.txn_date)}</td>
+        <td>${typeLabel(t.txn_type, t.txn_type_label)}</td>
+        <td>${t.description || ''}${t.reason ? `<span class="reason-tag">Reason: ${t.reason}</span>` : ''}</td>
+        <td class="amt ${cls}">${fmtUSD(amt)}</td>
+        <td class="amt amt-balance">${fmtUSD(t.running_owed)}</td>
+      </tr>`;
+    }).join('')}
+  </tbody>
+</table>
+
+<div class="summary">
+  <div>
+    <div class="label">Current Balance Owed</div>
+    <div style="font-size:11px;color:#666;margin-top:2px">As of ${fmtDate(new Date().toISOString())}</div>
+  </div>
+  <div class="value">${fmtUSD(family.remaining_balance)}</div>
+</div>
+
+<div class="footer">
+  This statement reflects all charges, payments, credits, and adjustments on file for this account.
+  If you have any questions about a specific transaction, please contact The Children's Center billing office.
+  This is a computer-generated statement.
+</div>
+
+</body></html>`;
+
+  res.setHeader('Content-Type', 'text/html; charset=utf-8');
+  res.send(html);
+});
+
+// ── Hook: record successful Stripe payments into the ledger ──────────────────
+// When Stripe tells us a payment succeeded, also insert a ledger entry so the
+// statement reflects it. The pay-in-full link also produces a 50% discount
+// credit that zeros out the remaining balance.
+const origHandleStripeEvent = handleStripeEvent;
+handleStripeEvent = async function(event) {
+  await origHandleStripeEvent(event);
+
+  const type = event.type;
+  if (type !== 'payment_intent.succeeded' && type !== 'checkout.session.completed') return;
+
+  const obj = event.data.object;
+  const pi = type === 'checkout.session.completed' && obj.payment_intent
+    ? await stripe.paymentIntents.retrieve(obj.payment_intent)
+    : obj;
+
+  const metadata = pi.metadata || obj.metadata || {};
+  const familyId = metadata.family_id ? parseInt(metadata.family_id) : null;
+  if (!familyId) return;
+
+  const amount = (pi.amount_received || pi.amount || 0) / 100;
+  const linkType = metadata.link_type || '';
+
+  // Check if we already recorded this payment (idempotent)
+  const { rows: existing } = await pool.query(
+    `SELECT id FROM collections_transactions WHERE stripe_payment_intent_id=$1`,
+    [pi.id]
+  );
+  if (existing.length) return;
+
+  // Record the payment
+  await pool.query(
+    `INSERT INTO collections_transactions
+       (family_id, txn_date, txn_type, amount, description, reason, stripe_payment_intent_id, created_by)
+     VALUES ($1, CURRENT_DATE, 'payment', $2, $3, $4, $5, 'stripe_webhook')`,
+    [familyId, amount,
+     linkType === 'pay_in_full' ? 'Pay-in-Full payment (50% off)' : 'Online payment',
+     `Stripe payment ${pi.id}`,
+     pi.id]
+  );
+
+  // If this was a pay-in-full payment, add the matching 50% discount credit
+  if (linkType === 'pay_in_full') {
+    const family = await familyWithBalance(familyId);
+    if (family && family.remaining_balance > 0.01) {
+      await pool.query(
+        `INSERT INTO collections_transactions
+           (family_id, txn_date, txn_type, amount, description, reason, stripe_payment_intent_id, created_by)
+         VALUES ($1, CURRENT_DATE, 'pay_in_full_discount', $2, $3, $4, $5, 'stripe_webhook')`,
+        [familyId, family.remaining_balance,
+         '50% pay-in-full discount',
+         'Applied at time of pay-in-full payment',
+         pi.id]
+      );
+    }
+  }
+};
+
 
 app.get('/api/collections/dashboard', ssoAuth, async (req, res) => {
   const [familiesQ, paymentsQ, failedQ, recentQ] = await Promise.all([
