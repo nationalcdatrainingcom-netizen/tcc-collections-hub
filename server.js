@@ -267,6 +267,10 @@ async function initDB() {
       updated_at TIMESTAMPTZ DEFAULT NOW()
     );
 
+    -- Weekly subscription link columns (for balances >$600 where weekly is offered)
+    ALTER TABLE collections_families ADD COLUMN IF NOT EXISTS weekly_link_url TEXT;
+    ALTER TABLE collections_families ADD COLUMN IF NOT EXISTS weekly_link_id TEXT;
+
     CREATE TABLE IF NOT EXISTS collections_payments (
       id SERIAL PRIMARY KEY,
       family_id INTEGER REFERENCES collections_families(id) ON DELETE CASCADE,
@@ -3299,9 +3303,29 @@ app.post('/api/collections/families/:id/create-links', ssoAuth, async (req, res)
   const remainingCents = Math.round(family.remaining_balance * 100);
   if (remainingCents <= 0) return res.status(400).json({ error: 'No remaining balance' });
 
+  // ─── Compute the three suggested amounts ─────────────────────────────────
+  // Mary may override these via req.body { monthly_cents, weekly_cents }.
+  // All three options are always offered — even a small weekly payment from a
+  // family with a large balance is better than nothing. Families who can't manage
+  // a large monthly payment may find $25/week more achievable, even on a
+  // years-long horizon.
+  const MIN_CENTS = COLLECTIONS_MIN_PAYMENT_CENTS;          // $25 minimum
   const discountCents = Math.round(remainingCents / 2);
 
+  const suggestedMonthlyCents = Math.max(MIN_CENTS, Math.round(remainingCents / 24));
+  const monthlyCents = req.body?.monthly_cents
+    ? Math.max(MIN_CENTS, Math.round(parseFloat(req.body.monthly_cents)))
+    : suggestedMonthlyCents;
+
+  // Weekly is always offered — $25/wk is meaningful recovery even on a 20K balance.
+  // 104 weeks = 2 years, so suggested = balance/104 floored at $25.
+  const suggestedWeeklyCents = Math.max(MIN_CENTS, Math.round(remainingCents / 104));
+  const weeklyCents = req.body?.weekly_cents
+    ? Math.max(MIN_CENTS, Math.round(parseFloat(req.body.weekly_cents)))
+    : suggestedWeeklyCents;
+
   try {
+    // ─── Pay in Full (50% off) — one-time payment ──────────────────────────
     const payInFullPrice = await stripe.prices.create({
       currency: 'usd',
       unit_amount: discountCents,
@@ -3318,28 +3342,41 @@ app.post('/api/collections/families/:id/create-links', ssoAuth, async (req, res)
       }},
     });
 
-    // Pay What You Can — recurring MONTHLY subscription, family chooses the amount
-    // ($25 minimum). Auto-charges every month until they cancel or until the balance
-    // is paid off (we cancel the subscription via webhook when balance hits zero).
-    const pwycPrice = await stripe.prices.create({
+    // ─── Monthly subscription — fixed amount, recurring auto-charge ───────
+    const monthlyPrice = await stripe.prices.create({
       currency: 'usd',
+      unit_amount: monthlyCents,
       recurring: { interval: 'month' },
-      custom_unit_amount: {
-        enabled: true,
-        minimum: COLLECTIONS_MIN_PAYMENT_CENTS,
-        preset: Math.min(Math.max(COLLECTIONS_MIN_PAYMENT_CENTS, Math.round(remainingCents / 12)), 50000),
-      },
       product_data: { name: `Monthly Payment Plan — ${family.family_name}` },
     });
-    const pwycLink = await stripe.paymentLinks.create({
-      line_items: [{ price: pwycPrice.id, quantity: 1 }],
-      metadata: { family_id: String(family.id), link_type: 'pay_what_you_can' },
+    const monthlyLink = await stripe.paymentLinks.create({
+      line_items: [{ price: monthlyPrice.id, quantity: 1 }],
+      metadata: { family_id: String(family.id), link_type: 'monthly' },
       subscription_data: {
-        metadata: { family_id: String(family.id), link_type: 'pay_what_you_can' },
-        description: `Monthly payment toward balance owed to The Children's Center. You can cancel anytime.`,
+        metadata: { family_id: String(family.id), link_type: 'monthly' },
+        description: `Monthly payment toward balance owed to The Children's Center. We'll cancel automatically when your balance is paid off.`,
       },
       after_completion: { type: 'hosted_confirmation', hosted_confirmation: {
-        custom_message: `Thank you! Your monthly payment is set up. We'll automatically charge your selected amount each month until your balance is paid in full. You can cancel or change the amount anytime by contacting us.`,
+        custom_message: `Thank you! Your monthly payment of $${(monthlyCents/100).toFixed(2)} is set up. We'll charge your card automatically each month until your balance is paid off, then cancel the subscription. Contact us anytime to change the amount.`,
+      }},
+    });
+
+    // ─── Weekly subscription — always offered (recurring auto-charge) ───────
+    const weeklyPrice = await stripe.prices.create({
+      currency: 'usd',
+      unit_amount: weeklyCents,
+      recurring: { interval: 'week' },
+      product_data: { name: `Weekly Payment Plan — ${family.family_name}` },
+    });
+    const weeklyLink = await stripe.paymentLinks.create({
+      line_items: [{ price: weeklyPrice.id, quantity: 1 }],
+      metadata: { family_id: String(family.id), link_type: 'weekly' },
+      subscription_data: {
+        metadata: { family_id: String(family.id), link_type: 'weekly' },
+        description: `Weekly payment toward balance owed to The Children's Center. We'll cancel automatically when your balance is paid off.`,
+      },
+      after_completion: { type: 'hosted_confirmation', hosted_confirmation: {
+        custom_message: `Thank you! Your weekly payment of $${(weeklyCents/100).toFixed(2)} is set up. We'll charge your card automatically each week until your balance is paid off. Contact us anytime to change the amount.`,
       }},
     });
 
@@ -3347,28 +3384,52 @@ app.post('/api/collections/families/:id/create-links', ssoAuth, async (req, res)
       `UPDATE collections_families SET
          payinfull_link_url=$1, payinfull_link_id=$2,
          paywhatyoucan_link_url=$3, paywhatyoucan_link_id=$4,
+         weekly_link_url=$5, weekly_link_id=$6,
          updated_at=NOW()
-       WHERE id=$5 RETURNING *`,
-      [payInFullLink.url, payInFullLink.id, pwycLink.url, pwycLink.id, family.id]
+       WHERE id=$7 RETURNING *`,
+      [payInFullLink.url, payInFullLink.id,
+       monthlyLink.url, monthlyLink.id,
+       weeklyLink.url, weeklyLink.id,
+       family.id]
     );
 
     res.json({
-      pay_in_full: { url: payInFullLink.url, amount: discountCents / 100 },
-      pay_what_you_can: { url: pwycLink.url, minimum: COLLECTIONS_MIN_PAYMENT_CENTS / 100 },
+      pay_in_full: { url: payInFullLink.url, amount_cents: discountCents },
+      monthly: {
+        url: monthlyLink.url,
+        amount_cents: monthlyCents,
+        suggested_cents: suggestedMonthlyCents,
+        was_overridden: monthlyCents !== suggestedMonthlyCents,
+      },
+      weekly: {
+        url: weeklyLink.url,
+        amount_cents: weeklyCents,
+        suggested_cents: suggestedWeeklyCents,
+        was_overridden: weeklyCents !== suggestedWeeklyCents,
+      },
       family: rows[0],
     });
   } catch (e) {
     console.error('Stripe link creation failed:', e);
-    res.status(500).json({ error: 'Stripe error: ' + e.message });
+    const detail = {
+      error: 'Stripe error: ' + e.message,
+      stripe_code: e.code || null,
+      stripe_type: e.type || null,
+      stripe_param: e.param || null,
+      stripe_doc_url: e.doc_url || null,
+    };
+    res.status(500).json(detail);
   }
 });
 
 app.post('/api/collections/families/:id/deactivate-links', ssoAuth, async (req, res) => {
   if (!stripe) return res.status(503).json({ error: 'Stripe not configured' });
-  const { rows } = await pool.query(`SELECT payinfull_link_id, paywhatyoucan_link_id FROM collections_families WHERE id=$1`, [req.params.id]);
+  const { rows } = await pool.query(
+    `SELECT payinfull_link_id, paywhatyoucan_link_id, weekly_link_id
+     FROM collections_families WHERE id=$1`, [req.params.id]);
   if (!rows[0]) return res.status(404).json({ error: 'Not found' });
   const deactivated = [];
-  for (const linkId of [rows[0].payinfull_link_id, rows[0].paywhatyoucan_link_id]) {
+  for (const linkId of [rows[0].payinfull_link_id, rows[0].paywhatyoucan_link_id, rows[0].weekly_link_id]) {
     if (!linkId) continue;
     try {
       await stripe.paymentLinks.update(linkId, { active: false });
@@ -3377,7 +3438,8 @@ app.post('/api/collections/families/:id/deactivate-links', ssoAuth, async (req, 
   }
   await pool.query(
     `UPDATE collections_families SET payinfull_link_url=NULL, payinfull_link_id=NULL,
-       paywhatyoucan_link_url=NULL, paywhatyoucan_link_id=NULL, updated_at=NOW() WHERE id=$1`,
+       paywhatyoucan_link_url=NULL, paywhatyoucan_link_id=NULL,
+       weekly_link_url=NULL, weekly_link_id=NULL, updated_at=NOW() WHERE id=$1`,
     [req.params.id]
   );
   res.json({ deactivated });
@@ -3388,7 +3450,8 @@ app.post('/api/collections/families/:id/deactivate-links', ssoAuth, async (req, 
 // ═════════════════════════════════════════════════════════════════════════════
 // Branded HTML email templates with both payment options. The subject line and
 // content are warm but firm — these go to families who left with a balance.
-function buildPaymentLinkEmail({ family, payInFullUrl, payInFullAmount, monthlyUrl, minMonthly, fromName }) {
+function buildPaymentLinkEmail({ family, payInFullUrl, payInFullAmount,
+                                  monthlyUrl, monthlyAmount, weeklyUrl, weeklyAmount, fromName }) {
   const greeting = family.family_name.split(/[\s,]+/)[0] || family.family_name;
   const fmtMoney = (n) => {
     const v = parseFloat(n) || 0;
@@ -3397,9 +3460,27 @@ function buildPaymentLinkEmail({ family, payInFullUrl, payInFullAmount, monthlyU
   const remaining = fmtMoney(family.remaining_balance || 0);
   const halfOff = fmtMoney(payInFullAmount || family.discount_pay_in_full || 0);
   const savings = fmtMoney((parseFloat(family.remaining_balance || 0)) - (parseFloat(payInFullAmount || family.discount_pay_in_full || 0)));
-  const minPayment = parseFloat(minMonthly || 25).toFixed(0);
+  const monthly = fmtMoney(monthlyAmount || 25);
+  const weekly = weeklyAmount ? fmtMoney(weeklyAmount) : null;
 
-  const subject = `Settle Your Balance with The Children's Center — Two Easy Options`;
+  const optionCount = weeklyUrl ? 'three' : 'two';
+  const subject = `Settle Your Balance with The Children's Center — ${optionCount === 'three' ? 'Three' : 'Two'} Easy Options`;
+
+  const weeklyCardHTML = weeklyUrl ? `
+        <!-- Option 3: Weekly Payment Plan -->
+        <table role="presentation" width="100%" cellpadding="0" cellspacing="0" style="margin-bottom:16px;border:1px solid #d4d4d4;border-radius:8px;background:#ffffff">
+          <tr><td style="padding:20px">
+            <div style="font-size:11px;color:#1a2744;text-transform:uppercase;letter-spacing:1px;font-weight:600">Smaller Weekly Payments</div>
+            <div style="font-family:'Georgia',serif;font-size:22px;color:#1a2744;margin-top:6px">Weekly Payment Plan</div>
+            <p style="font-size:14px;line-height:1.5;margin:10px 0 16px;color:#555">
+              Pay <strong>$${weekly}/week</strong>, automatically charged each week until your balance is paid off.
+              We'll cancel automatically when you reach zero. Contact us anytime to change the amount.
+            </p>
+            <a href="${weeklyUrl}" style="display:inline-block;background:#1a2744;color:#ffffff;font-weight:600;padding:12px 24px;border-radius:6px;text-decoration:none;font-size:15px">
+              Set Up $${weekly}/Week Payments →
+            </a>
+          </td></tr>
+        </table>` : '';
 
   const html = `<!DOCTYPE html>
 <html><head><meta charset="UTF-8"><title>${subject}</title></head>
@@ -3423,7 +3504,7 @@ function buildPaymentLinkEmail({ family, payInFullUrl, payInFullAmount, monthlyU
 
         <p style="font-size:15px;line-height:1.6;margin:0 0 24px">
           We understand things come up, and we want to make this as easy as possible to resolve.
-          We're offering you <strong>two flexible payment options</strong>:
+          We're offering you <strong>${optionCount} flexible payment options</strong>:
         </p>
 
         <!-- Option 1: Pay in Full with 50% Discount -->
@@ -3442,22 +3523,24 @@ function buildPaymentLinkEmail({ family, payInFullUrl, payInFullAmount, monthlyU
         </table>
 
         <!-- Option 2: Monthly Payment Plan -->
-        <table role="presentation" width="100%" cellpadding="0" cellspacing="0" style="margin-bottom:24px;border:1px solid #d4d4d4;border-radius:8px;background:#ffffff">
+        <table role="presentation" width="100%" cellpadding="0" cellspacing="0" style="margin-bottom:16px;border:1px solid #d4d4d4;border-radius:8px;background:#ffffff">
           <tr><td style="padding:20px">
             <div style="font-size:11px;color:#1a2744;text-transform:uppercase;letter-spacing:1px;font-weight:600">Flexible Option</div>
             <div style="font-family:'Georgia',serif;font-size:22px;color:#1a2744;margin-top:6px">Monthly Payment Plan</div>
             <p style="font-size:14px;line-height:1.5;margin:10px 0 16px;color:#555">
-              Choose any monthly amount you can manage — as low as <strong>$${minPayment}/month</strong>.
-              You can cancel or change the amount anytime by contacting us. Your card will be charged automatically each month.
+              Pay <strong>$${monthly}/month</strong>, automatically charged each month until your balance is paid off.
+              We'll cancel automatically when you reach zero. Contact us anytime to change the amount.
             </p>
             <a href="${monthlyUrl}" style="display:inline-block;background:#1a2744;color:#ffffff;font-weight:600;padding:12px 24px;border-radius:6px;text-decoration:none;font-size:15px">
-              Set Up Monthly Payments →
+              Set Up $${monthly}/Month Payments →
             </a>
           </td></tr>
         </table>
 
-        <p style="font-size:13.5px;line-height:1.6;margin:0 0 12px;color:#555">
-          Both options use Stripe for secure payment processing. We never see or store your card details.
+        ${weeklyCardHTML}
+
+        <p style="font-size:13.5px;line-height:1.6;margin:24px 0 12px;color:#555">
+          All options use Stripe for secure payment processing. We never see or store your card details.
         </p>
 
         <p style="font-size:13.5px;line-height:1.6;margin:0 0 16px;color:#555">
@@ -3483,21 +3566,29 @@ function buildPaymentLinkEmail({ family, payInFullUrl, payInFullAmount, monthlyU
 </table>
 </body></html>`;
 
-  const text = `Dear ${greeting},
+  let text = `Dear ${greeting},
 
 We're following up on the outstanding balance on your account with The Children's Center: $${remaining}.
 
-We're offering two flexible payment options:
+We're offering ${optionCount} flexible payment options:
 
 ★ OPTION 1 — Pay in Full, Save 50%
 Pay just $${halfOff} now (savings of $${savings}).
 ${payInFullUrl}
 
-OPTION 2 — Monthly Payment Plan ($${minPayment}/month minimum)
-Pay any monthly amount you can manage, cancel anytime.
+OPTION 2 — Monthly Payment Plan ($${monthly}/month, recurring)
+Auto-charged each month until paid off, then cancels automatically.
 ${monthlyUrl}
-
-Both options use Stripe for secure payment processing.
+`;
+  if (weeklyUrl) {
+    text += `
+OPTION 3 — Weekly Payment Plan ($${weekly}/week, recurring)
+Auto-charged each week until paid off, then cancels automatically.
+${weeklyUrl}
+`;
+  }
+  text += `
+All options use Stripe for secure payment processing.
 
 Questions? Reply to this email or call (269) 683-0405.
 
@@ -3551,12 +3642,32 @@ app.post('/api/collections/families/:id/send-email', ssoAuth, async (req, res) =
   const fromEmail = process.env.SENDGRID_FROM_EMAIL || 'billing@childrenscenterinc.com';
   const fromName = process.env.SENDGRID_FROM_NAME || "The Children's Center Billing";
 
+  // Fetch the actual monthly/weekly amounts from Stripe (since they vary per family)
+  let monthlyAmount = null, weeklyAmount = null;
+  try {
+    if (family.paywhatyoucan_link_id) {
+      const link = await stripe.paymentLinks.retrieve(family.paywhatyoucan_link_id, { expand: ['line_items.data.price'] });
+      const price = link.line_items?.data?.[0]?.price;
+      if (price?.unit_amount) monthlyAmount = price.unit_amount / 100;
+    }
+    if (family.weekly_link_id) {
+      const link = await stripe.paymentLinks.retrieve(family.weekly_link_id, { expand: ['line_items.data.price'] });
+      const price = link.line_items?.data?.[0]?.price;
+      if (price?.unit_amount) weeklyAmount = price.unit_amount / 100;
+    }
+  } catch (e) {
+    console.warn('Could not fetch link prices:', e.message);
+    monthlyAmount = monthlyAmount || (COLLECTIONS_MIN_PAYMENT_CENTS / 100);
+  }
+
   const { subject, html, text } = buildPaymentLinkEmail({
     family,
     payInFullUrl: family.payinfull_link_url,
     payInFullAmount: family.discount_pay_in_full,
     monthlyUrl: family.paywhatyoucan_link_url,
-    minMonthly: COLLECTIONS_MIN_PAYMENT_CENTS / 100,
+    monthlyAmount,
+    weeklyUrl: family.weekly_link_url || null,
+    weeklyAmount,
     fromName,
   });
 
@@ -4015,4 +4126,4 @@ app.get('*', (req, res) => res.sendFile(path.join(__dirname, 'public', 'index.ht
 initDB().then(() => {
   const PORT = process.env.PORT || 3000;
   app.listen(PORT, () => console.log(`TCC Billing Hub running on port ${PORT}`));
-}).catch(e => { console.error('DB init failed:', e); process.exit(1); });
+}).catch(e => { console.error('DB init failed:', e); process.exit(1); });v
