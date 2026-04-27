@@ -493,6 +493,32 @@ async function initDB() {
     }
   }
 
+  // Backfill starting_balance transactions for any pre-existing collections_families
+  // that were imported before the transaction ledger was introduced. Without this,
+  // their remaining_balance computes to $0 and link generation fails.
+  // Idempotent: only inserts where no transaction exists for that family yet.
+  const backfill = await pool.query(`
+    INSERT INTO collections_transactions
+      (family_id, txn_date, txn_type, amount, description, created_by)
+    SELECT
+      f.id,
+      COALESCE(f.created_at::date, CURRENT_DATE),
+      'starting_balance',
+      -ABS(f.original_balance::numeric),
+      'Starting balance (backfilled)',
+      'migration_backfill'
+    FROM collections_families f
+    WHERE f.original_balance IS NOT NULL
+      AND f.original_balance > 0
+      AND NOT EXISTS (
+        SELECT 1 FROM collections_transactions t WHERE t.family_id = f.id
+      )
+    RETURNING family_id
+  `);
+  if (backfill.rowCount > 0) {
+    console.log(`Backfilled starting_balance transactions for ${backfill.rowCount} families`);
+  }
+
   console.log('DB ready');
 }
 
