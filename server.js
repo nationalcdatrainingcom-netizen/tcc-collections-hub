@@ -26,6 +26,22 @@ try {
   console.log('Stripe module not installed — Collections feature will be read-only');
 }
 
+// SendGrid is optional — only used for emailing payment links to families.
+// If SENDGRID_API_KEY isn't set, the "Send Email" button is hidden and you
+// can still copy/paste the Stripe URLs into your own email client.
+let sendgrid = null;
+try {
+  if (process.env.SENDGRID_API_KEY) {
+    sendgrid = require('@sendgrid/mail');
+    sendgrid.setApiKey(process.env.SENDGRID_API_KEY);
+    console.log('SendGrid initialized');
+  } else {
+    console.log('SendGrid disabled (SENDGRID_API_KEY not set)');
+  }
+} catch (e) {
+  console.log('SendGrid module not installed — email sending will be unavailable');
+}
+
 const app = express();
 const pool = new Pool({ connectionString: process.env.DATABASE_URL, ssl: { rejectUnauthorized: false } });
 const upload = multer({
@@ -103,7 +119,14 @@ function ssoAuth(req, res, next) {
 
 // Public endpoint so frontend can know whether direct access is allowed
 app.get('/api/auth/mode', (req, res) => {
-  res.json({ allowDirectAccess: ALLOW_DIRECT_ACCESS, user: ALLOW_DIRECT_ACCESS ? DIRECT_ACCESS_USER : null });
+  res.json({
+    allowDirectAccess: ALLOW_DIRECT_ACCESS,
+    user: ALLOW_DIRECT_ACCESS ? DIRECT_ACCESS_USER : null,
+    capabilities: {
+      stripe: !!stripe,
+      sendgrid: !!sendgrid,
+    },
+  });
 });
 
 // ── DB Init ─────────────────────────────────────────────────────────────────
@@ -2953,6 +2976,101 @@ async function handleStripeEvent(event) {
       );
       break;
     }
+
+    // ── Subscription events for the monthly Pay-What-You-Can plan ──
+    case 'invoice.payment_succeeded': {
+      // Fired every month when Stripe successfully charges the recurring price.
+      // Find the family via the subscription metadata.
+      const inv = obj;
+      let famId = familyId;
+      if (!famId && inv.subscription) {
+        try {
+          const sub = await stripe.subscriptions.retrieve(inv.subscription);
+          if (sub.metadata?.family_id) famId = parseInt(sub.metadata.family_id);
+        } catch { /* ignore */ }
+      }
+      if (!famId) break;
+
+      const amount = (inv.amount_paid || 0) / 100;
+      const piId = inv.payment_intent || `inv_${inv.id}`;
+
+      // Record in collections_payments for traceability
+      await pool.query(
+        `INSERT INTO collections_payments
+         (family_id, stripe_payment_intent_id, stripe_charge_id, stripe_customer_email,
+          amount, currency, status, paid_at, link_type, raw_event)
+         VALUES ($1,$2,$3,$4,$5,$6,'succeeded',$7,'pay_what_you_can_monthly',$8)
+         ON CONFLICT (stripe_payment_intent_id) DO UPDATE
+           SET status='succeeded', amount=EXCLUDED.amount, paid_at=EXCLUDED.paid_at`,
+        [famId, piId, inv.charge || null, inv.customer_email || null,
+         amount, inv.currency || 'usd', new Date(inv.created * 1000),
+         JSON.stringify(event)]
+      );
+
+      // Auto-cancel the subscription if balance is now ≤ $0
+      // (the ledger entry for this payment is added by the wrapped handleStripeEvent
+      // hook later in the file, so balance will reflect this payment after that runs)
+      // We schedule the check as a follow-up async task.
+      setTimeout(async () => {
+        try {
+          const fam = await familyWithBalance(famId);
+          if (fam && fam.remaining_balance <= 0.01 && inv.subscription) {
+            await stripe.subscriptions.cancel(inv.subscription);
+            await pool.query(
+              `UPDATE collections_families SET status='settled', settled_at=NOW(), updated_at=NOW() WHERE id=$1`,
+              [famId]
+            );
+            console.log(`[subscription] Auto-cancelled ${inv.subscription} for family ${famId} — balance settled`);
+          }
+        } catch (e) {
+          console.error('[subscription] Auto-cancel check failed:', e.message);
+        }
+      }, 1500);
+      break;
+    }
+
+    case 'invoice.payment_failed': {
+      // Fired when the recurring monthly charge fails (e.g., declined card).
+      const inv = obj;
+      let famId = familyId;
+      if (!famId && inv.subscription) {
+        try {
+          const sub = await stripe.subscriptions.retrieve(inv.subscription);
+          if (sub.metadata?.family_id) famId = parseInt(sub.metadata.family_id);
+        } catch { /* ignore */ }
+      }
+      if (!famId) break;
+
+      const amount = (inv.amount_due || 0) / 100;
+      const piId = inv.payment_intent || `inv_${inv.id}`;
+      await pool.query(
+        `INSERT INTO collections_payments
+         (family_id, stripe_payment_intent_id, stripe_customer_email, amount, currency,
+          status, failure_reason, link_type, raw_event)
+         VALUES ($1,$2,$3,$4,$5,'failed',$6,'pay_what_you_can_monthly',$7)
+         ON CONFLICT (stripe_payment_intent_id) DO UPDATE
+           SET status='failed', failure_reason=EXCLUDED.failure_reason`,
+        [famId, piId, inv.customer_email || null, amount, inv.currency || 'usd',
+         'Monthly subscription charge failed (likely card declined or expired)',
+         JSON.stringify(event)]
+      );
+      break;
+    }
+
+    case 'customer.subscription.deleted': {
+      // Fired when the subscription is cancelled (manually, via auto-cancel, or by the family)
+      const sub = obj;
+      const famId = familyId || (sub.metadata?.family_id ? parseInt(sub.metadata.family_id) : null);
+      if (!famId) break;
+      await pool.query(
+        `INSERT INTO collections_events (family_id, event_type, stripe_event_id, detail, raw_event)
+         VALUES ($1, 'subscription_cancelled', $2, $3, $4)
+         ON CONFLICT (stripe_event_id) DO NOTHING`,
+        [famId, event.id, `Subscription ${sub.id} cancelled (status: ${sub.cancellation_details?.reason || 'unknown'})`,
+         JSON.stringify(event)]
+      );
+      break;
+    }
   }
 }
 
@@ -3174,23 +3292,28 @@ app.post('/api/collections/families/:id/create-links', ssoAuth, async (req, res)
       }},
     });
 
+    // Pay What You Can — recurring MONTHLY subscription, family chooses the amount
+    // ($25 minimum). Auto-charges every month until they cancel or until the balance
+    // is paid off (we cancel the subscription via webhook when balance hits zero).
     const pwycPrice = await stripe.prices.create({
       currency: 'usd',
+      recurring: { interval: 'month' },
       custom_unit_amount: {
         enabled: true,
         minimum: COLLECTIONS_MIN_PAYMENT_CENTS,
-        preset: Math.min(remainingCents, 10000),
+        preset: Math.min(Math.max(COLLECTIONS_MIN_PAYMENT_CENTS, Math.round(remainingCents / 12)), 50000),
       },
-      product_data: { name: `Payment Toward Balance — ${family.family_name}` },
+      product_data: { name: `Monthly Payment Plan — ${family.family_name}` },
     });
     const pwycLink = await stripe.paymentLinks.create({
       line_items: [{ price: pwycPrice.id, quantity: 1 }],
       metadata: { family_id: String(family.id), link_type: 'pay_what_you_can' },
-      payment_intent_data: {
+      subscription_data: {
         metadata: { family_id: String(family.id), link_type: 'pay_what_you_can' },
+        description: `Monthly payment toward balance owed to The Children's Center. You can cancel anytime.`,
       },
       after_completion: { type: 'hosted_confirmation', hosted_confirmation: {
-        custom_message: `Thank you for your payment! Every contribution helps settle your balance with The Children's Center.`,
+        custom_message: `Thank you! Your monthly payment is set up. We'll automatically charge your selected amount each month until your balance is paid in full. You can cancel or change the amount anytime by contacting us.`,
       }},
     });
 
@@ -3232,6 +3355,207 @@ app.post('/api/collections/families/:id/deactivate-links', ssoAuth, async (req, 
     [req.params.id]
   );
   res.json({ deactivated });
+});
+
+// ═════════════════════════════════════════════════════════════════════════════
+// ── SendGrid: email payment links to families ────────────────────────────────
+// ═════════════════════════════════════════════════════════════════════════════
+// Branded HTML email templates with both payment options. The subject line and
+// content are warm but firm — these go to families who left with a balance.
+function buildPaymentLinkEmail({ family, payInFullUrl, payInFullAmount, monthlyUrl, minMonthly, fromName }) {
+  const greeting = family.family_name.split(/[\s,]+/)[0] || family.family_name;
+  const fmtMoney = (n) => {
+    const v = parseFloat(n) || 0;
+    return v.toLocaleString('en-US', { minimumFractionDigits: 2, maximumFractionDigits: 2 });
+  };
+  const remaining = fmtMoney(family.remaining_balance || 0);
+  const halfOff = fmtMoney(payInFullAmount || family.discount_pay_in_full || 0);
+  const savings = fmtMoney((parseFloat(family.remaining_balance || 0)) - (parseFloat(payInFullAmount || family.discount_pay_in_full || 0)));
+  const minPayment = parseFloat(minMonthly || 25).toFixed(0);
+
+  const subject = `Settle Your Balance with The Children's Center — Two Easy Options`;
+
+  const html = `<!DOCTYPE html>
+<html><head><meta charset="UTF-8"><title>${subject}</title></head>
+<body style="margin:0;padding:0;font-family:Helvetica,Arial,sans-serif;background:#f7f5ef;color:#1a2744">
+<table role="presentation" width="100%" cellpadding="0" cellspacing="0" style="background:#f7f5ef;padding:24px 0">
+  <tr><td align="center">
+    <table role="presentation" width="600" cellpadding="0" cellspacing="0" style="max-width:600px;background:#ffffff;border-radius:8px;overflow:hidden;box-shadow:0 1px 3px rgba(0,0,0,.05)">
+
+      <tr><td style="background:#1a2744;padding:24px 32px">
+        <div style="font-family:'Georgia',serif;font-size:22px;color:#ffffff">The Children's Center</div>
+        <div style="color:rgba(255,255,255,.7);font-size:13px;margin-top:4px">Billing Department</div>
+      </td></tr>
+
+      <tr><td style="padding:32px">
+        <p style="font-size:15px;line-height:1.6;margin:0 0 16px">Dear ${greeting},</p>
+
+        <p style="font-size:15px;line-height:1.6;margin:0 0 16px">
+          We hope you and your family are doing well. We're writing to follow up on the outstanding balance on your account
+          with The Children's Center, currently <strong>$${remaining}</strong>.
+        </p>
+
+        <p style="font-size:15px;line-height:1.6;margin:0 0 24px">
+          We understand things come up, and we want to make this as easy as possible to resolve.
+          We're offering you <strong>two flexible payment options</strong>:
+        </p>
+
+        <!-- Option 1: Pay in Full with 50% Discount -->
+        <table role="presentation" width="100%" cellpadding="0" cellspacing="0" style="margin-bottom:16px;border:2px solid #c5a572;border-radius:8px;background:#fdfbf6">
+          <tr><td style="padding:20px">
+            <div style="font-size:11px;color:#c5a572;text-transform:uppercase;letter-spacing:1px;font-weight:600">★ Best Deal — Limited Time</div>
+            <div style="font-family:'Georgia',serif;font-size:22px;color:#1a2744;margin-top:6px">Pay in Full — Save 50%</div>
+            <p style="font-size:14px;line-height:1.5;margin:10px 0 16px;color:#555">
+              Pay just <strong style="color:#c0392b">$${halfOff}</strong> now and we'll consider your account fully settled.
+              That's a savings of <strong>$${savings}</strong>.
+            </p>
+            <a href="${payInFullUrl}" style="display:inline-block;background:#c5a572;color:#ffffff;font-weight:600;padding:12px 24px;border-radius:6px;text-decoration:none;font-size:15px">
+              Pay $${halfOff} Now →
+            </a>
+          </td></tr>
+        </table>
+
+        <!-- Option 2: Monthly Payment Plan -->
+        <table role="presentation" width="100%" cellpadding="0" cellspacing="0" style="margin-bottom:24px;border:1px solid #d4d4d4;border-radius:8px;background:#ffffff">
+          <tr><td style="padding:20px">
+            <div style="font-size:11px;color:#1a2744;text-transform:uppercase;letter-spacing:1px;font-weight:600">Flexible Option</div>
+            <div style="font-family:'Georgia',serif;font-size:22px;color:#1a2744;margin-top:6px">Monthly Payment Plan</div>
+            <p style="font-size:14px;line-height:1.5;margin:10px 0 16px;color:#555">
+              Choose any monthly amount you can manage — as low as <strong>$${minPayment}/month</strong>.
+              You can cancel or change the amount anytime by contacting us. Your card will be charged automatically each month.
+            </p>
+            <a href="${monthlyUrl}" style="display:inline-block;background:#1a2744;color:#ffffff;font-weight:600;padding:12px 24px;border-radius:6px;text-decoration:none;font-size:15px">
+              Set Up Monthly Payments →
+            </a>
+          </td></tr>
+        </table>
+
+        <p style="font-size:13.5px;line-height:1.6;margin:0 0 12px;color:#555">
+          Both options use Stripe for secure payment processing. We never see or store your card details.
+        </p>
+
+        <p style="font-size:13.5px;line-height:1.6;margin:0 0 16px;color:#555">
+          If you have questions or want to discuss another arrangement, please reply to this email or call us at
+          <strong>(269) 683-0405</strong>. We genuinely appreciate the time your family spent with us, and we'd
+          love to settle this so we can both move forward.
+        </p>
+
+        <p style="font-size:14px;line-height:1.6;margin:24px 0 0">
+          Warm regards,<br>
+          <strong>${fromName}</strong>
+        </p>
+      </td></tr>
+
+      <tr><td style="background:#f7f5ef;padding:16px 32px;font-size:11px;color:#888;text-align:center;line-height:1.6">
+        The Children's Center · 210 Main Street, Niles, MI 49120<br>
+        219 Peace Boulevard, St. Joseph, MI 49085 · (269) 683-0405<br>
+        <a href="https://www.weloveourfamilies.com" style="color:#888">weloveourfamilies.com</a>
+      </td></tr>
+
+    </table>
+  </td></tr>
+</table>
+</body></html>`;
+
+  const text = `Dear ${greeting},
+
+We're following up on the outstanding balance on your account with The Children's Center: $${remaining}.
+
+We're offering two flexible payment options:
+
+★ OPTION 1 — Pay in Full, Save 50%
+Pay just $${halfOff} now (savings of $${savings}).
+${payInFullUrl}
+
+OPTION 2 — Monthly Payment Plan ($${minPayment}/month minimum)
+Pay any monthly amount you can manage, cancel anytime.
+${monthlyUrl}
+
+Both options use Stripe for secure payment processing.
+
+Questions? Reply to this email or call (269) 683-0405.
+
+Warm regards,
+${fromName}
+
+The Children's Center
+210 Main Street, Niles, MI 49120
+219 Peace Boulevard, St. Joseph, MI 49085`;
+
+  return { subject, html, text };
+}
+
+// Send the payment-link email to the family.
+// Recipient resolution: explicit `to` in body, else family.primary_contact_email,
+// else any linked child's parent_email. Returns 422 if no email is available.
+app.post('/api/collections/families/:id/send-email', ssoAuth, async (req, res) => {
+  if (!sendgrid) {
+    return res.status(503).json({
+      error: 'SendGrid not configured. Set SENDGRID_API_KEY in Render environment variables.',
+    });
+  }
+
+  const family = await familyWithBalance(req.params.id);
+  if (!family) return res.status(404).json({ error: 'Family not found' });
+
+  if (!family.payinfull_link_url || !family.paywhatyoucan_link_url) {
+    return res.status(400).json({
+      error: 'Generate Stripe payment links first (click "Generate Payment Links" on this family\'s page).',
+    });
+  }
+
+  // Resolve the email recipient
+  let toEmail = (req.body.to || '').trim() || family.primary_contact_email;
+  if (!toEmail) {
+    // Try linked children's parent_email
+    const { rows } = await pool.query(
+      `SELECT c.parent_email FROM collections_family_children fc
+       JOIN children c ON c.id=fc.child_id
+       WHERE fc.family_id=$1 AND c.parent_email IS NOT NULL AND c.parent_email <> ''
+       LIMIT 1`, [req.params.id]
+    );
+    toEmail = rows[0]?.parent_email;
+  }
+  if (!toEmail) {
+    return res.status(422).json({
+      error: 'No email address on file. Add one to this family or link a child whose parent_email is set.',
+    });
+  }
+
+  const fromEmail = process.env.SENDGRID_FROM_EMAIL || 'billing@childrenscenterinc.com';
+  const fromName = process.env.SENDGRID_FROM_NAME || "The Children's Center Billing";
+
+  const { subject, html, text } = buildPaymentLinkEmail({
+    family,
+    payInFullUrl: family.payinfull_link_url,
+    payInFullAmount: family.discount_pay_in_full,
+    monthlyUrl: family.paywhatyoucan_link_url,
+    minMonthly: COLLECTIONS_MIN_PAYMENT_CENTS / 100,
+    fromName,
+  });
+
+  try {
+    await sendgrid.send({
+      to: toEmail,
+      from: { email: fromEmail, name: fromName },
+      subject, html, text,
+      categories: ['collections', 'payment-link'],
+      customArgs: { family_id: String(family.id) },
+    });
+
+    // Log the send in the events table
+    await pool.query(
+      `INSERT INTO collections_events (family_id, event_type, detail, created_at)
+       VALUES ($1, 'email_sent', $2, NOW())`,
+      [family.id, `Payment-link email sent to ${toEmail}`]
+    );
+
+    res.json({ sent: true, to: toEmail, from: fromEmail });
+  } catch (e) {
+    console.error('SendGrid send error:', e?.response?.body || e.message);
+    const detail = e?.response?.body?.errors?.map(x => x.message).join('; ') || e.message;
+    res.status(500).json({ error: `Email send failed: ${detail}` });
+  }
 });
 
 // ── Transactions / Adjustments ───────────────────────────────────────────────
@@ -3533,9 +3857,43 @@ handleStripeEvent = async function(event) {
   await origHandleStripeEvent(event);
 
   const type = event.type;
+  const obj = event.data.object;
+
+  // Recurring monthly subscription payment — log it in the ledger too
+  if (type === 'invoice.payment_succeeded') {
+    let famId = null;
+    let metadata = obj.subscription_details?.metadata || {};
+    if (metadata.family_id) famId = parseInt(metadata.family_id);
+    if (!famId && obj.subscription) {
+      try {
+        const sub = await stripe.subscriptions.retrieve(obj.subscription);
+        if (sub.metadata?.family_id) famId = parseInt(sub.metadata.family_id);
+      } catch { /* ignore */ }
+    }
+    if (!famId) return;
+
+    const amount = (obj.amount_paid || 0) / 100;
+    const piId = obj.payment_intent || `inv_${obj.id}`;
+
+    // Idempotent
+    const { rows: existing } = await pool.query(
+      `SELECT id FROM collections_transactions WHERE stripe_payment_intent_id=$1`, [piId]
+    );
+    if (existing.length) return;
+
+    await pool.query(
+      `INSERT INTO collections_transactions
+         (family_id, txn_date, txn_type, amount, description, reason, stripe_payment_intent_id, created_by)
+       VALUES ($1, CURRENT_DATE, 'payment', $2, $3, $4, $5, 'stripe_webhook')`,
+      [famId, amount, 'Monthly subscription payment',
+       `Stripe invoice ${obj.id}`, piId]
+    );
+    return;
+  }
+
+  // One-time payments (pay-in-full or legacy one-time pay-what-you-can)
   if (type !== 'payment_intent.succeeded' && type !== 'checkout.session.completed') return;
 
-  const obj = event.data.object;
   const pi = type === 'checkout.session.completed' && obj.payment_intent
     ? await stripe.paymentIntents.retrieve(obj.payment_intent)
     : obj;
@@ -3547,6 +3905,8 @@ handleStripeEvent = async function(event) {
   const amount = (pi.amount_received || pi.amount || 0) / 100;
   const linkType = metadata.link_type || '';
 
+  // Skip — subscription invoices already handled above and would have a separate PI
+  // We only want one-time pay-in-full or legacy one-time pwyc here.
   // Check if we already recorded this payment (idempotent)
   const { rows: existing } = await pool.query(
     `SELECT id FROM collections_transactions WHERE stripe_payment_intent_id=$1`,
