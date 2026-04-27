@@ -1758,86 +1758,118 @@ async function deleteNoSchool(id) {
 // ── Tuition Rates ─────────────────────────────────────────────────────────────
 pages['tuition-rates'] = async () => {
   document.getElementById('page-title').textContent = 'Tuition Rates';
-  document.getElementById('topbar-actions').innerHTML =
-    `<button class="btn btn-gold" onclick="openAddRate()">+ Add Rate</button>`;
+  document.getElementById('topbar-actions').innerHTML = '';
   const content = document.getElementById('content');
   content.innerHTML = '<div class="loading">Loading…</div>';
   try {
     const rates = await api('GET', '/tuition-rates');
+    if (!rates.length) {
+      content.innerHTML = `<div class="card"><div class="empty"><div class="empty-icon">💰</div>
+        <p>No tuition rates loaded yet. They should auto-seed on next deploy.</p></div></div>`;
+      return;
+    }
+
+    // Group by center
+    const byCenter = {};
+    for (const r of rates) {
+      (byCenter[r.center] = byCenter[r.center] || []).push(r);
+    }
+    const centerOrder = ['Niles', 'Peace', 'Montessori'];
+
     content.innerHTML = `
       <div class="card" style="margin-bottom:16px">
-        <div class="card-title">💡 How Rates Are Used</div>
+        <div class="card-title">💡 About Tuition Rates</div>
         <p style="font-size:13.5px;color:var(--gray);line-height:1.7">
-          Rates are used by the billing engine to calculate no-school day charges.
-          The system will charge the <strong>lesser of</strong>: hourly rate ($8/hr) OR the applicable part-time/full-time weekly rate.
-          Enter your rates per center so the engine can make the right calculation automatically.
+          These are the official 2025 rate sheets for each center. The billing engine uses them
+          to compute family charges. Click any weekly rate to edit it — changes take effect on the next billing run.
+          To add a new program tier or update the rate sheets wholesale, the seeded values in <code>server.js</code> are the source of truth.
         </p>
       </div>
-      ${rates.length === 0 ? `
-        <div class="card"><div class="empty"><div class="empty-icon">💰</div>
-        <p>No tuition rates set up yet. Add rates per center to enable no-school day fee calculations.</p></div></div>
-      ` : `
-      <div class="card" style="padding:0">
-        <div class="table-wrap">
-          <table>
-            <thead><tr><th>Center</th><th>Type</th><th>Label</th><th>Weekly Amount</th><th>Hourly Rate</th></tr></thead>
-            <tbody>
-            ${rates.map(r=>`
-              <tr>
-                <td>${r.center}</td>
-                <td>${r.rate_type}</td>
-                <td>${r.label}</td>
-                <td>$${parseFloat(r.weekly_amount||0).toFixed(2)}</td>
-                <td>$${parseFloat(r.hourly_rate||8).toFixed(2)}/hr</td>
-              </tr>`).join('')}
-            </tbody>
-          </table>
+
+      ${centerOrder.filter(c => byCenter[c]).map(center => `
+        <div class="card" style="padding:0;margin-bottom:16px">
+          <div style="padding:14px 20px;border-bottom:1px solid var(--border);display:flex;justify-content:space-between;align-items:center">
+            <div style="font-family:'DM Serif Display',serif;font-size:20px;color:var(--navy)">${center}</div>
+            <div style="font-size:12px;color:var(--gray)">Effective ${fmtDateShort(byCenter[center][0].effective_date)} · ${byCenter[center].length} programs</div>
+          </div>
+          <div class="table-wrap">
+            <table>
+              <thead><tr>
+                <th>Program</th>
+                <th style="text-align:right">Weekly Rate</th>
+                <th>Age Range</th>
+                <th>Hours</th>
+                <th>Notes</th>
+                <th></th>
+              </tr></thead>
+              <tbody>
+                ${byCenter[center].map(r => `
+                  <tr>
+                    <td><strong>${r.description}</strong>
+                      <div style="font-size:11px;color:var(--gray);font-family:monospace">${r.program_key}</div>
+                    </td>
+                    <td style="text-align:right;font-family:monospace;font-weight:600">$${parseFloat(r.weekly_rate).toFixed(2)}</td>
+                    <td style="font-size:12.5px;color:var(--gray)">${formatAgeRange(r.age_min_months, r.age_max_months)}</td>
+                    <td style="font-size:12.5px;color:var(--gray)">${formatHoursRange(r.hours_min, r.hours_max)}</td>
+                    <td style="font-size:12px;color:var(--gray)">${r.notes || ''}</td>
+                    <td><button class="btn btn-sm btn-ghost" onclick='editRate(${r.id}, ${parseFloat(r.weekly_rate)}, "${(r.notes||'').replace(/"/g,'&quot;')}")'>Edit</button></td>
+                  </tr>`).join('')}
+              </tbody>
+            </table>
+          </div>
         </div>
-      </div>`}`;
+      `).join('')}`;
   } catch(e) { content.innerHTML = `<div class="loading">Error: ${e.message}</div>`; }
 };
 
-function openAddRate() {
+function formatAgeRange(min, max) {
+  if (min == null && max == null) return '—';
+  const fmt = (m) => m == null ? '' : (m < 12 ? `${m}mo` : `${(m/12).toFixed(m%12===0?0:1)}yr`);
+  if (min != null && max != null) return `${fmt(min)} – ${fmt(max)}`;
+  if (min != null) return `${fmt(min)}+`;
+  return `up to ${fmt(max)}`;
+}
+
+function formatHoursRange(min, max) {
+  if (min == null && max == null) return '—';
+  if (min != null && max != null) return `${min}–${max} hrs/wk`;
+  if (min != null) return `${min}+ hrs/wk`;
+  return `<${max} hrs/wk`;
+}
+
+function editRate(rateId, currentRate, currentNotes) {
   openModal(`
-    <div class="modal-title">Add Tuition Rate</div>
+    <div class="modal-title">Edit Tuition Rate</div>
+    <p style="font-size:12.5px;color:var(--gray);margin-bottom:14px">
+      Update the weekly rate or notes. Other fields (age range, hours, description) are managed in code.
+    </p>
     <div class="form-row">
-      <div class="form-group"><label>Center</label>
-        <select id="rc">${CENTERS.map(c=>`<option>${c}</option>`).join('')}</select>
-      </div>
-      <div class="form-group"><label>Type</label>
-        <select id="rtype">
-          <option value="full_time">Full Time</option>
-          <option value="part_time">Part Time</option>
-          <option value="before_after">Before & After School</option>
-          <option value="drop_in">Drop-In / Hourly</option>
-        </select>
+      <div class="form-group"><label>Weekly Rate ($)</label>
+        <input id="er-rate" type="number" step="0.01" min="0" value="${currentRate.toFixed(2)}">
       </div>
     </div>
-    <div class="form-row">
-      <div class="form-group"><label>Label</label><input id="rlabel" placeholder="e.g. Full Time Infant"></div>
-      <div class="form-group"><label>Weekly Amount ($)</label><input id="rwkly" type="number" step="0.01" placeholder="0.00"></div>
+    <div class="form-group">
+      <label>Notes</label>
+      <input id="er-notes" type="text" value="${currentNotes}" placeholder="Optional">
     </div>
     <div class="modal-footer">
       <button class="btn btn-ghost" onclick="closeModal()">Cancel</button>
-      <button class="btn btn-primary" onclick="saveRate()">Add Rate</button>
+      <button class="btn btn-primary" onclick="saveRate(${rateId})">Save</button>
     </div>`);
 }
 
-async function saveRate() {
-  const data = {
-    center: document.getElementById('rc').value,
-    rate_type: document.getElementById('rtype').value,
-    label: document.getElementById('rlabel').value.trim(),
-    weekly_amount: parseFloat(document.getElementById('rwkly').value)||null,
-    hourly_rate: 8.00,
-  };
-  if (!data.label) return toast('Label required','error');
+async function saveRate(rateId) {
+  const rate = parseFloat(document.getElementById('er-rate').value);
+  const notes = document.getElementById('er-notes').value.trim();
+  if (!rate || rate <= 0) return toast('Enter a positive weekly rate', 'error');
   try {
-    await api('POST', '/tuition-rates', data);
-    toast('Rate added','success');
+    await api('PUT', `/tuition-rates/${rateId}`, { weekly_rate: rate, notes });
+    toast('Rate updated', 'success');
     closeModal();
     pages['tuition-rates']();
-  } catch(e) { toast('Error: '+e.message,'error'); }
+  } catch (e) {
+    toast('Error: ' + e.message, 'error');
+  }
 }
 
 // ── CDC Filing Wizard ─────────────────────────────────────────────────────────
@@ -2445,6 +2477,31 @@ pages['import-roster'] = () => {
     ${centerSelector('document.getElementById("ir-center-label").textContent=currentCenter')}
 
     <div class="card">
+      <div class="card-title">👨‍👩‍👧 Import Guardian Contacts</div>
+      <p style="font-size:13.5px;color:var(--gray);margin-bottom:14px;line-height:1.7">
+        Upload the Playground guardian export to populate parent contact info on each child's record
+        and <strong>auto-link past-due families</strong> to their roster children. Format is auto-detected.
+      </p>
+
+      <details style="margin-bottom:14px;font-size:13px">
+        <summary style="cursor:pointer;color:var(--blue);font-weight:500">Where to find these exports in Playground</summary>
+        <ul style="margin-top:10px;padding-left:22px;color:var(--gray);line-height:1.9">
+          <li><strong>Montessori (MCC):</strong> Reports → Guardian Contacts (columns: Last name, First name, Relationship, Last Name, First Name, Phone, Email)</li>
+          <li><strong>Peace:</strong> Reports → Guardians export (columns include: First Name, Last Name, Email, Relationship, Students, Account Number, Cell Phone, Role)</li>
+          <li><strong>MCC alternative:</strong> Check-in Authorization List (columns: Signed up, Name, Students, Relationship, Permission Level, Email, Phone, Family #)</li>
+        </ul>
+      </details>
+
+      <div class="upload-zone" onclick="document.getElementById('ig-file').click()">
+        <div style="font-size:40px">👨‍👩‍👧</div>
+        <p><strong>Click to upload Guardian Contacts CSV</strong></p>
+        <p style="font-size:12px;color:var(--gray)">Format auto-detected · Importing for ${currentCenter}</p>
+      </div>
+      <input type="file" id="ig-file" accept=".csv" onchange="handleGuardianUpload(this)">
+      <div id="ig-result" style="margin-top:18px"></div>
+    </div>
+
+    <div class="card">
       <div class="card-title">📥 Bulk Import from Playground CSV</div>
       <p style="font-size:13.5px;color:var(--gray);margin-bottom:16px;line-height:1.7">
         Upload the Playground children export for <strong id="ir-center-label">${currentCenter}</strong>.
@@ -2490,6 +2547,86 @@ pages['import-roster'] = () => {
 };
 
 let LAST_ROSTER_FILE = null;
+
+async function handleGuardianUpload(input) {
+  const file = input.files[0];
+  if (!file) return;
+  const fd = new FormData();
+  fd.append('file', file);
+  fd.append('center', currentCenter);
+
+  const resDiv = document.getElementById('ig-result');
+  resDiv.innerHTML = '<div class="loading">Parsing and matching guardians…</div>';
+
+  try {
+    const r = await uploadFile('/upload/guardians', fd);
+    const formatLabels = {
+      mcc_guardian: 'MCC Guardian Contacts',
+      peace: 'Peace Guardians',
+      mcc_checkin: 'MCC Check-in Authorization',
+    };
+    const fmt = formatLabels[r.format_detected] || r.format_detected;
+
+    resDiv.innerHTML = `
+      <div style="background:var(--green-light);border:1px solid var(--green);border-radius:8px;padding:16px">
+        <strong style="color:var(--green)">✅ Guardians imported</strong>
+        <span style="font-size:12px;color:var(--gray);margin-left:8px">Format: ${fmt} · ${r.elapsed_ms}ms</span>
+
+        <div style="display:grid;grid-template-columns:repeat(auto-fit,minmax(120px,1fr));gap:8px;margin-top:12px">
+          <div style="padding:10px;background:var(--white);border-radius:6px;text-align:center">
+            <div style="font-size:22px;font-weight:600;color:var(--navy)">${r.rows_processed}</div>
+            <div style="font-size:11px;color:var(--gray);text-transform:uppercase;letter-spacing:.5px">Rows read</div>
+          </div>
+          <div style="padding:10px;background:var(--white);border-radius:6px;text-align:center">
+            <div style="font-size:22px;font-weight:600;color:var(--green)">${r.guardians_inserted}</div>
+            <div style="font-size:11px;color:var(--gray);text-transform:uppercase;letter-spacing:.5px">Guardians saved</div>
+          </div>
+          <div style="padding:10px;background:var(--white);border-radius:6px;text-align:center">
+            <div style="font-size:22px;font-weight:600;color:var(--navy)">${r.children_updated}</div>
+            <div style="font-size:11px;color:var(--gray);text-transform:uppercase;letter-spacing:.5px">Kids w/ contact</div>
+          </div>
+          <div style="padding:10px;background:var(--cream);border-radius:6px;text-align:center;border:2px solid var(--gold)">
+            <div style="font-size:22px;font-weight:600;color:var(--gold)">${r.auto_linked_families}</div>
+            <div style="font-size:11px;color:var(--gold);text-transform:uppercase;letter-spacing:.5px">Past-due auto-linked</div>
+          </div>
+          ${r.unmatched_children_count > 0 ? `
+            <div style="padding:10px;background:var(--red-light);border-radius:6px;text-align:center">
+              <div style="font-size:22px;font-weight:600;color:var(--red)">${r.unmatched_children_count}</div>
+              <div style="font-size:11px;color:var(--red);text-transform:uppercase;letter-spacing:.5px">Unmatched</div>
+            </div>
+          ` : ''}
+        </div>
+
+        ${r.unmatched_children_count > 0 ? `
+          <details style="margin-top:14px">
+            <summary style="cursor:pointer;font-size:13px;color:var(--gray)">
+              Why ${r.unmatched_children_count} unmatched? (children in CSV but not in current roster)
+            </summary>
+            <div style="margin-top:8px;padding:10px;background:var(--white);border-radius:4px;font-size:12px;color:var(--gray);font-family:monospace">
+              ${r.unmatched_sample.slice(0, 10).join(', ')}${r.unmatched_sample.length < r.unmatched_children_count ? ` <em>… and ${r.unmatched_children_count - r.unmatched_sample.length} more</em>` : ''}
+            </div>
+            <p style="margin-top:8px;font-size:12.5px;color:var(--gray)">
+              Tip: Import your roster first (below) so the names exist before importing guardians.
+            </p>
+          </details>
+        ` : ''}
+
+        ${r.auto_linked_families > 0 ? `
+          <div style="margin-top:14px;padding-top:12px;border-top:1px solid rgba(30,132,73,0.2)">
+            <button class="btn btn-sm btn-primary" onclick="showPage('collections-families')">
+              View ${r.auto_linked_families} auto-linked past-due ${r.auto_linked_families === 1 ? 'family' : 'families'} →
+            </button>
+          </div>
+        ` : ''}
+      </div>`;
+    toast(`${r.guardians_inserted} guardians imported · ${r.auto_linked_families} families auto-linked`, 'success');
+  } catch (e) {
+    resDiv.innerHTML = `<div style="background:var(--red-light);border:1px solid var(--red);border-radius:8px;padding:14px;color:var(--red)">
+      <strong>Error:</strong> ${e.message}
+    </div>`;
+  }
+  input.value = ''; // reset so re-upload works
+}
 
 async function handleRosterPreview(input) {
   const file = input.files[0];
