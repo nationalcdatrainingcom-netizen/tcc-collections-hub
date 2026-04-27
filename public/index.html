@@ -3169,20 +3169,27 @@ async function openFamilyDetail(id) {
               </div>
             </div>
             <div style="background:var(--blue-light);border:1px solid var(--blue);border-radius:8px;padding:16px;margin-bottom:12px">
-              <div style="font-weight:600;color:var(--navy);margin-bottom:6px">💙 Pay What You Can (min $25)</div>
+              <div style="font-weight:600;color:var(--navy);margin-bottom:6px">💙 Monthly Payment Plan (min $25/month, recurring)</div>
               <div style="display:flex;gap:8px;align-items:center">
                 <input type="text" readonly value="${family.paywhatyoucan_link_url}" style="flex:1;font-size:12px" onclick="this.select()">
                 <button class="btn btn-sm btn-primary" onclick="copyText('${family.paywhatyoucan_link_url}')">Copy</button>
                 <a class="btn btn-sm btn-ghost" href="${family.paywhatyoucan_link_url}" target="_blank">Open</a>
               </div>
+              <div style="font-size:11px;color:var(--gray);margin-top:6px">
+                Family enters their monthly amount ($25 min). Stripe auto-charges monthly until the balance is paid off,
+                then we cancel the subscription automatically.
+              </div>
             </div>
-            <div style="display:flex;gap:8px">
+            <div style="display:flex;gap:8px;flex-wrap:wrap">
+              <button class="btn btn-sm btn-primary" onclick="sendPaymentEmail(${family.id})">✉ Send Email to Family</button>
               <button class="btn btn-sm btn-ghost" onclick="regenerateLinks(${family.id})">♻ Regenerate Links</button>
               <button class="btn btn-sm btn-ghost" onclick="deactivateLinks(${family.id})" style="color:var(--red)">🗑 Deactivate Links</button>
             </div>
           ` : `
             <p style="color:var(--gray);font-size:13px;margin-bottom:14px">
-              Click below to generate two Stripe payment links: a 50%-off pay-in-full link and a flexible "pay what you can" link ($25 minimum).
+              Click below to generate two Stripe payment links:
+              a <strong>50%-off pay-in-full</strong> link, and a <strong>recurring monthly subscription</strong>
+              ($25/month minimum) the family can self-cancel.
             </p>
             <button class="btn btn-gold" onclick="generateLinks(${family.id})">Generate Stripe Payment Links</button>
           `}
@@ -3563,6 +3570,52 @@ async function deactivateLinks(familyId) {
     toast('Links deactivated','success');
     openFamilyDetail(familyId);
   } catch (e) { toast('Error: '+e.message,'error'); }
+}
+
+async function sendPaymentEmail(familyId) {
+  // Look up the family detail to suggest a default recipient
+  const detail = window.__FAMILY_DETAIL?.family
+    ? window.__FAMILY_DETAIL
+    : await api('GET', `/collections/families/${familyId}`);
+  const fam = detail.family;
+  const linkedEmail = (detail.linked_children || []).find(c => c.parent_email)?.parent_email;
+  const defaultEmail = fam.primary_contact_email || linkedEmail || '';
+
+  openModal(`
+    <div class="modal-title">Send Payment Link Email</div>
+    <p style="font-size:13px;color:var(--gray);margin-bottom:14px;line-height:1.6">
+      This will email <strong>${fam.family_name}</strong> a branded message with both payment options:
+      the <strong>50% pay-in-full</strong> discount and the <strong>$25/month minimum subscription</strong>.
+    </p>
+
+    <div class="form-group">
+      <label>Recipient Email</label>
+      <input id="sem-to" type="email" value="${defaultEmail}" placeholder="parent@example.com">
+      ${defaultEmail ? `<div style="font-size:11px;color:var(--gray);margin-top:4px">From ${fam.primary_contact_email ? 'family record' : 'linked child'}. Edit if needed.</div>` : ''}
+    </div>
+
+    <div style="background:var(--cream);border-left:3px solid var(--gold);padding:10px 14px;border-radius:6px;font-size:12.5px;color:var(--navy);line-height:1.6;margin-bottom:14px">
+      <strong>What gets sent:</strong> Branded HTML email from TCC Billing with both payment links,
+      the 50% discount amount, and a friendly note inviting them to call if they need a different arrangement.
+    </div>
+
+    <div class="modal-footer">
+      <button class="btn btn-ghost" onclick="closeModal()">Cancel</button>
+      <button class="btn btn-primary" onclick="confirmSendEmail(${familyId})">Send Email</button>
+    </div>`);
+}
+
+async function confirmSendEmail(familyId) {
+  const to = document.getElementById('sem-to').value.trim();
+  if (!to || !to.includes('@')) return toast('Enter a valid email address', 'error');
+  try {
+    const r = await api('POST', `/collections/families/${familyId}/send-email`, { to });
+    toast(`Email sent to ${r.to}`, 'success');
+    closeModal();
+    openFamilyDetail(familyId);
+  } catch (e) {
+    toast('Send failed: ' + e.message, 'error');
+  }
 }
 
 function editFamily(family) {
