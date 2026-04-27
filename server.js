@@ -207,16 +207,6 @@ async function initDB() {
       created_at TIMESTAMPTZ DEFAULT NOW()
     );
 
-    CREATE TABLE IF NOT EXISTS tuition_rates (
-      id SERIAL PRIMARY KEY,
-      center TEXT NOT NULL,
-      rate_type TEXT NOT NULL,
-      label TEXT NOT NULL,
-      weekly_amount NUMERIC(10,2),
-      hourly_rate NUMERIC(10,2) DEFAULT 8.00,
-      created_at TIMESTAMPTZ DEFAULT NOW()
-    );
-
     CREATE TABLE IF NOT EXISTS billing_periods (
       id SERIAL PRIMARY KEY,
       period_number TEXT UNIQUE NOT NULL,
@@ -316,6 +306,62 @@ async function initDB() {
     ALTER TABLE children ADD COLUMN IF NOT EXISTS parent_email TEXT;
     ALTER TABLE children ADD COLUMN IF NOT EXISTS parent_phone TEXT;
     ALTER TABLE children ADD COLUMN IF NOT EXISTS parent_name TEXT;
+
+    -- Tuition rate sheets, seeded from the official center rate sheets.
+    -- One row per program tier per center. The billing engine reads these
+    -- to compute what a family should be charged for a given week/period.
+    -- If a legacy version of this table exists (with rate_type/weekly_amount
+    -- columns), drop it so the new schema applies cleanly. The table is
+    -- never written to except by the seeded rates loader, so no data is lost.
+    DO $migrate$
+    BEGIN
+      IF EXISTS (SELECT 1 FROM information_schema.columns
+                 WHERE table_name='tuition_rates' AND column_name='rate_type') THEN
+        DROP TABLE tuition_rates CASCADE;
+      END IF;
+    END
+    $migrate$;
+
+    CREATE TABLE IF NOT EXISTS tuition_rates (
+      id SERIAL PRIMARY KEY,
+      center TEXT NOT NULL,
+      program_key TEXT NOT NULL,
+      description TEXT NOT NULL,
+      weekly_rate NUMERIC(10,2) NOT NULL,
+      age_min_months INTEGER,
+      age_max_months INTEGER,
+      hours_min NUMERIC(5,2),
+      hours_max NUMERIC(5,2),
+      effective_date DATE NOT NULL DEFAULT '2025-01-01',
+      notes TEXT,
+      active BOOLEAN DEFAULT true,
+      UNIQUE(center, program_key, effective_date)
+    );
+
+    -- Guardian / parent contact records imported from Playground guardian exports.
+    -- A child has 1..N guardians (parent, grandmother, family friend, etc.).
+    -- The is_primary flag marks the primary guardian (first "Parent" role or
+    -- explicit "Primary Guardian" role). Auto-linking past-due families uses
+    -- the primary guardian.
+    CREATE TABLE IF NOT EXISTS guardians (
+      id SERIAL PRIMARY KEY,
+      center TEXT NOT NULL,
+      child_id INTEGER REFERENCES children(id) ON DELETE CASCADE,
+      child_first TEXT,
+      child_last TEXT,
+      guardian_first TEXT,
+      guardian_last TEXT,
+      relationship TEXT,
+      email TEXT,
+      phone TEXT,
+      role TEXT,
+      is_primary BOOLEAN DEFAULT false,
+      source_account_number TEXT,
+      created_at TIMESTAMPTZ DEFAULT NOW(),
+      UNIQUE(center, child_id, guardian_first, guardian_last, relationship)
+    );
+    CREATE INDEX IF NOT EXISTS idx_guardians_child ON guardians(child_id);
+    CREATE INDEX IF NOT EXISTS idx_guardians_name ON guardians(LOWER(guardian_last), LOWER(guardian_first));
   `);
 
   // Seed billing periods from the official MiLEAP CDC 2026 Payment Schedule.
@@ -366,6 +412,64 @@ async function initDB() {
       [p,s,e,r,r4,c,cDelayed]
     );
   }
+  // Seed tuition rates from the 2025 rate sheets (Niles, St. Joseph/Peace, MCC 2025-26).
+  // Each center uses its own sheet exclusively. Rates are upserted on every boot so
+  // corrections to the rate sheets propagate automatically.
+  const RATES_2025 = {
+    'Niles': [
+      // key, description, weekly_rate, age_min_mo, age_max_mo, hours_min, hours_max, notes
+      ['infant_toddler',        'Infants & Toddlers (Under 2½ years)',          352.00, 0,   30,  null, null, 'Full time, all under 2.5'],
+      ['older_twos_threes',     'Older Twos / Threes (2½ – under 3)',           248.50, 30,  36,  null, null, ''],
+      ['prek_preschool_part',   'Pre-K / Preschool (3–5) — Part-Time',          176.00, 36,  60,  0, 30, '<30 hrs/week'],
+      ['prek_preschool_full',   'Pre-K / Preschool (3–5) — Full-Time',          233.00, 36,  60,  30, null, '≥30 hrs/week'],
+      ['gsrp_wrap_mr',          'GSRP Wrap-Around Care M–R',                     62.00, null,null,null,null, '4-day wrap'],
+      ['gsrp_wrap_mf',          'GSRP Wrap-Around Care M–F',                     93.00, null,null,null,null, '5-day wrap'],
+      ['schoolage_ba',          'School-Age Before/After School (K–6)',          88.00, 60,  144, null,null, 'K–6th grade'],
+      ['schoolage_nonschool_part','School-Age Non-School Week <30 hrs',         160.50, 60,  144, 0, 30,   'Non-school week part-time'],
+      ['schoolage_nonschool_full','School-Age Non-School Week ≥30 hrs',         197.00, 60,  144, 30,null, 'Non-school week full-time'],
+      ['summer_camp',           'Summer Camp (includes activities)',            217.50, 60,  144, null,null, 'Summer only'],
+    ],
+    'Peace': [
+      ['infant_toddler',        'Infants & Toddlers (Under 2½) — Full-Time',    419.25, 0,   30,  null, null, 'Full time only'],
+      ['older_twos',            'Older Twos (2½ – under 3)',                    305.25, 30,  36,  null, null, ''],
+      ['prek_preschool_part',   'Pre-K / Preschool (2½–5) — Part-Time',         176.00, 30,  60,  0, 30, '<30 hrs/week'],
+      ['prek_preschool_full',   'Pre-K / Preschool (2½–5) — Full-Time',         233.00, 30,  60,  30, null, '≥30 hrs/week'],
+      ['gsrp_wrap_mr',          'GSRP Wrap-Around Care M–R',                     62.00, null,null,null,null, '4-day wrap'],
+      ['gsrp_wrap_mf',          'GSRP Wrap-Around Care M–F',                     98.50, null,null,null,null, '5-day wrap'],
+      ['schoolage_ba',          'School-Age Before/After School (K–6)',          88.00, 60,  144, null,null, 'K–6th grade'],
+      ['schoolage_nonschool_part','School-Age Non-School Week <30 hrs',         170.75, 60,  144, 0, 30,   'Non-school week part-time'],
+      ['schoolage_nonschool_full','School-Age Non-School Week ≥30 hrs',         202.00, 60,  144, 30,null, 'Non-school week full-time'],
+      ['summer_camp',           'Summer Camp (includes activities)',            233.00, 60,  144, null,null, 'Summer only'],
+    ],
+    'Montessori': [
+      ['under25_fullday',       'Under 2½ — Full Day (8am–5pm)',                400.00, 0,   30,  null, null, 'Annual $20,060 / Monthly $1,672'],
+      ['under25_extended',      'Under 2½ — Extended Day (7am–6pm)',            419.00, 0,   30,  null, null, 'Annual $21,535 / Monthly $1,794'],
+      ['preprimary_schoolday',  'Pre-Primary/Primary (2½–6) — School Day (8–3)', 280.00, 30,  72,  null, null, 'Annual $13,520 / Monthly $1,126.67'],
+      ['preprimary_extended',   'Pre-Primary/Primary (2½–6) — Extended (7–6)',   385.00, 30,  72,  null, null, 'Annual $19,500 / Monthly $1,625'],
+      ['summer_camp',           'School-Age Summer Camp 1st–6th',               233.00, 72,  144, null, null, 'Summer only'],
+      ['wrap_around',           'Wrap-Around (GSRP & Elementary) 7–8am & 3–6pm', 90.00, null,null,null, null, 'Monthly $380'],
+    ],
+  };
+  for (const [center, rows] of Object.entries(RATES_2025)) {
+    for (const r of rows) {
+      await pool.query(
+        `INSERT INTO tuition_rates
+           (center, program_key, description, weekly_rate, age_min_months, age_max_months, hours_min, hours_max, effective_date, notes)
+         VALUES ($1,$2,$3,$4,$5,$6,$7,$8,'2025-01-01',$9)
+         ON CONFLICT (center, program_key, effective_date) DO UPDATE SET
+           description=EXCLUDED.description,
+           weekly_rate=EXCLUDED.weekly_rate,
+           age_min_months=EXCLUDED.age_min_months,
+           age_max_months=EXCLUDED.age_max_months,
+           hours_min=EXCLUDED.hours_min,
+           hours_max=EXCLUDED.hours_max,
+           notes=EXCLUDED.notes,
+           active=true`,
+        [center, ...r]
+      );
+    }
+  }
+
   console.log('DB ready');
 }
 
@@ -1185,6 +1289,317 @@ function parseTime12(str) {
   } catch { return null; }
 }
 
+// ═════════════════════════════════════════════════════════════════════════════
+// ── Tuition Rates ────────────────────────────────────────────────────────────
+// ═════════════════════════════════════════════════════════════════════════════
+app.get('/api/tuition-rates', ssoAuth, async (req, res) => {
+  const { center } = req.query;
+  const params = [];
+  let q = `SELECT * FROM tuition_rates WHERE active=true`;
+  if (center) { params.push(center); q += ` AND center=$${params.length}`; }
+  q += ` ORDER BY center, weekly_rate DESC`;
+  const { rows } = await pool.query(q, params);
+  res.json(rows);
+});
+
+app.put('/api/tuition-rates/:id', ssoAuth, async (req, res) => {
+  const { weekly_rate, description, notes, active } = req.body;
+  const { rows } = await pool.query(
+    `UPDATE tuition_rates SET
+       weekly_rate = COALESCE($1::numeric, weekly_rate),
+       description = COALESCE($2, description),
+       notes = COALESCE($3, notes),
+       active = COALESCE($4::boolean, active)
+     WHERE id=$5 RETURNING *`,
+    [weekly_rate, description, notes, active, req.params.id]
+  );
+  if (!rows[0]) return res.status(404).json({ error: 'Rate not found' });
+  res.json(rows[0]);
+});
+
+// ═════════════════════════════════════════════════════════════════════════════
+// ── Guardians Import + Auto-Link ─────────────────────────────────────────────
+// ═════════════════════════════════════════════════════════════════════════════
+// Accepts any of three Playground guardian CSV formats:
+//   1. MCC "Guardian Contacts" export — columns: Last name, First name (child),
+//      Relationship, Last Name, First Name (guardian), Phone, Email
+//   2. Peace/St. Joseph export — columns: First Name, Last Name (guardian),
+//      Email, Relationship, Students, Account Number, Cell Phone, ..., Role
+//   3. MCC "Check-in Authorization" export — columns: Signed up, Name, Students,
+//      Relationship, Permission Level, Email, Phone, Family #
+//
+// For each row:
+//   • Parse child name(s) from the appropriate column
+//   • Parse guardian name/email/phone
+//   • Match to an existing child by (center, first_name, last_name), case-insensitive
+//   • Insert/update into `guardians`
+//   • For the primary guardian (first "Parent"/"Primary Guardian" role per child),
+//     populate `children.parent_name/parent_email/parent_phone`
+//   • After import, auto-link past-due families where their family_name matches
+//     the primary guardian's full name
+
+function detectGuardianCSVFormat(headers) {
+  const h = headers.map(x => x.trim());
+  // Format 1: MCC Guardian Contacts — has both capitalized and lowercase 'Last name'
+  if (h.includes('Last name') && h.includes('Last Name') && h.includes('Relationship') && h.includes('Email')) {
+    return 'mcc_guardian';
+  }
+  // Format 2: Peace — has Role column and Cell Phone
+  if (h.includes('Role') && h.includes('Cell Phone') && h.includes('Students')) {
+    return 'peace';
+  }
+  // Format 3: MCC Friday check-in auth — has Permission Level and Family #
+  if (h.includes('Permission Level') && h.includes('Family #')) {
+    return 'mcc_checkin';
+  }
+  return null;
+}
+
+function normalizeName(s) {
+  return String(s || '').trim().toLowerCase()
+    .normalize('NFD').replace(/[\u0300-\u036f]/g, '') // strip accents
+    .replace(/['\-]/g, '')                              // strip apostrophes and hyphens
+    .replace(/\s+/g, ' ');
+}
+
+function isPrimaryRelationship(relationship, role) {
+  const rel = String(relationship || '').toLowerCase();
+  const rl = String(role || '').toLowerCase();
+  if (rl.includes('primary guardian')) return true;
+  if (rel === 'parent' || rel === 'mother' || rel === 'father') return true;
+  return false;
+}
+
+// Extract child records from a single CSV row (different formats name children differently)
+function extractChildrenFromRow(row, format) {
+  if (format === 'mcc_guardian') {
+    const last = (row['Last name'] || '').trim();
+    const first = (row['First name'] || '').trim();
+    if (!last) return [];
+    return [{ first, last }];
+  }
+  if (format === 'peace') {
+    // "Ashton Morgan and Amiri Williams" → [{first:"Ashton",last:"Morgan"},{first:"Amiri",last:"Williams"}]
+    const students = (row['Students'] || '').trim();
+    if (!students) return [];
+    return students.split(/\s+and\s+/i).map(s => {
+      const parts = s.trim().split(/\s+/);
+      if (parts.length < 2) return { first: parts[0] || '', last: '' };
+      return { first: parts[0], last: parts.slice(1).join(' ') };
+    }).filter(c => c.last);
+  }
+  if (format === 'mcc_checkin') {
+    // "Students" is typically just last name, and "Name" is guardian full name
+    const last = (row['Students'] || '').trim();
+    if (!last) return [];
+    return [{ first: '', last }];
+  }
+  return [];
+}
+
+function extractGuardianFromRow(row, format) {
+  if (format === 'mcc_guardian') {
+    return {
+      first: (row['First Name'] || '').trim(),
+      last: (row['Last Name'] || '').trim(),
+      relationship: (row['Relationship'] || '').trim(),
+      role: '',
+      email: (row['Email'] || '').trim(),
+      phone: (row['Phone'] || '').trim(),
+      accountNumber: '',
+    };
+  }
+  if (format === 'peace') {
+    const phone = (row['Cell Phone'] || row['Work Phone'] || row['Other Phone'] || '').trim();
+    return {
+      first: (row['First Name'] || '').trim(),
+      last: (row['Last Name'] || '').trim(),
+      relationship: (row['Relationship'] || '').trim(),
+      role: (row['Role'] || '').trim(),
+      email: (row['Email'] || '').trim(),
+      phone,
+      accountNumber: (row['Account Number'] || '').trim(),
+    };
+  }
+  if (format === 'mcc_checkin') {
+    // "Name" is typically "firstname " with trailing space
+    const fullName = (row['Name'] || '').trim();
+    const parts = fullName.split(/\s+/);
+    return {
+      first: parts[0] || '',
+      last: parts.slice(1).join(' ') || '',
+      relationship: (row['Relationship'] || '').trim(),
+      role: (row['Permission Level'] || '').trim(),
+      email: (row['Email'] || '').trim(),
+      phone: (row['Phone'] || '').trim(),
+      accountNumber: (row['Family #'] || '').trim(),
+    };
+  }
+  return null;
+}
+
+app.post('/api/upload/guardians', ssoAuth, upload.single('file'), async (req, res) => {
+  const startTime = Date.now();
+  const { center } = req.body;
+  if (!req.file || !center) return res.status(400).json({ error: 'Missing center or file' });
+
+  let text = req.file.buffer.toString();
+  if (text.charCodeAt(0) === 0xFEFF) text = text.slice(1); // strip BOM
+  let records;
+  try {
+    records = parse(text, { columns: true, skip_empty_lines: true, trim: true });
+  } catch (e) { return res.status(400).json({ error: 'CSV parse error: ' + e.message }); }
+  if (!records.length) return res.status(400).json({ error: 'CSV is empty' });
+
+  const headers = Object.keys(records[0]);
+  const format = detectGuardianCSVFormat(headers);
+  if (!format) {
+    return res.status(400).json({
+      error: 'Unknown CSV format. Expected Playground Guardian Contacts, Peace Guardian, or Check-in Authorization export.',
+      headers_seen: headers,
+    });
+  }
+
+  // Preload all active children at this center for matching
+  const { rows: allKids } = await pool.query(
+    `SELECT id, first_name, last_name FROM children WHERE center=$1 AND is_active=true`,
+    [center]
+  );
+  const kidIndex = new Map();
+  for (const k of allKids) {
+    // Index by last-name-only AND by last+first — covers cases where CSV has no first name
+    const fullKey = `${normalizeName(k.first_name)}|${normalizeName(k.last_name)}`;
+    const lastKey = `${normalizeName(k.last_name)}`;
+    kidIndex.set(fullKey, k);
+    // For last-only matching, only index if unique; else leave null to avoid false matches
+    if (!kidIndex.has(lastKey)) kidIndex.set(lastKey, k);
+    else kidIndex.set(lastKey, null); // ambiguous
+  }
+
+  let rowsProcessed = 0, guardiansInserted = 0, childrenUpdated = 0, unmatched = 0;
+  const unmatchedNames = [];
+  const primaryByChild = new Map(); // child_id → first primary guardian info
+
+  for (const row of records) {
+    rowsProcessed++;
+    const kids = extractChildrenFromRow(row, format);
+    const guardian = extractGuardianFromRow(row, format);
+    if (!guardian || (!guardian.first && !guardian.last)) continue;
+
+    for (const kid of kids) {
+      // Find child: prefer full match, fall back to last-only if unambiguous
+      const fullKey = `${normalizeName(kid.first)}|${normalizeName(kid.last)}`;
+      const lastKey = `${normalizeName(kid.last)}`;
+      let childRow = kidIndex.get(fullKey);
+      if (!childRow && kid.first === '') childRow = kidIndex.get(lastKey);
+
+      if (!childRow) {
+        unmatched++;
+        if (unmatchedNames.length < 20) unmatchedNames.push(`${kid.first} ${kid.last}`.trim());
+        continue;
+      }
+
+      const isPrimary = isPrimaryRelationship(guardian.relationship, guardian.role);
+      try {
+        await pool.query(
+          `INSERT INTO guardians
+             (center, child_id, child_first, child_last, guardian_first, guardian_last,
+              relationship, email, phone, role, is_primary, source_account_number)
+           VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12)
+           ON CONFLICT (center, child_id, guardian_first, guardian_last, relationship) DO UPDATE SET
+             email = CASE WHEN EXCLUDED.email <> '' THEN EXCLUDED.email ELSE guardians.email END,
+             phone = CASE WHEN EXCLUDED.phone <> '' THEN EXCLUDED.phone ELSE guardians.phone END,
+             role = EXCLUDED.role,
+             is_primary = EXCLUDED.is_primary OR guardians.is_primary,
+             source_account_number = COALESCE(NULLIF(EXCLUDED.source_account_number, ''), guardians.source_account_number)`,
+          [center, childRow.id, childRow.first_name, childRow.last_name,
+           guardian.first, guardian.last, guardian.relationship,
+           guardian.email, guardian.phone, guardian.role, isPrimary, guardian.accountNumber]
+        );
+        guardiansInserted++;
+
+        // Remember the first primary guardian for each child to backfill children.parent_*
+        if (isPrimary && !primaryByChild.has(childRow.id)) {
+          primaryByChild.set(childRow.id, { guardian, childRow });
+        }
+      } catch (e) {
+        console.error('Guardian insert error:', e.message);
+      }
+    }
+  }
+
+  // Backfill parent_name / parent_email / parent_phone on children
+  for (const [childId, { guardian }] of primaryByChild) {
+    const fullName = `${guardian.first} ${guardian.last}`.trim();
+    await pool.query(
+      `UPDATE children SET
+         parent_name = COALESCE(NULLIF($1,''), parent_name),
+         parent_email = COALESCE(NULLIF($2,''), parent_email),
+         parent_phone = COALESCE(NULLIF($3,''), parent_phone)
+       WHERE id=$4`,
+      [fullName, guardian.email, guardian.phone, childId]
+    );
+    childrenUpdated++;
+  }
+
+  // ── Auto-link past-due families ────────────────────────────────────────────
+  // For every active past-due family at this center with no children linked yet,
+  // find roster children whose primary guardian's full name matches the
+  // family_name. Link them silently (per user preference).
+  let autoLinked = 0;
+  const { rows: activeFams } = await pool.query(
+    `SELECT id, family_name FROM collections_families
+     WHERE status='active' AND (center=$1 OR center IS NULL)`,
+    [center]
+  );
+  for (const fam of activeFams) {
+    // Skip families that already have linked children
+    const { rows: existing } = await pool.query(
+      `SELECT 1 FROM collections_family_children WHERE family_id=$1 LIMIT 1`, [fam.id]);
+    if (existing.length) continue;
+
+    // Find children whose parent_name matches the family name (normalized)
+    const famNorm = normalizeName(fam.family_name);
+    const { rows: candidates } = await pool.query(
+      `SELECT id, first_name, last_name, parent_name FROM children
+       WHERE center=$1 AND parent_name IS NOT NULL`,
+      [center]
+    );
+    const matches = candidates.filter(c => normalizeName(c.parent_name) === famNorm);
+    for (const m of matches) {
+      await pool.query(
+        `INSERT INTO collections_family_children (family_id, child_id)
+         VALUES ($1, $2) ON CONFLICT DO NOTHING`,
+        [fam.id, m.id]
+      );
+      autoLinked++;
+    }
+  }
+
+  const elapsedMs = Date.now() - startTime;
+  console.log(`[guardians upload] ${center} format=${format}: ${guardiansInserted} guardians, ${childrenUpdated} kids updated, ${autoLinked} auto-links (${elapsedMs}ms)`);
+
+  res.json({
+    format_detected: format,
+    rows_processed: rowsProcessed,
+    guardians_inserted: guardiansInserted,
+    children_updated: childrenUpdated,
+    auto_linked_families: autoLinked,
+    unmatched_children_count: unmatched,
+    unmatched_sample: unmatchedNames,
+    elapsed_ms: elapsedMs,
+  });
+});
+
+// List guardians for a child
+app.get('/api/children/:id/guardians', ssoAuth, async (req, res) => {
+  const { rows } = await pool.query(
+    `SELECT * FROM guardians WHERE child_id=$1 ORDER BY is_primary DESC, guardian_last, guardian_first`,
+    [req.params.id]
+  );
+  res.json(rows);
+});
+
 // ── Routes: Billing Engine ────────────────────────────────────────────────────
 app.get('/api/billing/calculate', ssoAuth, async (req, res) => {
   const { center, start_date, end_date } = req.query;
@@ -1397,22 +1812,6 @@ app.get('/api/dashboard', ssoAuth, async (req, res) => {
     childrenSummary: children.rows[0],
     overduePeriods: periods.rows,
   });
-});
-
-// ── Tuition Rates ─────────────────────────────────────────────────────────────
-app.get('/api/tuition-rates', ssoAuth, async (req, res) => {
-  const { rows } = await pool.query(`SELECT * FROM tuition_rates ORDER BY center,rate_type`);
-  res.json(rows);
-});
-
-app.post('/api/tuition-rates', ssoAuth, async (req, res) => {
-  const { center, rate_type, label, weekly_amount, hourly_rate } = req.body;
-  const { rows } = await pool.query(
-    `INSERT INTO tuition_rates (center,rate_type,label,weekly_amount,hourly_rate)
-     VALUES ($1,$2,$3,$4,$5) RETURNING *`,
-    [center, rate_type, label, weekly_amount, hourly_rate||8.00]
-  );
-  res.json(rows[0]);
 });
 
 // ═════════════════════════════════════════════════════════════════════════════
