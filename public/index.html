@@ -3194,17 +3194,19 @@ async function openFamilyDetail(id) {
               </div>
               <div style="font-size:11px;color:var(--gray);margin-top:6px">One-time payment. Account auto-settles on success.</div>
             </div>
-            <div style="background:var(--blue-light);border:1px solid var(--blue);border-radius:8px;padding:16px;margin-bottom:12px">
-              <div style="font-weight:600;color:var(--navy);margin-bottom:6px">💙 Monthly Payment Plan (recurring auto-charge)</div>
-              <div style="display:flex;gap:8px;align-items:center">
-                <input type="text" readonly value="${family.paywhatyoucan_link_url}" style="flex:1;font-size:12px" onclick="this.select()">
-                <button class="btn btn-sm btn-primary" onclick="copyText('${family.paywhatyoucan_link_url}')">Copy</button>
-                <a class="btn btn-sm btn-ghost" href="${family.paywhatyoucan_link_url}" target="_blank">Open</a>
+            ${family.paywhatyoucan_link_url ? `
+              <div style="background:var(--blue-light);border:1px solid var(--blue);border-radius:8px;padding:16px;margin-bottom:12px">
+                <div style="font-weight:600;color:var(--navy);margin-bottom:6px">💙 Monthly Payment Plan (recurring auto-charge)</div>
+                <div style="display:flex;gap:8px;align-items:center">
+                  <input type="text" readonly value="${family.paywhatyoucan_link_url}" style="flex:1;font-size:12px" onclick="this.select()">
+                  <button class="btn btn-sm btn-primary" onclick="copyText('${family.paywhatyoucan_link_url}')">Copy</button>
+                  <a class="btn btn-sm btn-ghost" href="${family.paywhatyoucan_link_url}" target="_blank">Open</a>
+                </div>
+                <div style="font-size:11px;color:var(--gray);margin-top:6px">
+                  Stripe auto-charges the family the configured monthly amount. We cancel the subscription automatically when the balance hits zero.
+                </div>
               </div>
-              <div style="font-size:11px;color:var(--gray);margin-top:6px">
-                Stripe auto-charges the family the configured monthly amount. We cancel the subscription automatically when the balance hits zero.
-              </div>
-            </div>
+            ` : ''}
             ${family.weekly_link_url ? `
               <div style="background:#f0f6e8;border:1px solid #6b8e23;border-radius:8px;padding:16px;margin-bottom:12px">
                 <div style="font-weight:600;color:var(--navy);margin-bottom:6px">🌱 Weekly Payment Plan (recurring auto-charge)</div>
@@ -3225,10 +3227,13 @@ async function openFamilyDetail(id) {
             </div>
           ` : `
             <p style="color:var(--gray);font-size:13px;margin-bottom:14px;line-height:1.7">
-              We'll generate <strong>three</strong> Stripe payment links for this family:
-              a <strong>50%-off pay-in-full</strong> (one-time), a <strong>monthly recurring</strong> auto-charge,
-              and a <strong>weekly recurring</strong> auto-charge. All recurring options have a $25 minimum —
-              even small payments are real recovery.
+              ${family.remaining_balance <= 600
+                ? `We'll generate <strong>three</strong> payment links for this small balance:
+                   <strong>50%-off pay-in-full</strong>, <strong>monthly recurring</strong>, and <strong>weekly recurring</strong>.`
+                : `We'll generate <strong>two</strong> payment links for this large balance:
+                   <strong>50%-off pay-in-full</strong> and <strong>weekly recurring</strong>.
+                   (Monthly is skipped because $25/mo would take more than 2 years on a balance over $600.)`}
+              All recurring options have a $25 minimum.
             </p>
             <button class="btn btn-gold" onclick="openGenerateLinksModal(${family.id}, ${family.remaining_balance})">Configure & Generate Payment Links</button>
           `}
@@ -3589,19 +3594,16 @@ function openGenerateLinksModal(familyId, balance) {
   const halfOff = balance / 2;
   const suggestedMonthly = Math.max(25, balance / 24);
   const suggestedWeekly = Math.max(25, balance / 104);
+  const isSmallBalance = balance <= 600;
 
   const fmt = (n) => n.toLocaleString('en-US', { minimumFractionDigits: 2, maximumFractionDigits: 2 });
-
-  // Calculate payoff time at the suggested amounts (purely informational)
-  const monthsAtMin = Math.ceil(balance / 25);
-  const weeksAtMin = Math.ceil(balance / 25);
-  const yearsAtWeeklyMin = (weeksAtMin / 52).toFixed(1);
 
   openModal(`
     <div class="modal-title">Generate Payment Links</div>
     <p style="font-size:13px;color:var(--gray);line-height:1.6;margin-bottom:14px">
-      All three payment options will be generated. Confirm or override the recurring amounts below.
-      Each option has a $25 minimum — even small payments are real recovery.
+      ${isSmallBalance
+        ? `This family's balance is <strong>$${fmt(balance)}</strong>, so all three options will be generated.`
+        : `This family's balance is <strong>$${fmt(balance)}</strong>. Since $25/month would take more than 2 years on this balance, only <strong>pay-in-full + weekly</strong> will be generated. Weekly at $25 minimum is more achievable.`}
     </p>
 
     <div style="background:#fff8e0;border:1px solid var(--gold);border-radius:6px;padding:12px 14px;margin-bottom:14px">
@@ -3611,46 +3613,42 @@ function openGenerateLinksModal(familyId, balance) {
     </div>
 
     <div class="form-row">
-      <div class="form-group">
-        <label>Monthly Amount ($)</label>
-        <input id="gl-monthly" type="number" step="0.01" min="25" value="${suggestedMonthly.toFixed(2)}">
-        <div style="font-size:11px;color:var(--gray);margin-top:4px">
-          Suggested: $${fmt(suggestedMonthly)}/mo · Min $25 · Balance ÷ 24 months
+      ${isSmallBalance ? `
+        <div class="form-group">
+          <label>Monthly Amount ($)</label>
+          <input id="gl-monthly" type="number" step="0.01" min="25" value="${suggestedMonthly.toFixed(2)}">
+          <div style="font-size:11px;color:var(--gray);margin-top:4px">
+            Suggested: $${fmt(suggestedMonthly)}/mo · Min $25
+          </div>
         </div>
-      </div>
+      ` : ''}
       <div class="form-group">
         <label>Weekly Amount ($)</label>
         <input id="gl-weekly" type="number" step="0.01" min="25" value="${suggestedWeekly.toFixed(2)}">
         <div style="font-size:11px;color:var(--gray);margin-top:4px">
-          Suggested: $${fmt(suggestedWeekly)}/wk · Min $25 · Balance ÷ 104 weeks
+          Suggested: $${fmt(suggestedWeekly)}/wk · Min $25
         </div>
       </div>
     </div>
 
-    ${balance > 600 ? '' : `
-      <div style="font-size:12px;color:var(--gray);font-style:italic;padding:8px 12px;background:var(--cream);border-radius:6px;margin-bottom:14px;line-height:1.5">
-        ℹ️ This is a small balance ($${fmt(balance)}). At the $25 minimum, monthly clears it in ${monthsAtMin} months;
-        weekly clears it in ${weeksAtMin} weeks. Most families on small balances will pick monthly or pay-in-full.
-      </div>
-    `}
-
     <div class="modal-footer">
       <button class="btn btn-ghost" onclick="closeModal()">Cancel</button>
-      <button class="btn btn-gold" onclick="confirmGenerateLinks(${familyId})">Generate Links</button>
+      <button class="btn btn-gold" onclick="confirmGenerateLinks(${familyId}, ${isSmallBalance})">Generate Links</button>
     </div>`);
 }
 
-async function confirmGenerateLinks(familyId) {
-  const monthlyDollars = parseFloat(document.getElementById('gl-monthly').value);
+async function confirmGenerateLinks(familyId, isSmallBalance) {
   const weeklyDollars = parseFloat(document.getElementById('gl-weekly').value);
-
-  if (isNaN(monthlyDollars) || monthlyDollars < 25) return toast('Monthly must be at least $25','error');
   if (isNaN(weeklyDollars) || weeklyDollars < 25) return toast('Weekly must be at least $25','error');
 
-  const body = {
-    monthly_cents: Math.round(monthlyDollars * 100),
-    weekly_cents: Math.round(weeklyDollars * 100),
-  };
+  const body = { weekly_cents: Math.round(weeklyDollars * 100) };
+
+  if (isSmallBalance) {
+    const monthlyEl = document.getElementById('gl-monthly');
+    const monthlyDollars = parseFloat(monthlyEl.value);
+    if (isNaN(monthlyDollars) || monthlyDollars < 25) return toast('Monthly must be at least $25','error');
+    body.monthly_cents = Math.round(monthlyDollars * 100);
+  }
 
   toast('Generating Stripe payment links…','info');
   closeModal();
@@ -3660,7 +3658,10 @@ async function confirmGenerateLinks(familyId) {
 
   try {
     await api('POST', `/collections/families/${familyId}/create-links`, body);
-    toast(`Links generated: 50%-off · $${monthlyDollars.toFixed(2)}/mo · $${weeklyDollars.toFixed(2)}/wk`, 'success');
+    const parts = ['50%-off'];
+    if (isSmallBalance) parts.push(`$${parseFloat(body.monthly_cents/100).toFixed(2)}/mo`);
+    parts.push(`$${weeklyDollars.toFixed(2)}/wk`);
+    toast(`Links generated: ${parts.join(' · ')}`, 'success');
     openFamilyDetail(familyId);
   } catch (e) {
     toast('Error: ' + (e.message || 'Failed to generate links'), 'error');
