@@ -271,6 +271,13 @@ async function initDB() {
     ALTER TABLE collections_families ADD COLUMN IF NOT EXISTS weekly_link_url TEXT;
     ALTER TABLE collections_families ADD COLUMN IF NOT EXISTS weekly_link_id TEXT;
 
+    -- Email unsubscribe tracking (RFC 2369 List-Unsubscribe + one-click List-Unsubscribe-Post)
+    -- A family who clicks unsubscribe in their email client never receives automated
+    -- emails again, but Mary can still manually email them if needed.
+    ALTER TABLE collections_families ADD COLUMN IF NOT EXISTS email_unsubscribed BOOLEAN DEFAULT false;
+    ALTER TABLE collections_families ADD COLUMN IF NOT EXISTS email_unsubscribed_at TIMESTAMPTZ;
+    ALTER TABLE collections_families ADD COLUMN IF NOT EXISTS email_unsubscribe_token TEXT;
+
     CREATE TABLE IF NOT EXISTS collections_payments (
       id SERIAL PRIMARY KEY,
       family_id INTEGER REFERENCES collections_families(id) ON DELETE CASCADE,
@@ -3465,7 +3472,8 @@ app.post('/api/collections/families/:id/deactivate-links', ssoAuth, async (req, 
 // Branded HTML email templates with both payment options. The subject line and
 // content are warm but firm — these go to families who left with a balance.
 function buildPaymentLinkEmail({ family, payInFullUrl, payInFullAmount,
-                                  monthlyUrl, monthlyAmount, weeklyUrl, weeklyAmount, fromName }) {
+                                  monthlyUrl, monthlyAmount, weeklyUrl, weeklyAmount,
+                                  fromName, unsubscribeUrl }) {
   // Use the primary guardian's first name if available, else fall back to family last name
   const greeting = (family.primary_guardian_first_name || family.family_name.split(/[\s,]+/)[0] || family.family_name).trim();
   const fmtMoney = (n) => {
@@ -3564,6 +3572,7 @@ function buildPaymentLinkEmail({ family, payInFullUrl, payInFullAmount,
       <tr><td style="background:#f7f5ef;padding:16px 32px;font-size:11px;color:#888;text-align:center;line-height:1.6">
         The Children's Center · 210 Main Street, Niles, MI 49120<br>
         219 Peace Boulevard, St. Joseph, MI 49085 · (269) 683-0405
+        ${unsubscribeUrl ? `<br><br><a href="${unsubscribeUrl}" style="color:#888;text-decoration:underline">Unsubscribe from these emails</a>` : ''}
       </td></tr>
 
     </table>
@@ -3614,6 +3623,11 @@ P.S. If these options don't quite fit, please reply to this email or call (269) 
 The Children's Center
 210 Main Street, Niles, MI 49120
 219 Peace Boulevard, St. Joseph, MI 49085`;
+  if (unsubscribeUrl) {
+    text += `
+
+To stop receiving these emails: ${unsubscribeUrl}`;
+  }
 
   return { subject, html, text };
 }
@@ -3690,6 +3704,27 @@ app.post('/api/collections/families/:id/send-email', ssoAuth, async (req, res) =
     console.warn('Could not fetch link prices:', e.message);
   }
 
+  // Block sends if family has unsubscribed
+  if (family.email_unsubscribed) {
+    return res.status(403).json({
+      error: `${family.family_name} has unsubscribed from automated emails. You can still email them manually outside this system.`,
+    });
+  }
+
+  // Generate a one-time unsubscribe token if this family doesn't have one yet.
+  // The token is used in the List-Unsubscribe header so a single click in the
+  // recipient's email client (Gmail's "Unsubscribe" button) opts them out instantly.
+  let unsubscribeToken = family.email_unsubscribe_token;
+  if (!unsubscribeToken) {
+    unsubscribeToken = require('crypto').randomBytes(24).toString('hex');
+    await pool.query(
+      `UPDATE collections_families SET email_unsubscribe_token=$1 WHERE id=$2`,
+      [unsubscribeToken, family.id]
+    );
+  }
+  const appUrl = process.env.APP_URL || 'https://tcc-collections-hub.onrender.com';
+  const unsubscribeUrl = `${appUrl}/api/collections/unsubscribe?token=${unsubscribeToken}`;
+
   const { subject, html, text } = buildPaymentLinkEmail({
     family,
     payInFullUrl: family.payinfull_link_url,
@@ -3699,6 +3734,7 @@ app.post('/api/collections/families/:id/send-email', ssoAuth, async (req, res) =
     weeklyUrl: family.weekly_link_url || null,
     weeklyAmount,
     fromName,
+    unsubscribeUrl,
   });
 
   try {
@@ -3708,6 +3744,12 @@ app.post('/api/collections/families/:id/send-email', ssoAuth, async (req, res) =
       subject, html, text,
       categories: ['collections', 'payment-link'],
       customArgs: { family_id: String(family.id) },
+      // RFC 8058 one-click unsubscribe — tells Gmail/Outlook to show their built-in
+      // Unsubscribe button. Massively boosts deliverability and reputation.
+      headers: {
+        'List-Unsubscribe': `<${unsubscribeUrl}>`,
+        'List-Unsubscribe-Post': 'List-Unsubscribe=One-Click',
+      },
     });
 
     // Log the send in the events table
@@ -3724,6 +3766,54 @@ app.post('/api/collections/families/:id/send-email', ssoAuth, async (req, res) =
     res.status(500).json({ error: `Email send failed: ${detail}` });
   }
 });
+
+// ── Unsubscribe endpoint (no auth required — accessed via email link) ────────
+// Both GET and POST are supported per RFC 8058. Email clients use POST for
+// one-click unsubscribe; humans hitting the URL use GET. Either way, the token
+// is the proof of authority — only the family receiving the email knows it.
+async function handleUnsubscribe(req, res) {
+  const token = (req.query.token || req.body?.token || '').trim();
+  if (!token) return res.status(400).send('Missing unsubscribe token.');
+
+  const { rows } = await pool.query(
+    `UPDATE collections_families SET
+       email_unsubscribed = true,
+       email_unsubscribed_at = NOW()
+     WHERE email_unsubscribe_token = $1
+     RETURNING id, family_name, email_unsubscribed_at`,
+    [token]
+  );
+
+  if (!rows[0]) return res.status(404).send('Unsubscribe link not found or already used.');
+
+  // Log the event
+  await pool.query(
+    `INSERT INTO collections_events (family_id, event_type, detail, created_at)
+     VALUES ($1, 'email_unsubscribed', $2, NOW())`,
+    [rows[0].id, `Unsubscribed via email link from ${req.ip || 'unknown'}`]
+  );
+
+  // Return a friendly confirmation page (HTML for human visitors)
+  res.send(`<!DOCTYPE html>
+<html><head><meta charset="UTF-8"><title>Unsubscribed</title>
+<style>
+  body { font-family:Helvetica,Arial,sans-serif; background:#f7f5ef; color:#1a2744; margin:0; padding:48px 16px; }
+  .card { max-width:480px; margin:0 auto; background:#fff; border-radius:8px; padding:32px; box-shadow:0 1px 3px rgba(0,0,0,.05); text-align:center; }
+  .check { font-size:48px; color:#1e8449; }
+  h1 { font-family:Georgia,serif; margin:8px 0; }
+  p { line-height:1.6; color:#555; }
+</style></head><body>
+<div class="card">
+  <div class="check">✓</div>
+  <h1>You've been unsubscribed</h1>
+  <p>Hi from The Children's Center — we've received your request and you won't receive automated emails from us anymore.</p>
+  <p>If you change your mind or have questions, please call <strong>(269) 683-0405</strong>. Thank you.</p>
+  <p style="margin-top:24px;font-size:12px;color:#888">Mary Wardlaw, Owner | The Children's Center</p>
+</div>
+</body></html>`);
+}
+app.get('/api/collections/unsubscribe', handleUnsubscribe);
+app.post('/api/collections/unsubscribe', handleUnsubscribe);
 
 // ── Transactions / Adjustments ───────────────────────────────────────────────
 const TXN_TYPES_REDUCING = new Set(['payment','credit','pay_in_full_discount']);
