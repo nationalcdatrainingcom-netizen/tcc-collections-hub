@@ -42,6 +42,27 @@ try {
   console.log('SendGrid module not installed — email sending will be unavailable');
 }
 
+// Twilio is optional — only used for SMS touches in the 7-touch outreach campaign.
+// If TWILIO_ACCOUNT_SID, TWILIO_AUTH_TOKEN, and TWILIO_FROM_NUMBER aren't set,
+// SMS touches are queued but skipped with status 'skipped_sms_disabled'.
+// When you set SMS_ENABLED=true in env vars, SMS touches will start sending.
+let twilio = null;
+try {
+  if (process.env.TWILIO_ACCOUNT_SID && process.env.TWILIO_AUTH_TOKEN) {
+    twilio = require('twilio')(process.env.TWILIO_ACCOUNT_SID, process.env.TWILIO_AUTH_TOKEN);
+    console.log('Twilio initialized');
+    if (process.env.SMS_ENABLED !== 'true') {
+      console.log('SMS sending DISABLED (set SMS_ENABLED=true after Twilio A2P 10DLC approves)');
+    } else {
+      console.log('SMS sending ENABLED');
+    }
+  } else {
+    console.log('Twilio disabled (TWILIO_ACCOUNT_SID/AUTH_TOKEN not set)');
+  }
+} catch (e) {
+  console.log('Twilio module not installed — SMS sending will be unavailable');
+}
+
 const app = express();
 const pool = new Pool({ connectionString: process.env.DATABASE_URL, ssl: { rejectUnauthorized: false } });
 const upload = multer({
@@ -125,6 +146,8 @@ app.get('/api/auth/mode', (req, res) => {
     capabilities: {
       stripe: !!stripe,
       sendgrid: !!sendgrid,
+      twilio: !!twilio,
+      sms_enabled: !!twilio && process.env.SMS_ENABLED === 'true',
     },
   });
 });
@@ -305,6 +328,45 @@ async function initDB() {
       raw_event JSONB,
       created_at TIMESTAMPTZ DEFAULT NOW()
     );
+
+    -- 7-touch outreach campaign system. When Mary clicks "Start Sequence" on a
+    -- family, an enrollment row is created and 7 touch rows are scheduled.
+    -- A background scheduler ticks every 15 minutes and fires due touches.
+    -- The sequence auto-stops on payment, settlement, or unsubscribe.
+    CREATE TABLE IF NOT EXISTS campaign_enrollments (
+      id SERIAL PRIMARY KEY,
+      family_id INTEGER REFERENCES collections_families(id) ON DELETE CASCADE,
+      cadence TEXT NOT NULL DEFAULT 'standard',  -- 'standard' (only one for now)
+      status TEXT NOT NULL DEFAULT 'active',     -- 'active', 'paused', 'completed', 'cancelled'
+      enrolled_at TIMESTAMPTZ DEFAULT NOW(),
+      paused_at TIMESTAMPTZ,
+      paused_reason TEXT,
+      completed_at TIMESTAMPTZ,
+      completed_reason TEXT,
+      last_payment_at TIMESTAMPTZ,
+      created_by TEXT,
+      UNIQUE(family_id)  -- only one active enrollment per family at a time
+    );
+    CREATE INDEX IF NOT EXISTS idx_enrollments_status ON campaign_enrollments(status);
+
+    CREATE TABLE IF NOT EXISTS campaign_touches (
+      id SERIAL PRIMARY KEY,
+      enrollment_id INTEGER REFERENCES campaign_enrollments(id) ON DELETE CASCADE,
+      family_id INTEGER REFERENCES collections_families(id) ON DELETE CASCADE,
+      touch_number INTEGER NOT NULL,             -- 1..7
+      channel TEXT NOT NULL,                     -- 'email' or 'sms'
+      scheduled_for TIMESTAMPTZ NOT NULL,
+      sent_at TIMESTAMPTZ,
+      send_status TEXT,                          -- 'sent', 'failed', 'skipped_sms_disabled', 'skipped_no_phone'
+      error_detail TEXT,
+      sendgrid_message_id TEXT,                  -- for click/open tracking
+      twilio_sid TEXT,                           -- for SMS delivery tracking
+      opened_at TIMESTAMPTZ,
+      clicked_at TIMESTAMPTZ,
+      created_at TIMESTAMPTZ DEFAULT NOW()
+    );
+    CREATE INDEX IF NOT EXISTS idx_touches_due ON campaign_touches(scheduled_for, sent_at) WHERE sent_at IS NULL;
+    CREATE INDEX IF NOT EXISTS idx_touches_enrollment ON campaign_touches(enrollment_id);
 
     -- Full audit-trail ledger for past-due families. Every charge, payment,
     -- adjustment, refund, and credit is one row here. Remaining balance is
@@ -3815,6 +3877,693 @@ async function handleUnsubscribe(req, res) {
 app.get('/api/collections/unsubscribe', handleUnsubscribe);
 app.post('/api/collections/unsubscribe', handleUnsubscribe);
 
+// ═════════════════════════════════════════════════════════════════════════════
+// ── 7-Touch Outreach Campaign Engine ─────────────────────────────────────────
+// ═════════════════════════════════════════════════════════════════════════════
+// Mary clicks "Start Sequence" on a family. We create an enrollment + 7 touches.
+// A scheduler ticks every 15 minutes and fires due touches. The sequence stops
+// automatically on payment, settlement, or unsubscribe. Mary can also pause/cancel.
+
+// Cadence: standard = 0/5/12/21/30/38/50 days
+// Touch types: 1,2,3,5,7 = email | 4,6 = sms
+const CAMPAIGN_TOUCHES = [
+  { number: 1, channel: 'email', day_offset: 0,  template: 'touch1_warm_letter' },
+  { number: 2, channel: 'email', day_offset: 5,  template: 'touch2_check_in' },
+  { number: 3, channel: 'email', day_offset: 12, template: 'touch3_small_steps' },
+  { number: 4, channel: 'sms',   day_offset: 21, template: 'touch4_sms_brief' },
+  { number: 5, channel: 'email', day_offset: 30, template: 'touch5_offer_reminder' },
+  { number: 6, channel: 'sms',   day_offset: 38, template: 'touch6_sms_final' },
+  { number: 7, channel: 'email', day_offset: 50, template: 'touch7_final_note' },
+];
+
+// ── Touch content templates ──────────────────────────────────────────────────
+// Each function takes (family, urls, amounts) and returns { subject, html, text }
+// for emails, or { text } for SMS.
+
+function campaignEmailLayout({ greeting, headerSubtitle, body, optionsHTML, closingHTML, unsubscribeUrl }) {
+  return `<!DOCTYPE html>
+<html><head><meta charset="UTF-8"></head>
+<body style="margin:0;padding:0;font-family:Helvetica,Arial,sans-serif;background:#f7f5ef;color:#1a2744">
+<table role="presentation" width="100%" cellpadding="0" cellspacing="0" style="background:#f7f5ef;padding:24px 0">
+  <tr><td align="center">
+    <table role="presentation" width="600" cellpadding="0" cellspacing="0" style="max-width:600px;background:#ffffff;border-radius:8px;overflow:hidden;box-shadow:0 1px 3px rgba(0,0,0,.05)">
+      <tr><td style="background:#1a2744;padding:24px 32px">
+        <div style="font-family:'Georgia',serif;font-size:22px;color:#ffffff">The Children's Center</div>
+        <div style="color:rgba(255,255,255,.7);font-size:13px;margin-top:4px">${headerSubtitle}</div>
+      </td></tr>
+      <tr><td style="padding:32px">
+        <p style="font-size:15px;line-height:1.7;margin:0 0 16px">Dear ${greeting},</p>
+        ${body}
+        ${optionsHTML}
+        ${closingHTML}
+      </td></tr>
+      <tr><td style="background:#f7f5ef;padding:16px 32px;font-size:11px;color:#888;text-align:center;line-height:1.6">
+        The Children's Center · 210 Main Street, Niles, MI 49120<br>
+        219 Peace Boulevard, St. Joseph, MI 49085 · (269) 683-0405
+        ${unsubscribeUrl ? `<br><br><a href="${unsubscribeUrl}" style="color:#888;text-decoration:underline">Unsubscribe from these emails</a>` : ''}
+      </td></tr>
+    </table>
+  </td></tr>
+</table>
+</body></html>`;
+}
+
+function buildOptionCards({ payInFullUrl, halfOff, savings, monthlyUrl, monthly, weeklyUrl, weekly, emphasis }) {
+  // emphasis: 'pay_in_full' | 'weekly' | null — controls which card has visual emphasis
+  const goldEmphasis = emphasis === 'pay_in_full';
+  const weeklyEmphasis = emphasis === 'weekly';
+
+  let html = `
+        <table role="presentation" width="100%" cellpadding="0" cellspacing="0" style="margin-bottom:14px;border:${goldEmphasis ? '3px' : '2px'} solid #c5a572;border-radius:8px;background:#fdfbf6">
+          <tr><td style="padding:20px">
+            <div style="font-size:11px;color:#c5a572;text-transform:uppercase;letter-spacing:1px;font-weight:500">${goldEmphasis ? '★ Limited time' : 'A one-time opportunity'}</div>
+            <div style="font-family:'Georgia',serif;font-size:20px;color:#1a2744;margin-top:6px">Settle at a reduced amount</div>
+            <p style="font-size:14px;line-height:1.5;margin:10px 0 16px;color:#555">
+              Pay <strong style="color:#c0392b">$${halfOff}</strong> now and we'll consider your account fully settled — a savings of <strong>$${savings}</strong>.
+            </p>
+            <a href="${payInFullUrl}" style="display:inline-block;background:#c5a572;color:#ffffff;font-weight:500;padding:10px 22px;border-radius:6px;text-decoration:none;font-size:14px">Pay $${halfOff} →</a>
+          </td></tr>
+        </table>`;
+
+  if (monthlyUrl) {
+    html += `
+        <table role="presentation" width="100%" cellpadding="0" cellspacing="0" style="margin-bottom:14px;border:1px solid #d4d4d4;border-radius:8px;background:#ffffff">
+          <tr><td style="padding:20px">
+            <div style="font-size:11px;color:#1a2744;text-transform:uppercase;letter-spacing:1px;font-weight:500">A simple monthly option</div>
+            <div style="font-family:'Georgia',serif;font-size:20px;color:#1a2744;margin-top:6px">Monthly payment plan</div>
+            <p style="font-size:14px;line-height:1.5;margin:10px 0 16px;color:#555">Just <strong>$${monthly}/month</strong>, charged automatically. Cancels itself when your balance is paid off.</p>
+            <a href="${monthlyUrl}" style="display:inline-block;background:#1a2744;color:#ffffff;font-weight:500;padding:10px 22px;border-radius:6px;text-decoration:none;font-size:14px">Set up $${monthly}/month →</a>
+          </td></tr>
+        </table>`;
+  }
+  if (weeklyUrl) {
+    html += `
+        <table role="presentation" width="100%" cellpadding="0" cellspacing="0" style="margin-bottom:20px;border:${weeklyEmphasis ? '3px solid #6b8e23' : '1px solid #d4d4d4'};border-radius:8px;background:${weeklyEmphasis ? '#f0f6e8' : '#ffffff'}">
+          <tr><td style="padding:20px">
+            <div style="font-size:11px;color:${weeklyEmphasis ? '#6b8e23' : '#1a2744'};text-transform:uppercase;letter-spacing:1px;font-weight:500">${weeklyEmphasis ? '★ Smaller, easier steps' : (monthlyUrl ? 'Or a smaller weekly option' : 'A simple weekly option')}</div>
+            <div style="font-family:'Georgia',serif;font-size:20px;color:#1a2744;margin-top:6px">Weekly payment plan</div>
+            <p style="font-size:14px;line-height:1.5;margin:10px 0 16px;color:#555">As low as <strong>$${weekly}/week</strong>, charged automatically. Cancels itself when your balance is paid off.</p>
+            <a href="${weeklyUrl}" style="display:inline-block;background:${weeklyEmphasis ? '#6b8e23' : '#1a2744'};color:#ffffff;font-weight:500;padding:10px 22px;border-radius:6px;text-decoration:none;font-size:14px">Set up $${weekly}/week →</a>
+          </td></tr>
+        </table>`;
+  }
+  return html;
+}
+
+function buildOptionPlaintext({ halfOff, savings, monthlyUrl, monthly, weeklyUrl, weekly, payInFullUrl }) {
+  let s = `\n★ A one-time opportunity — Settle at a reduced amount\nPay $${halfOff} now (savings of $${savings}).\n${payInFullUrl}\n`;
+  if (monthlyUrl) s += `\nA simple monthly option — $${monthly}/month\nCharged automatically. Cancels itself when your balance is paid off.\n${monthlyUrl}\n`;
+  if (weeklyUrl) s += `\n${monthlyUrl ? 'Or a smaller weekly option' : 'A simple weekly option'} — $${weekly}/week\nCharged automatically. Cancels itself when your balance is paid off.\n${weeklyUrl}\n`;
+  return s;
+}
+
+function buildTouchContent(touchTemplate, { greeting, halfOff, savings, monthly, weekly, payInFullUrl, monthlyUrl, weeklyUrl, unsubscribeUrl }) {
+  const optionsHTML = buildOptionCards({ payInFullUrl, halfOff, savings, monthlyUrl, monthly, weeklyUrl, weekly,
+    emphasis: touchTemplate === 'touch3_small_steps' ? 'weekly' : (touchTemplate === 'touch5_offer_reminder' ? 'pay_in_full' : null) });
+  const optionsText = buildOptionPlaintext({ halfOff, savings, monthlyUrl, monthly, weeklyUrl, weekly, payInFullUrl });
+
+  switch (touchTemplate) {
+    case 'touch1_warm_letter':
+      // (Already built — uses the existing buildPaymentLinkEmail function. We delegate.)
+      return null;
+
+    case 'touch2_check_in': {
+      const subject = `Just making sure my note came through`;
+      const body = `
+        <p style="font-size:15px;line-height:1.7;margin:0 0 16px">I sent a note last week and wanted to make sure it didn't get lost in your inbox. We'd love to help you close the loop on your account in a way that feels good.</p>
+        <p style="font-size:15px;line-height:1.7;margin:0 0 20px">Here are the options I mentioned, just in case:</p>`;
+      const closing = `
+        <p style="font-size:15px;line-height:1.7;margin:24px 0 16px">No pressure at all — just here to make this easy.</p>
+        <p style="font-size:15px;line-height:1.7;margin:0 0 4px">With appreciation,</p>
+        <p style="font-size:15px;line-height:1.7;margin:0;font-weight:500">Mary Wardlaw</p>
+        <p style="font-size:13px;line-height:1.7;margin:0;color:#555">Owner | The Children's Center</p>`;
+      return {
+        subject,
+        html: campaignEmailLayout({ greeting, headerSubtitle: 'A note from Mary Wardlaw', body, optionsHTML, closingHTML: closing, unsubscribeUrl }),
+        text: `Dear ${greeting},\n\nI sent a note last week and wanted to make sure it didn't get lost in your inbox. We'd love to help you close the loop on your account in a way that feels good.\n\nHere are the options I mentioned, just in case:\n${optionsText}\nNo pressure at all — just here to make this easy.\n\nWith appreciation,\nMary Wardlaw\nOwner | The Children's Center\n\n${unsubscribeUrl ? `To stop receiving these emails: ${unsubscribeUrl}\n` : ''}`,
+      };
+    }
+
+    case 'touch3_small_steps': {
+      const subject = `Sometimes a small step is the right step`;
+      const body = `
+        <p style="font-size:15px;line-height:1.7;margin:0 0 16px">One thing I love about our families is how much they value doing right by their commitments — even when life is busy.</p>
+        <p style="font-size:15px;line-height:1.7;margin:0 0 20px">If a big payment isn't possible right now, even <strong>$25 a week</strong> can quietly close this out over time. There's no judgment here, just a path forward whenever you're ready.</p>`;
+      const closing = `
+        <p style="font-size:15px;line-height:1.7;margin:24px 0 16px">Whatever pace works for your family, we're here for it.</p>
+        <p style="font-size:15px;line-height:1.7;margin:0 0 4px">With appreciation,</p>
+        <p style="font-size:15px;line-height:1.7;margin:0;font-weight:500">Mary Wardlaw</p>
+        <p style="font-size:13px;line-height:1.7;margin:0;color:#555">Owner | The Children's Center</p>`;
+      return {
+        subject,
+        html: campaignEmailLayout({ greeting, headerSubtitle: 'A note from Mary Wardlaw', body, optionsHTML, closingHTML: closing, unsubscribeUrl }),
+        text: `Dear ${greeting},\n\nOne thing I love about our families is how much they value doing right by their commitments — even when life is busy.\n\nIf a big payment isn't possible right now, even $25 a week can quietly close this out over time. There's no judgment here, just a path forward whenever you're ready.\n${optionsText}\nWhatever pace works for your family, we're here for it.\n\nWith appreciation,\nMary Wardlaw\nOwner | The Children's Center\n\n${unsubscribeUrl ? `To stop receiving these emails: ${unsubscribeUrl}\n` : ''}`,
+      };
+    }
+
+    case 'touch4_sms_brief': {
+      // SMS — keep under 320 chars (2 segments). No links to unsubscribe (SMS reply STOP is industry standard).
+      const text = `Hi ${greeting}, this is Mary from The Children's Center. Just wanted to reach out about your account — we have payment options as low as $25/week. Here's the link: ${payInFullUrl} — Mary. Reply STOP to opt out.`;
+      return { text };
+    }
+
+    case 'touch5_offer_reminder': {
+      const subject = `A reminder about the half-off option`;
+      const body = `
+        <p style="font-size:15px;line-height:1.7;margin:0 0 16px">I wanted to gently remind you about the special <strong>50%-off pay-in-full option</strong> I extended. It won't be available indefinitely, and I'd hate for you to miss the chance to settle for half of what's owed.</p>
+        <p style="font-size:15px;line-height:1.7;margin:0 0 20px">Pay in full today for just <strong>$${halfOff}</strong> — savings of <strong>$${savings}</strong>.</p>`;
+      const closing = `
+        <p style="font-size:15px;line-height:1.7;margin:24px 0 16px">Of course, the monthly and weekly options remain available too. Whatever works for your family.</p>
+        <p style="font-size:15px;line-height:1.7;margin:0 0 4px">With appreciation,</p>
+        <p style="font-size:15px;line-height:1.7;margin:0;font-weight:500">Mary Wardlaw</p>
+        <p style="font-size:13px;line-height:1.7;margin:0;color:#555">Owner | The Children's Center</p>`;
+      return {
+        subject,
+        html: campaignEmailLayout({ greeting, headerSubtitle: 'A note from Mary Wardlaw', body, optionsHTML, closingHTML: closing, unsubscribeUrl }),
+        text: `Dear ${greeting},\n\nI wanted to gently remind you about the special 50%-off pay-in-full option I extended. It won't be available indefinitely, and I'd hate for you to miss the chance to settle for half of what's owed.\n\nPay in full today for just $${halfOff} — savings of $${savings}.\n${optionsText}\nOf course, the monthly and weekly options remain available too. Whatever works for your family.\n\nWith appreciation,\nMary Wardlaw\nOwner | The Children's Center\n\n${unsubscribeUrl ? `To stop receiving these emails: ${unsubscribeUrl}\n` : ''}`,
+      };
+    }
+
+    case 'touch6_sms_final': {
+      const text = `Hi ${greeting}, Mary from The Children's Center. The 50% pay-in-full offer is still on the table — would love to help you close this out. Link: ${payInFullUrl} — Reply STOP to opt out.`;
+      return { text };
+    }
+
+    case 'touch7_final_note': {
+      const subject = `A final friendly note`;
+      const body = `
+        <p style="font-size:15px;line-height:1.7;margin:0 0 16px">I've reached out a few times now without hearing back, so I wanted to send one more note before we have to take the next step on your account.</p>
+        <p style="font-size:15px;line-height:1.7;margin:0 0 20px">The options I've shared remain available — including the pay-in-full discount. We'd genuinely rather work this out together than have to escalate, and I want to give you every opportunity to do so.</p>`;
+      const closing = `
+        <p style="font-size:15px;line-height:1.7;margin:24px 0 16px">If now isn't the right moment, please call me directly at <strong>(269) 683-0405</strong>. I'll personally work with you to find a way forward.</p>
+        <p style="font-size:15px;line-height:1.7;margin:0 0 4px">With appreciation,</p>
+        <p style="font-size:15px;line-height:1.7;margin:0;font-weight:500">Mary Wardlaw</p>
+        <p style="font-size:13px;line-height:1.7;margin:0;color:#555">Owner | The Children's Center</p>`;
+      return {
+        subject,
+        html: campaignEmailLayout({ greeting, headerSubtitle: 'A note from Mary Wardlaw', body, optionsHTML, closingHTML: closing, unsubscribeUrl }),
+        text: `Dear ${greeting},\n\nI've reached out a few times now without hearing back, so I wanted to send one more note before we have to take the next step on your account.\n\nThe options I've shared remain available — including the pay-in-full discount. We'd genuinely rather work this out together than have to escalate, and I want to give you every opportunity to do so.\n${optionsText}\nIf now isn't the right moment, please call me directly at (269) 683-0405. I'll personally work with you to find a way forward.\n\nWith appreciation,\nMary Wardlaw\nOwner | The Children's Center\n\n${unsubscribeUrl ? `To stop receiving these emails: ${unsubscribeUrl}\n` : ''}`,
+      };
+    }
+  }
+  return null;
+}
+
+// ── Campaign API endpoints ───────────────────────────────────────────────────
+// Start a 7-touch sequence for a family.
+// Touch 1 fires immediately (synchronously) so Mary sees confirmation right away.
+// Touches 2-7 are scheduled and fire via the background scheduler.
+app.post('/api/collections/families/:id/campaign/start', ssoAuth, async (req, res) => {
+  const family = await familyWithBalance(req.params.id);
+  if (!family) return res.status(404).json({ error: 'Family not found' });
+
+  // Pre-flight checks
+  if (family.status === 'settled') return res.status(400).json({ error: 'Family is already settled — no campaign needed.' });
+  if (family.email_unsubscribed) return res.status(400).json({ error: 'Family has unsubscribed.' });
+  if (!family.payinfull_link_url) return res.status(400).json({ error: 'Generate Stripe payment links first.' });
+
+  // Resolve recipient email
+  let toEmail = family.primary_contact_email;
+  if (!toEmail) {
+    const { rows } = await pool.query(
+      `SELECT c.parent_email FROM collections_family_children fc
+       JOIN children c ON c.id=fc.child_id
+       WHERE fc.family_id=$1 AND c.parent_email IS NOT NULL AND c.parent_email <> ''
+       LIMIT 1`, [req.params.id]);
+    toEmail = rows[0]?.parent_email;
+  }
+  if (!toEmail) return res.status(400).json({ error: 'No email on file. Add one before enrolling.' });
+
+  // Check if already enrolled (only one active enrollment per family at a time)
+  const existing = await pool.query(
+    `SELECT id, status FROM campaign_enrollments WHERE family_id=$1`, [req.params.id]);
+  if (existing.rows[0] && existing.rows[0].status === 'active') {
+    return res.status(409).json({ error: 'Family already has an active campaign. Cancel it first to restart.' });
+  }
+
+  // Create or revive enrollment
+  let enrollmentId;
+  if (existing.rows[0]) {
+    await pool.query(
+      `UPDATE campaign_enrollments SET status='active', enrolled_at=NOW(), paused_at=NULL,
+         paused_reason=NULL, completed_at=NULL, completed_reason=NULL, created_by=$1 WHERE id=$2`,
+      [req.user?.username || 'mary', existing.rows[0].id]);
+    enrollmentId = existing.rows[0].id;
+    // Clear old touches
+    await pool.query(`DELETE FROM campaign_touches WHERE enrollment_id=$1`, [enrollmentId]);
+  } else {
+    const { rows } = await pool.query(
+      `INSERT INTO campaign_enrollments (family_id, cadence, status, created_by)
+       VALUES ($1, 'standard', 'active', $2) RETURNING id`,
+      [req.params.id, req.user?.username || 'mary']);
+    enrollmentId = rows[0].id;
+  }
+
+  // Schedule all 7 touches relative to NOW
+  const now = new Date();
+  for (const t of CAMPAIGN_TOUCHES) {
+    const scheduledFor = new Date(now.getTime() + t.day_offset * 24 * 60 * 60 * 1000);
+    await pool.query(
+      `INSERT INTO campaign_touches (enrollment_id, family_id, touch_number, channel, scheduled_for)
+       VALUES ($1, $2, $3, $4, $5)`,
+      [enrollmentId, req.params.id, t.number, t.channel, scheduledFor]);
+  }
+
+  // Fire touch 1 synchronously (it's day 0 — Mary expects it sent right away)
+  const touch1Result = await fireTouch(enrollmentId, 1);
+
+  await pool.query(
+    `INSERT INTO collections_events (family_id, event_type, detail) VALUES ($1, 'campaign_started', $2)`,
+    [req.params.id, `7-touch sequence enrolled. Touch 1 ${touch1Result.success ? 'sent' : 'failed: ' + touch1Result.error}`]);
+
+  res.json({
+    enrollment_id: enrollmentId,
+    touch1_sent: touch1Result.success,
+    touch1_error: touch1Result.error,
+    next_touches_scheduled: CAMPAIGN_TOUCHES.length - 1,
+  });
+});
+
+app.post('/api/collections/families/:id/campaign/pause', ssoAuth, async (req, res) => {
+  const reason = (req.body.reason || '').trim() || 'Paused by Mary';
+  const { rows } = await pool.query(
+    `UPDATE campaign_enrollments SET status='paused', paused_at=NOW(), paused_reason=$1
+     WHERE family_id=$2 AND status='active' RETURNING id`,
+    [reason, req.params.id]);
+  if (!rows[0]) return res.status(404).json({ error: 'No active campaign to pause.' });
+  await pool.query(
+    `INSERT INTO collections_events (family_id, event_type, detail) VALUES ($1, 'campaign_paused', $2)`,
+    [req.params.id, reason]);
+  res.json({ paused: true });
+});
+
+app.post('/api/collections/families/:id/campaign/resume', ssoAuth, async (req, res) => {
+  const { rows } = await pool.query(
+    `UPDATE campaign_enrollments SET status='active', paused_at=NULL, paused_reason=NULL
+     WHERE family_id=$1 AND status='paused' RETURNING id`,
+    [req.params.id]);
+  if (!rows[0]) return res.status(404).json({ error: 'No paused campaign to resume.' });
+  await pool.query(
+    `INSERT INTO collections_events (family_id, event_type, detail) VALUES ($1, 'campaign_resumed', 'Resumed by Mary')`,
+    [req.params.id]);
+  res.json({ resumed: true });
+});
+
+app.post('/api/collections/families/:id/campaign/cancel', ssoAuth, async (req, res) => {
+  const reason = (req.body.reason || '').trim() || 'Cancelled by Mary';
+  const { rows } = await pool.query(
+    `UPDATE campaign_enrollments SET status='cancelled', completed_at=NOW(), completed_reason=$1
+     WHERE family_id=$2 AND status IN ('active','paused') RETURNING id`,
+    [reason, req.params.id]);
+  if (!rows[0]) return res.status(404).json({ error: 'No campaign to cancel.' });
+  await pool.query(
+    `INSERT INTO collections_events (family_id, event_type, detail) VALUES ($1, 'campaign_cancelled', $2)`,
+    [req.params.id, reason]);
+  res.json({ cancelled: true });
+});
+
+// Get campaign status for a family — used by the family detail UI.
+app.get('/api/collections/families/:id/campaign', ssoAuth, async (req, res) => {
+  const enrollment = await pool.query(
+    `SELECT * FROM campaign_enrollments WHERE family_id=$1`, [req.params.id]);
+  if (!enrollment.rows[0]) return res.json({ enrolled: false });
+  const touches = await pool.query(
+    `SELECT * FROM campaign_touches WHERE enrollment_id=$1 ORDER BY touch_number`,
+    [enrollment.rows[0].id]);
+  res.json({ enrolled: true, enrollment: enrollment.rows[0], touches: touches.rows });
+});
+
+// List all enrollments — used by the global "Active Campaigns" page.
+app.get('/api/campaigns/enrollments', ssoAuth, async (req, res) => {
+  const status = req.query.status || 'active';
+  const { rows } = await pool.query(
+    `SELECT e.*, f.family_name, f.center, f.original_balance,
+       (SELECT COUNT(*) FROM campaign_touches WHERE enrollment_id=e.id AND sent_at IS NOT NULL) AS sent_count,
+       (SELECT MIN(scheduled_for) FROM campaign_touches WHERE enrollment_id=e.id AND sent_at IS NULL) AS next_send_at
+     FROM campaign_enrollments e
+     JOIN collections_families f ON f.id=e.family_id
+     WHERE e.status=$1
+     ORDER BY e.enrolled_at DESC`, [status]);
+  res.json(rows);
+});
+
+// ── Touch firing logic ───────────────────────────────────────────────────────
+// Sends a single touch. Called synchronously when touch 1 starts a campaign,
+// or by the scheduler for touches 2-7.
+async function fireTouch(enrollmentId, touchNumber) {
+  const { rows: touchRows } = await pool.query(
+    `SELECT t.*, e.status AS enrollment_status, e.family_id
+     FROM campaign_touches t
+     JOIN campaign_enrollments e ON e.id = t.enrollment_id
+     WHERE t.enrollment_id=$1 AND t.touch_number=$2`,
+    [enrollmentId, touchNumber]);
+  const touch = touchRows[0];
+  if (!touch) return { success: false, error: 'Touch not found' };
+  if (touch.sent_at) return { success: false, error: 'Already sent' };
+  if (touch.enrollment_status !== 'active') return { success: false, error: 'Enrollment not active: ' + touch.enrollment_status };
+
+  // Re-fetch family fresh — auto-stop conditions may have changed since enrollment
+  const family = await familyWithBalance(touch.family_id);
+  if (!family) return { success: false, error: 'Family deleted' };
+
+  if (family.status === 'settled') {
+    await pool.query(`UPDATE campaign_enrollments SET status='completed', completed_at=NOW(), completed_reason='Family settled' WHERE id=$1`, [enrollmentId]);
+    return { success: false, error: 'Family settled — campaign completed' };
+  }
+  if (family.email_unsubscribed) {
+    await pool.query(`UPDATE campaign_enrollments SET status='completed', completed_at=NOW(), completed_reason='Family unsubscribed' WHERE id=$1`, [enrollmentId]);
+    return { success: false, error: 'Family unsubscribed — campaign completed' };
+  }
+
+  // Resolve content
+  const def = CAMPAIGN_TOUCHES.find(t => t.number === touchNumber);
+  if (!def) return { success: false, error: 'No touch definition' };
+
+  const greeting = await resolveGreeting(family);
+
+  // Common content data
+  const halfOff = (parseFloat(family.discount_pay_in_full) || 0).toLocaleString('en-US', { minimumFractionDigits: 2, maximumFractionDigits: 2 });
+  const savings = (parseFloat(family.remaining_balance) - parseFloat(family.discount_pay_in_full)).toLocaleString('en-US', { minimumFractionDigits: 2, maximumFractionDigits: 2 });
+
+  // Fetch monthly/weekly amounts from Stripe
+  let monthlyAmount = null, weeklyAmount = null;
+  try {
+    if (stripe && family.paywhatyoucan_link_id) {
+      const link = await stripe.paymentLinks.retrieve(family.paywhatyoucan_link_id, { expand: ['line_items.data.price'] });
+      const price = link.line_items?.data?.[0]?.price;
+      if (price?.unit_amount) monthlyAmount = price.unit_amount / 100;
+    }
+    if (stripe && family.weekly_link_id) {
+      const link = await stripe.paymentLinks.retrieve(family.weekly_link_id, { expand: ['line_items.data.price'] });
+      const price = link.line_items?.data?.[0]?.price;
+      if (price?.unit_amount) weeklyAmount = price.unit_amount / 100;
+    }
+  } catch (e) { /* ignore */ }
+
+  // Generate or fetch unsubscribe token
+  let unsubscribeToken = family.email_unsubscribe_token;
+  if (!unsubscribeToken) {
+    unsubscribeToken = require('crypto').randomBytes(24).toString('hex');
+    await pool.query(`UPDATE collections_families SET email_unsubscribe_token=$1 WHERE id=$2`,
+      [unsubscribeToken, family.id]);
+  }
+  const appUrl = process.env.APP_URL || 'https://tcc-collections-hub.onrender.com';
+  const unsubscribeUrl = `${appUrl}/api/collections/unsubscribe?token=${unsubscribeToken}`;
+
+  // ─── Email touches ───────────────────────────────────────────────────────
+  if (touch.channel === 'email') {
+    if (!sendgrid) {
+      await markTouchSkipped(touch.id, 'skipped_sendgrid_disabled', 'SendGrid not configured');
+      return { success: false, error: 'SendGrid not configured' };
+    }
+
+    // Resolve recipient
+    let toEmail = family.primary_contact_email;
+    if (!toEmail) {
+      const { rows: kids } = await pool.query(
+        `SELECT c.parent_email FROM collections_family_children fc
+         JOIN children c ON c.id=fc.child_id
+         WHERE fc.family_id=$1 AND c.parent_email IS NOT NULL AND c.parent_email <> ''
+         LIMIT 1`, [family.id]);
+      toEmail = kids[0]?.parent_email;
+    }
+    if (!toEmail) {
+      await markTouchSkipped(touch.id, 'skipped_no_email', 'No email on file');
+      return { success: false, error: 'No email on file' };
+    }
+
+    let content;
+    if (def.template === 'touch1_warm_letter') {
+      // Touch 1 uses the existing buildPaymentLinkEmail (Mary's warm letter)
+      family.primary_guardian_first_name = greeting;
+      content = buildPaymentLinkEmail({
+        family,
+        payInFullUrl: family.payinfull_link_url,
+        payInFullAmount: family.discount_pay_in_full,
+        monthlyUrl: family.paywhatyoucan_link_url || null,
+        monthlyAmount,
+        weeklyUrl: family.weekly_link_url || null,
+        weeklyAmount,
+        fromName: process.env.SENDGRID_FROM_NAME || "The Children's Center Billing",
+        unsubscribeUrl,
+      });
+    } else {
+      content = buildTouchContent(def.template, {
+        greeting,
+        halfOff,
+        savings,
+        monthly: monthlyAmount ? monthlyAmount.toLocaleString('en-US', { minimumFractionDigits: 2, maximumFractionDigits: 2 }) : null,
+        weekly: weeklyAmount ? weeklyAmount.toLocaleString('en-US', { minimumFractionDigits: 2, maximumFractionDigits: 2 }) : null,
+        payInFullUrl: family.payinfull_link_url,
+        monthlyUrl: family.paywhatyoucan_link_url || null,
+        weeklyUrl: family.weekly_link_url || null,
+        unsubscribeUrl,
+      });
+    }
+    if (!content) {
+      await markTouchSkipped(touch.id, 'failed', 'No template content');
+      return { success: false, error: 'No content generated' };
+    }
+
+    try {
+      const fromEmail = process.env.SENDGRID_FROM_EMAIL || 'billing@childrenscenterinc.com';
+      const fromName = process.env.SENDGRID_FROM_NAME || "The Children's Center Billing";
+      const result = await sendgrid.send({
+        to: toEmail,
+        from: { email: fromEmail, name: fromName },
+        subject: content.subject,
+        html: content.html,
+        text: content.text,
+        categories: ['collections', 'campaign', `touch-${touchNumber}`],
+        customArgs: { family_id: String(family.id), touch_number: String(touchNumber), enrollment_id: String(enrollmentId) },
+        headers: {
+          'List-Unsubscribe': `<${unsubscribeUrl}>`,
+          'List-Unsubscribe-Post': 'List-Unsubscribe=One-Click',
+        },
+      });
+      const messageId = result?.[0]?.headers?.['x-message-id'] || null;
+      await pool.query(
+        `UPDATE campaign_touches SET sent_at=NOW(), send_status='sent', sendgrid_message_id=$1 WHERE id=$2`,
+        [messageId, touch.id]);
+      await pool.query(
+        `INSERT INTO collections_events (family_id, event_type, detail) VALUES ($1, 'campaign_touch_sent', $2)`,
+        [family.id, `Touch ${touchNumber} email sent to ${toEmail}`]);
+      // Check if this was the last touch
+      await checkCampaignCompletion(enrollmentId);
+      return { success: true };
+    } catch (e) {
+      const detail = e?.response?.body?.errors?.map(x => x.message).join('; ') || e.message;
+      await markTouchSkipped(touch.id, 'failed', detail);
+      return { success: false, error: detail };
+    }
+  }
+
+  // ─── SMS touches ─────────────────────────────────────────────────────────
+  if (touch.channel === 'sms') {
+    // Skip if Twilio not set up OR SMS_ENABLED not turned on
+    if (!twilio || process.env.SMS_ENABLED !== 'true') {
+      const reason = !twilio ? 'Twilio not configured' : 'SMS_ENABLED not set to true (waiting on Twilio A2P approval)';
+      await markTouchSkipped(touch.id, 'skipped_sms_disabled', reason);
+      // Don't fail the campaign — just log and continue. The next touch will fire on schedule.
+      return { success: true, skipped: true, reason };
+    }
+
+    let toPhone = family.primary_contact_phone;
+    if (!toPhone) {
+      const { rows: kids } = await pool.query(
+        `SELECT c.parent_phone FROM collections_family_children fc
+         JOIN children c ON c.id=fc.child_id
+         WHERE fc.family_id=$1 AND c.parent_phone IS NOT NULL AND c.parent_phone <> ''
+         LIMIT 1`, [family.id]);
+      toPhone = kids[0]?.parent_phone;
+    }
+    if (!toPhone) {
+      await markTouchSkipped(touch.id, 'skipped_no_phone', 'No phone on file');
+      return { success: true, skipped: true, reason: 'No phone' };
+    }
+    // Normalize phone to E.164
+    const e164Phone = normalizePhone(toPhone);
+    if (!e164Phone) {
+      await markTouchSkipped(touch.id, 'skipped_no_phone', 'Phone not parseable');
+      return { success: true, skipped: true, reason: 'Phone format' };
+    }
+
+    const content = buildTouchContent(def.template, {
+      greeting,
+      halfOff, savings,
+      monthly: monthlyAmount ? monthlyAmount.toLocaleString('en-US', { minimumFractionDigits: 2, maximumFractionDigits: 2 }) : null,
+      weekly: weeklyAmount ? weeklyAmount.toLocaleString('en-US', { minimumFractionDigits: 2, maximumFractionDigits: 2 }) : null,
+      payInFullUrl: family.payinfull_link_url,
+      monthlyUrl: family.paywhatyoucan_link_url || null,
+      weeklyUrl: family.weekly_link_url || null,
+      unsubscribeUrl: null,  // SMS uses STOP keyword instead of URL
+    });
+
+    try {
+      const msg = await twilio.messages.create({
+        from: process.env.TWILIO_FROM_NUMBER,
+        to: e164Phone,
+        body: content.text,
+      });
+      await pool.query(
+        `UPDATE campaign_touches SET sent_at=NOW(), send_status='sent', twilio_sid=$1 WHERE id=$2`,
+        [msg.sid, touch.id]);
+      await pool.query(
+        `INSERT INTO collections_events (family_id, event_type, detail) VALUES ($1, 'campaign_touch_sent', $2)`,
+        [family.id, `Touch ${touchNumber} SMS sent to ${e164Phone}`]);
+      await checkCampaignCompletion(enrollmentId);
+      return { success: true };
+    } catch (e) {
+      await markTouchSkipped(touch.id, 'failed', e.message);
+      return { success: false, error: e.message };
+    }
+  }
+}
+
+async function markTouchSkipped(touchId, status, errorDetail) {
+  await pool.query(
+    `UPDATE campaign_touches SET sent_at=NOW(), send_status=$1, error_detail=$2 WHERE id=$3`,
+    [status, errorDetail, touchId]);
+}
+
+async function checkCampaignCompletion(enrollmentId) {
+  // If all 7 touches have a sent_at, mark enrollment completed.
+  const { rows } = await pool.query(
+    `SELECT COUNT(*) AS pending FROM campaign_touches WHERE enrollment_id=$1 AND sent_at IS NULL`,
+    [enrollmentId]);
+  if (parseInt(rows[0].pending) === 0) {
+    await pool.query(
+      `UPDATE campaign_enrollments SET status='completed', completed_at=NOW(),
+         completed_reason='All 7 touches delivered' WHERE id=$1 AND status='active'`,
+      [enrollmentId]);
+  }
+}
+
+// Side-effect hook: when a payment is received for a family, update the
+// enrollment record. Settlement is auto-detected by fireTouch (it re-checks
+// the family status before each touch and stops the sequence if settled).
+// This function additionally handles the "partial payment pauses sequence"
+// rule: if remaining_balance > 0 after a payment, the sequence pauses for
+// 30 days unless another payment comes through.
+async function onPaymentReceived(familyId, paymentAmount) {
+  const family = await familyWithBalance(familyId);
+  if (!family) return;
+
+  const { rows: enrollRows } = await pool.query(
+    `SELECT * FROM campaign_enrollments WHERE family_id=$1 AND status IN ('active','paused')`, [familyId]);
+  const enrollment = enrollRows[0];
+  if (!enrollment) return;
+
+  if (family.remaining_balance <= 0.01) {
+    // Settled — completed
+    await pool.query(
+      `UPDATE campaign_enrollments SET status='completed', completed_at=NOW(),
+         completed_reason='Family settled — payment cleared balance' WHERE id=$1`,
+      [enrollment.id]);
+    await pool.query(
+      `INSERT INTO collections_events (family_id, event_type, detail)
+       VALUES ($1, 'campaign_completed', $2)`,
+      [familyId, `Campaign completed (settled via $${paymentAmount.toFixed(2)} payment)`]);
+  } else {
+    // Partial payment — pause for 30 days.
+    // The scheduler will resume sending if no further payment within that window.
+    await pool.query(
+      `UPDATE campaign_enrollments SET status='paused', paused_at=NOW(),
+         paused_reason='Partial payment received — paused 30 days', last_payment_at=NOW()
+       WHERE id=$1`, [enrollment.id]);
+
+    // Push remaining touches out by 30 days
+    await pool.query(
+      `UPDATE campaign_touches SET scheduled_for = scheduled_for + INTERVAL '30 days'
+       WHERE enrollment_id=$1 AND sent_at IS NULL`, [enrollment.id]);
+
+    await pool.query(
+      `INSERT INTO collections_events (family_id, event_type, detail)
+       VALUES ($1, 'campaign_paused_partial_payment', $2)`,
+      [familyId, `Partial payment of $${paymentAmount.toFixed(2)}; campaign paused 30 days`]);
+
+    // Auto-resume after 30 days if no further payment — handled by scheduler:
+    // when scheduler ticks, we check paused enrollments and re-activate any
+    // whose paused_at is > 30 days ago.
+  }
+}
+
+async function resolveGreeting(family) {
+  // Use primary guardian first name if linked-children info populates parent_name.
+  const { rows } = await pool.query(
+    `SELECT c.parent_name FROM collections_family_children fc
+     JOIN children c ON c.id=fc.child_id
+     WHERE fc.family_id=$1 AND c.parent_name IS NOT NULL AND c.parent_name <> ''
+     LIMIT 1`, [family.id]);
+  if (rows[0]?.parent_name) {
+    const name = rows[0].parent_name.trim();
+    if (name.includes(',')) return name.split(',')[1]?.trim().split(/\s+/)[0] || family.family_name;
+    return name.split(/\s+/)[0] || family.family_name;
+  }
+  return family.family_name.split(/[\s,]+/)[0] || family.family_name;
+}
+
+function normalizePhone(phone) {
+  if (!phone) return null;
+  // Strip everything but digits
+  const digits = String(phone).replace(/\D/g, '');
+  if (digits.length === 10) return `+1${digits}`;
+  if (digits.length === 11 && digits.startsWith('1')) return `+${digits}`;
+  return null;
+}
+
+// ── Background scheduler ─────────────────────────────────────────────────────
+// Runs every 15 minutes. Finds due-and-unsent touches and fires them.
+// Volume-controlled: max 30 emails per tick to protect sender reputation.
+async function runCampaignScheduler() {
+  try {
+    // Step 1: Auto-resume any campaigns paused for partial payment if 30+ days elapsed
+    // and no further payment recorded.
+    await pool.query(`
+      UPDATE campaign_enrollments
+      SET status='active', paused_at=NULL,
+        paused_reason = 'Auto-resumed after 30 days no further payment'
+      WHERE status='paused'
+        AND paused_at IS NOT NULL
+        AND paused_at < NOW() - INTERVAL '30 days'
+        AND paused_reason LIKE '%Partial payment%'
+    `);
+
+    // Step 2: Fire due touches (max 30 per tick to protect sender reputation)
+    const { rows: due } = await pool.query(`
+      SELECT t.id, t.enrollment_id, t.touch_number, t.channel
+      FROM campaign_touches t
+      JOIN campaign_enrollments e ON e.id = t.enrollment_id
+      WHERE t.sent_at IS NULL
+        AND t.scheduled_for <= NOW()
+        AND e.status = 'active'
+      ORDER BY t.scheduled_for ASC
+      LIMIT 30`);
+    if (due.length === 0) return;
+    console.log(`[scheduler] firing ${due.length} due touches`);
+    for (const t of due) {
+      try {
+        await fireTouch(t.enrollment_id, t.touch_number);
+      } catch (e) {
+        console.error(`[scheduler] touch ${t.id} crashed:`, e.message);
+      }
+    }
+  } catch (e) {
+    console.error('[scheduler] tick failed:', e.message);
+  }
+}
+
+// Kick off the scheduler. Tick every 15 minutes (900 seconds).
+// Also runs once 30 seconds after server startup to catch any straggler from a restart.
+setTimeout(runCampaignScheduler, 30 * 1000);
+setInterval(runCampaignScheduler, 15 * 60 * 1000);
+
+// Manual trigger endpoint — useful for testing without waiting 15 min.
+app.post('/api/campaigns/scheduler/run-now', ssoAuth, async (req, res) => {
+  await runCampaignScheduler();
+  res.json({ ran: true });
+});
+
 // ── Transactions / Adjustments ───────────────────────────────────────────────
 const TXN_TYPES_REDUCING = new Set(['payment','credit','pay_in_full_discount']);
 const TXN_TYPES_INCREASING = new Set(['charge','refund']);
@@ -4145,6 +4894,8 @@ handleStripeEvent = async function(event) {
       [famId, amount, 'Monthly subscription payment',
        `Stripe invoice ${obj.id}`, piId]
     );
+    // Notify campaign engine — pause/complete sequence based on remaining balance
+    try { await onPaymentReceived(famId, amount); } catch (e) { console.error('onPaymentReceived failed:', e.message); }
     return;
   }
 
@@ -4197,6 +4948,8 @@ handleStripeEvent = async function(event) {
       );
     }
   }
+  // Notify campaign engine — pause/complete sequence based on remaining balance
+  try { await onPaymentReceived(familyId, amount); } catch (e) { console.error('onPaymentReceived failed:', e.message); }
 };
 
 
