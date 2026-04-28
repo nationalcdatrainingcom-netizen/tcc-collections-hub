@@ -4126,4 +4126,4 @@ app.get('*', (req, res) => res.sendFile(path.join(__dirname, 'public', 'index.ht
 initDB().then(() => {
   const PORT = process.env.PORT || 3000;
   app.listen(PORT, () => console.log(`TCC Billing Hub running on port ${PORT}`));
-}).catch(e => { console.error('DB init failed:', e); process.exit(1); });v
+}).catch(e => { console.error('DB init failed:', e); process.exit(1); });
