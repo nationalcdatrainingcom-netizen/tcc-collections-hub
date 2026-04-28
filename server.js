@@ -3303,13 +3303,21 @@ app.post('/api/collections/families/:id/create-links', ssoAuth, async (req, res)
   const remainingCents = Math.round(family.remaining_balance * 100);
   if (remainingCents <= 0) return res.status(400).json({ error: 'No remaining balance' });
 
-  // ─── Compute the three suggested amounts ─────────────────────────────────
+  // ─── Compute the suggested amounts ───────────────────────────────────────
   // Mary may override these via req.body { monthly_cents, weekly_cents }.
-  // All three options are always offered — even a small weekly payment from a
-  // family with a large balance is better than nothing. Families who can't manage
-  // a large monthly payment may find $25/week more achievable, even on a
-  // years-long horizon.
+  //
+  // Rule: Small balances (≤$600) show all three options. Big balances (>$600)
+  // show pay-in-full + weekly only — because $25/month would take more than
+  // 2 years on a >$600 balance, monthly stops being realistic. Weekly at $25
+  // is always achievable, even on huge balances ($25/wk × 52 = $1,300/yr —
+  // a $20K balance takes 16 years but it's real recovery vs. $0).
+  // Pay-in-full is always offered.
+  //
+  // Threshold rationale: $25/month × 24 months = $600. If balance ≤ $600,
+  // monthly at $25 minimum clears it within 2 years and is a fine option.
   const MIN_CENTS = COLLECTIONS_MIN_PAYMENT_CENTS;          // $25 minimum
+  const SMALL_BALANCE_CUTOFF_CENTS = 60000;                 // $600
+  const isSmallBalance = remainingCents <= SMALL_BALANCE_CUTOFF_CENTS;
   const discountCents = Math.round(remainingCents / 2);
 
   const suggestedMonthlyCents = Math.max(MIN_CENTS, Math.round(remainingCents / 24));
@@ -3317,8 +3325,7 @@ app.post('/api/collections/families/:id/create-links', ssoAuth, async (req, res)
     ? Math.max(MIN_CENTS, Math.round(parseFloat(req.body.monthly_cents)))
     : suggestedMonthlyCents;
 
-  // Weekly is always offered — $25/wk is meaningful recovery even on a 20K balance.
-  // 104 weeks = 2 years, so suggested = balance/104 floored at $25.
+  // 104 weeks = 2 years
   const suggestedWeeklyCents = Math.max(MIN_CENTS, Math.round(remainingCents / 104));
   const weeklyCents = req.body?.weekly_cents
     ? Math.max(MIN_CENTS, Math.round(parseFloat(req.body.weekly_cents)))
@@ -3342,26 +3349,32 @@ app.post('/api/collections/families/:id/create-links', ssoAuth, async (req, res)
       }},
     });
 
-    // ─── Monthly subscription — fixed amount, recurring auto-charge ───────
-    const monthlyPrice = await stripe.prices.create({
-      currency: 'usd',
-      unit_amount: monthlyCents,
-      recurring: { interval: 'month' },
-      product_data: { name: `Monthly Payment Plan — ${family.family_name}` },
-    });
-    const monthlyLink = await stripe.paymentLinks.create({
-      line_items: [{ price: monthlyPrice.id, quantity: 1 }],
-      metadata: { family_id: String(family.id), link_type: 'monthly' },
-      subscription_data: {
+    // ─── Monthly subscription — only for SMALL balances (≤$600) ───────────
+    // Big balances (>$600) skip monthly because $25/month would take more
+    // than 2 years; weekly at $25 is more achievable.
+    let monthlyLink = null;
+    if (isSmallBalance) {
+      const monthlyPrice = await stripe.prices.create({
+        currency: 'usd',
+        unit_amount: monthlyCents,
+        recurring: { interval: 'month' },
+        product_data: { name: `Monthly Payment Plan — ${family.family_name}` },
+      });
+      monthlyLink = await stripe.paymentLinks.create({
+        line_items: [{ price: monthlyPrice.id, quantity: 1 }],
         metadata: { family_id: String(family.id), link_type: 'monthly' },
-        description: `Monthly payment toward balance owed to The Children's Center. We'll cancel automatically when your balance is paid off.`,
-      },
-      after_completion: { type: 'hosted_confirmation', hosted_confirmation: {
-        custom_message: `Thank you! Your monthly payment of $${(monthlyCents/100).toFixed(2)} is set up. We'll charge your card automatically each month until your balance is paid off, then cancel the subscription. Contact us anytime to change the amount.`,
-      }},
-    });
+        subscription_data: {
+          metadata: { family_id: String(family.id), link_type: 'monthly' },
+          description: `Monthly payment toward balance owed to The Children's Center. We'll cancel automatically when your balance is paid off.`,
+        },
+        after_completion: { type: 'hosted_confirmation', hosted_confirmation: {
+          custom_message: `Thank you! Your monthly payment of $${(monthlyCents/100).toFixed(2)} is set up. We'll charge your card automatically each month until your balance is paid off, then cancel the subscription. Contact us anytime to change the amount.`,
+        }},
+      });
+    }
 
     // ─── Weekly subscription — always offered (recurring auto-charge) ───────
+    // Even for huge balances, $25/week is achievable and produces real recovery.
     const weeklyPrice = await stripe.prices.create({
       currency: 'usd',
       unit_amount: weeklyCents,
@@ -3388,19 +3401,20 @@ app.post('/api/collections/families/:id/create-links', ssoAuth, async (req, res)
          updated_at=NOW()
        WHERE id=$7 RETURNING *`,
       [payInFullLink.url, payInFullLink.id,
-       monthlyLink.url, monthlyLink.id,
+       monthlyLink ? monthlyLink.url : null, monthlyLink ? monthlyLink.id : null,
        weeklyLink.url, weeklyLink.id,
        family.id]
     );
 
     res.json({
       pay_in_full: { url: payInFullLink.url, amount_cents: discountCents },
-      monthly: {
+      monthly: monthlyLink ? {
         url: monthlyLink.url,
         amount_cents: monthlyCents,
         suggested_cents: suggestedMonthlyCents,
         was_overridden: monthlyCents !== suggestedMonthlyCents,
-      },
+      } : null,
+      monthly_offered: isSmallBalance,
       weekly: {
         url: weeklyLink.url,
         amount_cents: weeklyCents,
@@ -3452,7 +3466,8 @@ app.post('/api/collections/families/:id/deactivate-links', ssoAuth, async (req, 
 // content are warm but firm — these go to families who left with a balance.
 function buildPaymentLinkEmail({ family, payInFullUrl, payInFullAmount,
                                   monthlyUrl, monthlyAmount, weeklyUrl, weeklyAmount, fromName }) {
-  const greeting = family.family_name.split(/[\s,]+/)[0] || family.family_name;
+  // Use the primary guardian's first name if available, else fall back to family last name
+  const greeting = (family.primary_guardian_first_name || family.family_name.split(/[\s,]+/)[0] || family.family_name).trim();
   const fmtMoney = (n) => {
     const v = parseFloat(n) || 0;
     return v.toLocaleString('en-US', { minimumFractionDigits: 2, maximumFractionDigits: 2 });
@@ -3460,24 +3475,36 @@ function buildPaymentLinkEmail({ family, payInFullUrl, payInFullAmount,
   const remaining = fmtMoney(family.remaining_balance || 0);
   const halfOff = fmtMoney(payInFullAmount || family.discount_pay_in_full || 0);
   const savings = fmtMoney((parseFloat(family.remaining_balance || 0)) - (parseFloat(payInFullAmount || family.discount_pay_in_full || 0)));
-  const monthly = fmtMoney(monthlyAmount || 25);
+  const monthly = monthlyAmount ? fmtMoney(monthlyAmount) : null;
   const weekly = weeklyAmount ? fmtMoney(weeklyAmount) : null;
 
-  const optionCount = weeklyUrl ? 'three' : 'two';
-  const subject = `Settle Your Balance with The Children's Center — ${optionCount === 'three' ? 'Three' : 'Two'} Easy Options`;
+  const subject = `A Personal Note from Mary at The Children's Center`;
+
+  // Build the option cards conditionally — monthly only shown if monthlyUrl is set
+  const monthlyCardHTML = monthlyUrl ? `
+        <table role="presentation" width="100%" cellpadding="0" cellspacing="0" style="margin-bottom:14px;border:1px solid #d4d4d4;border-radius:8px;background:#ffffff">
+          <tr><td style="padding:20px">
+            <div style="font-size:11px;color:#1a2744;text-transform:uppercase;letter-spacing:1px;font-weight:500">A simple monthly option</div>
+            <div style="font-family:'Georgia',serif;font-size:20px;color:#1a2744;margin-top:6px">Monthly payment plan</div>
+            <p style="font-size:14px;line-height:1.5;margin:10px 0 16px;color:#555">
+              Just <strong>$${monthly}/month</strong>, charged automatically. Cancels itself when your balance is paid off.
+            </p>
+            <a href="${monthlyUrl}" style="display:inline-block;background:#1a2744;color:#ffffff;font-weight:500;padding:10px 22px;border-radius:6px;text-decoration:none;font-size:14px">
+              Set up $${monthly}/month →
+            </a>
+          </td></tr>
+        </table>` : '';
 
   const weeklyCardHTML = weeklyUrl ? `
-        <!-- Option 3: Weekly Payment Plan -->
-        <table role="presentation" width="100%" cellpadding="0" cellspacing="0" style="margin-bottom:16px;border:1px solid #d4d4d4;border-radius:8px;background:#ffffff">
+        <table role="presentation" width="100%" cellpadding="0" cellspacing="0" style="margin-bottom:20px;border:1px solid #d4d4d4;border-radius:8px;background:#ffffff">
           <tr><td style="padding:20px">
-            <div style="font-size:11px;color:#1a2744;text-transform:uppercase;letter-spacing:1px;font-weight:600">Smaller Weekly Payments</div>
-            <div style="font-family:'Georgia',serif;font-size:22px;color:#1a2744;margin-top:6px">Weekly Payment Plan</div>
+            <div style="font-size:11px;color:#1a2744;text-transform:uppercase;letter-spacing:1px;font-weight:500">${monthlyUrl ? 'Or a smaller weekly option' : 'A simple weekly option'}</div>
+            <div style="font-family:'Georgia',serif;font-size:20px;color:#1a2744;margin-top:6px">Weekly payment plan</div>
             <p style="font-size:14px;line-height:1.5;margin:10px 0 16px;color:#555">
-              Pay <strong>$${weekly}/week</strong>, automatically charged each week until your balance is paid off.
-              We'll cancel automatically when you reach zero. Contact us anytime to change the amount.
+              As low as <strong>$${weekly}/week</strong>, charged automatically. Cancels itself when your balance is paid off.
             </p>
-            <a href="${weeklyUrl}" style="display:inline-block;background:#1a2744;color:#ffffff;font-weight:600;padding:12px 24px;border-radius:6px;text-decoration:none;font-size:15px">
-              Set Up $${weekly}/Week Payments →
+            <a href="${weeklyUrl}" style="display:inline-block;background:#1a2744;color:#ffffff;font-weight:500;padding:10px 22px;border-radius:6px;text-decoration:none;font-size:14px">
+              Set up $${weekly}/week →
             </a>
           </td></tr>
         </table>` : '';
@@ -3491,74 +3518,52 @@ function buildPaymentLinkEmail({ family, payInFullUrl, payInFullAmount,
 
       <tr><td style="background:#1a2744;padding:24px 32px">
         <div style="font-family:'Georgia',serif;font-size:22px;color:#ffffff">The Children's Center</div>
-        <div style="color:rgba(255,255,255,.7);font-size:13px;margin-top:4px">Billing Department</div>
+        <div style="color:rgba(255,255,255,.7);font-size:13px;margin-top:4px">A note from Mary Wardlaw</div>
       </td></tr>
 
       <tr><td style="padding:32px">
-        <p style="font-size:15px;line-height:1.6;margin:0 0 16px">Dear ${greeting},</p>
+        <p style="font-size:15px;line-height:1.7;margin:0 0 16px">Dear ${greeting},</p>
 
-        <p style="font-size:15px;line-height:1.6;margin:0 0 16px">
-          We hope you and your family are doing well. We're writing to follow up on the outstanding balance on your account
-          with The Children's Center, currently <strong>$${remaining}</strong>.
-        </p>
+        <p style="font-size:15px;line-height:1.7;margin:0 0 16px">I've been thinking about your family and wanted to reach out personally.</p>
 
-        <p style="font-size:15px;line-height:1.6;margin:0 0 24px">
-          We understand things come up, and we want to make this as easy as possible to resolve.
-          We're offering you <strong>${optionCount} flexible payment options</strong>:
-        </p>
+        <p style="font-size:15px;line-height:1.7;margin:0 0 16px">It was truly an honor to care for your child, and we're grateful you were part of our community. Because of that, I wanted to extend a simple invitation — an opportunity to clear your account in a way that feels good, manageable, and complete.</p>
 
-        <!-- Option 1: Pay in Full with 50% Discount -->
-        <table role="presentation" width="100%" cellpadding="0" cellspacing="0" style="margin-bottom:16px;border:2px solid #c5a572;border-radius:8px;background:#fdfbf6">
+        <p style="font-size:15px;line-height:1.7;margin:0 0 16px">We understand that life gets busy and circumstances change. At the same time, we know our families value integrity and honoring commitments, and we want to support you in doing that in the easiest way possible.</p>
+
+        <p style="font-size:15px;line-height:1.7;margin:0 0 20px">If clearing your balance has been on your mind, we've created a few flexible options:</p>
+
+        <table role="presentation" width="100%" cellpadding="0" cellspacing="0" style="margin-bottom:14px;border:2px solid #c5a572;border-radius:8px;background:#fdfbf6">
           <tr><td style="padding:20px">
-            <div style="font-size:11px;color:#c5a572;text-transform:uppercase;letter-spacing:1px;font-weight:600">★ Best Deal — Limited Time</div>
-            <div style="font-family:'Georgia',serif;font-size:22px;color:#1a2744;margin-top:6px">Pay in Full — Save 50%</div>
+            <div style="font-size:11px;color:#c5a572;text-transform:uppercase;letter-spacing:1px;font-weight:500">A one-time opportunity</div>
+            <div style="font-family:'Georgia',serif;font-size:20px;color:#1a2744;margin-top:6px">Settle at a reduced amount</div>
             <p style="font-size:14px;line-height:1.5;margin:10px 0 16px;color:#555">
-              Pay just <strong style="color:#c0392b">$${halfOff}</strong> now and we'll consider your account fully settled.
-              That's a savings of <strong>$${savings}</strong>.
+              Pay <strong style="color:#c0392b">$${halfOff}</strong> now and we'll consider your account fully settled — a savings of <strong>$${savings}</strong>.
             </p>
-            <a href="${payInFullUrl}" style="display:inline-block;background:#c5a572;color:#ffffff;font-weight:600;padding:12px 24px;border-radius:6px;text-decoration:none;font-size:15px">
-              Pay $${halfOff} Now →
+            <a href="${payInFullUrl}" style="display:inline-block;background:#c5a572;color:#ffffff;font-weight:500;padding:10px 22px;border-radius:6px;text-decoration:none;font-size:14px">
+              Pay $${halfOff} →
             </a>
           </td></tr>
         </table>
 
-        <!-- Option 2: Monthly Payment Plan -->
-        <table role="presentation" width="100%" cellpadding="0" cellspacing="0" style="margin-bottom:16px;border:1px solid #d4d4d4;border-radius:8px;background:#ffffff">
-          <tr><td style="padding:20px">
-            <div style="font-size:11px;color:#1a2744;text-transform:uppercase;letter-spacing:1px;font-weight:600">Flexible Option</div>
-            <div style="font-family:'Georgia',serif;font-size:22px;color:#1a2744;margin-top:6px">Monthly Payment Plan</div>
-            <p style="font-size:14px;line-height:1.5;margin:10px 0 16px;color:#555">
-              Pay <strong>$${monthly}/month</strong>, automatically charged each month until your balance is paid off.
-              We'll cancel automatically when you reach zero. Contact us anytime to change the amount.
-            </p>
-            <a href="${monthlyUrl}" style="display:inline-block;background:#1a2744;color:#ffffff;font-weight:600;padding:12px 24px;border-radius:6px;text-decoration:none;font-size:15px">
-              Set Up $${monthly}/Month Payments →
-            </a>
-          </td></tr>
-        </table>
-
+        ${monthlyCardHTML}
         ${weeklyCardHTML}
 
-        <p style="font-size:13.5px;line-height:1.6;margin:24px 0 12px;color:#555">
-          All options use Stripe for secure payment processing. We never see or store your card details.
-        </p>
+        <p style="font-size:15px;line-height:1.7;margin:24px 0 16px">Our goal is to make this feel doable, relieving, and even worth celebrating — because there's something powerful about closing the loop and moving forward with a clear mind.</p>
 
-        <p style="font-size:13.5px;line-height:1.6;margin:0 0 16px;color:#555">
-          If you have questions or want to discuss another arrangement, please reply to this email or call us at
-          <strong>(269) 683-0405</strong>. We genuinely appreciate the time your family spent with us, and we'd
-          love to settle this so we can both move forward.
-        </p>
+        <p style="font-size:15px;line-height:1.7;margin:0 0 24px">We believe in you, we value your family, and we're here to make this easy.</p>
 
-        <p style="font-size:14px;line-height:1.6;margin:24px 0 0">
-          Warm regards,<br>
-          <strong>${fromName}</strong>
+        <p style="font-size:15px;line-height:1.7;margin:0 0 4px">With appreciation,</p>
+        <p style="font-size:15px;line-height:1.7;margin:0;font-weight:500">Mary Wardlaw</p>
+        <p style="font-size:13px;line-height:1.7;margin:0;color:#555">Owner | The Children's Center</p>
+
+        <p style="font-size:12.5px;line-height:1.6;margin:28px 0 0;color:#888;font-style:italic">
+          P.S. If these options don't quite fit, please reply to this email or call <strong>(269) 683-0405</strong> — we'll work something out together.
         </p>
       </td></tr>
 
       <tr><td style="background:#f7f5ef;padding:16px 32px;font-size:11px;color:#888;text-align:center;line-height:1.6">
         The Children's Center · 210 Main Street, Niles, MI 49120<br>
-        219 Peace Boulevard, St. Joseph, MI 49085 · (269) 683-0405<br>
-        <a href="https://www.weloveourfamilies.com" style="color:#888">weloveourfamilies.com</a>
+        219 Peace Boulevard, St. Joseph, MI 49085 · (269) 683-0405
       </td></tr>
 
     </table>
@@ -3566,34 +3571,45 @@ function buildPaymentLinkEmail({ family, payInFullUrl, payInFullAmount,
 </table>
 </body></html>`;
 
+  // Plain-text version mirrors the HTML structure
   let text = `Dear ${greeting},
 
-We're following up on the outstanding balance on your account with The Children's Center: $${remaining}.
+I've been thinking about your family and wanted to reach out personally.
 
-We're offering ${optionCount} flexible payment options:
+It was truly an honor to care for your child, and we're grateful you were part of our community. Because of that, I wanted to extend a simple invitation — an opportunity to clear your account in a way that feels good, manageable, and complete.
 
-★ OPTION 1 — Pay in Full, Save 50%
-Pay just $${halfOff} now (savings of $${savings}).
+We understand that life gets busy and circumstances change. At the same time, we know our families value integrity and honoring commitments, and we want to support you in doing that in the easiest way possible.
+
+If clearing your balance has been on your mind, we've created a few flexible options:
+
+★ A ONE-TIME OPPORTUNITY — Settle at a reduced amount
+Pay $${halfOff} now (savings of $${savings}) and we'll consider your account fully settled.
 ${payInFullUrl}
-
-OPTION 2 — Monthly Payment Plan ($${monthly}/month, recurring)
-Auto-charged each month until paid off, then cancels automatically.
+`;
+  if (monthlyUrl) {
+    text += `
+A SIMPLE MONTHLY OPTION — $${monthly}/month
+Charged automatically. Cancels itself when your balance is paid off.
 ${monthlyUrl}
 `;
+  }
   if (weeklyUrl) {
     text += `
-OPTION 3 — Weekly Payment Plan ($${weekly}/week, recurring)
-Auto-charged each week until paid off, then cancels automatically.
+${monthlyUrl ? 'OR A SMALLER WEEKLY OPTION' : 'A SIMPLE WEEKLY OPTION'} — $${weekly}/week
+Charged automatically. Cancels itself when your balance is paid off.
 ${weeklyUrl}
 `;
   }
   text += `
-All options use Stripe for secure payment processing.
+Our goal is to make this feel doable, relieving, and even worth celebrating — because there's something powerful about closing the loop and moving forward with a clear mind.
 
-Questions? Reply to this email or call (269) 683-0405.
+We believe in you, we value your family, and we're here to make this easy.
 
-Warm regards,
-${fromName}
+With appreciation,
+Mary Wardlaw
+Owner | The Children's Center
+
+P.S. If these options don't quite fit, please reply to this email or call (269) 683-0405 — we'll work something out together.
 
 The Children's Center
 210 Main Street, Niles, MI 49120
@@ -3615,29 +3631,44 @@ app.post('/api/collections/families/:id/send-email', ssoAuth, async (req, res) =
   const family = await familyWithBalance(req.params.id);
   if (!family) return res.status(404).json({ error: 'Family not found' });
 
-  if (!family.payinfull_link_url || !family.paywhatyoucan_link_url) {
+  // Need at least pay-in-full + weekly to send (monthly may be null for big balances)
+  if (!family.payinfull_link_url || !family.weekly_link_url) {
     return res.status(400).json({
       error: 'Generate Stripe payment links first (click "Generate Payment Links" on this family\'s page).',
     });
   }
 
-  // Resolve the email recipient
+  // Resolve the email recipient AND the primary guardian's first name (for the greeting)
   let toEmail = (req.body.to || '').trim() || family.primary_contact_email;
-  if (!toEmail) {
-    // Try linked children's parent_email
+  let primaryGuardianFirstName = null;
+  if (!toEmail || true) {
+    // Always look up linked children to get parent name; fall back for email if needed
     const { rows } = await pool.query(
-      `SELECT c.parent_email FROM collections_family_children fc
+      `SELECT c.parent_email, c.parent_name FROM collections_family_children fc
        JOIN children c ON c.id=fc.child_id
-       WHERE fc.family_id=$1 AND c.parent_email IS NOT NULL AND c.parent_email <> ''
+       WHERE fc.family_id=$1
+       ORDER BY (c.parent_email IS NOT NULL AND c.parent_email <> '') DESC, c.id ASC
        LIMIT 1`, [req.params.id]
     );
-    toEmail = rows[0]?.parent_email;
+    if (!toEmail) toEmail = rows[0]?.parent_email;
+    if (rows[0]?.parent_name) {
+      // Extract first name from "First Last" or "Last, First"
+      const name = rows[0].parent_name.trim();
+      if (name.includes(',')) {
+        primaryGuardianFirstName = name.split(',')[1]?.trim().split(/\s+/)[0];
+      } else {
+        primaryGuardianFirstName = name.split(/\s+/)[0];
+      }
+    }
   }
   if (!toEmail) {
     return res.status(422).json({
       error: 'No email address on file. Add one to this family or link a child whose parent_email is set.',
     });
   }
+
+  // Pass the primary guardian first name to the template (used for "Dear FirstName,")
+  family.primary_guardian_first_name = primaryGuardianFirstName;
 
   const fromEmail = process.env.SENDGRID_FROM_EMAIL || 'billing@childrenscenterinc.com';
   const fromName = process.env.SENDGRID_FROM_NAME || "The Children's Center Billing";
@@ -3657,14 +3688,13 @@ app.post('/api/collections/families/:id/send-email', ssoAuth, async (req, res) =
     }
   } catch (e) {
     console.warn('Could not fetch link prices:', e.message);
-    monthlyAmount = monthlyAmount || (COLLECTIONS_MIN_PAYMENT_CENTS / 100);
   }
 
   const { subject, html, text } = buildPaymentLinkEmail({
     family,
     payInFullUrl: family.payinfull_link_url,
     payInFullAmount: family.discount_pay_in_full,
-    monthlyUrl: family.paywhatyoucan_link_url,
+    monthlyUrl: family.paywhatyoucan_link_url || null,
     monthlyAmount,
     weeklyUrl: family.weekly_link_url || null,
     weeklyAmount,
