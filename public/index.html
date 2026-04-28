@@ -416,6 +416,9 @@ input[type="file"] { display:none; }
     <div class="nav-item" onclick="showPage('collections-families')">
       <span class="nav-icon">👨‍👩‍👧</span> Past-Due Families
     </div>
+    <div class="nav-item" onclick="showPage('active-campaigns')">
+      <span class="nav-icon">📬</span> Active Campaigns
+    </div>
   </div>
   <div class="nav-section">
     <div class="nav-label">Attendance</div>
@@ -2912,6 +2915,71 @@ pages['collections-families'] = async () => {
   }
 };
 
+pages['active-campaigns'] = async () => {
+  document.getElementById('page-title').textContent = 'Active Campaigns';
+  document.getElementById('topbar-actions').innerHTML = `
+    <button class="btn btn-ghost" onclick="loadActiveCampaignsPage('active')">Active</button>
+    <button class="btn btn-ghost" onclick="loadActiveCampaignsPage('paused')">Paused</button>
+    <button class="btn btn-ghost" onclick="loadActiveCampaignsPage('completed')">Completed</button>
+    <button class="btn btn-ghost" onclick="loadActiveCampaignsPage('cancelled')">Cancelled</button>
+  `;
+  const content = document.getElementById('content');
+  content.innerHTML = '<div class="loading">Loading campaigns…</div>';
+  loadActiveCampaignsPage('active');
+};
+
+async function loadActiveCampaignsPage(status) {
+  const content = document.getElementById('content');
+  content.innerHTML = '<div class="loading">Loading…</div>';
+  try {
+    const enrollments = await api('GET', `/campaigns/enrollments?status=${status}`);
+    if (enrollments.length === 0) {
+      content.innerHTML = `
+        <div class="card" style="text-align:center;padding:32px">
+          <div style="font-size:48px;color:var(--gray);margin-bottom:12px">📬</div>
+          <div style="font-size:15px;color:var(--gray)">No ${status} campaigns.</div>
+          <div style="font-size:13px;color:var(--gray);margin-top:8px">
+            Start a sequence from any past-due family's detail page.
+          </div>
+        </div>`;
+      return;
+    }
+    const fmt = n => parseFloat(n).toLocaleString('en-US', { minimumFractionDigits: 2, maximumFractionDigits: 2 });
+    content.innerHTML = `
+      <div class="card">
+        <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:14px">
+          <div class="card-title" style="margin:0">${status.charAt(0).toUpperCase() + status.slice(1)} Campaigns (${enrollments.length})</div>
+          <button class="btn btn-sm btn-ghost" onclick="api('POST', '/campaigns/scheduler/run-now').then(()=>{toast('Scheduler triggered','success'); loadActiveCampaignsPage('${status}');})">⚡ Run Scheduler Now</button>
+        </div>
+        <table style="width:100%;border-collapse:collapse;font-size:13px">
+          <thead><tr style="background:#f8f8f8;text-align:left">
+            <th style="padding:10px 8px">Family</th>
+            <th style="padding:10px 8px">Center</th>
+            <th style="padding:10px 8px;text-align:right">Original Balance</th>
+            <th style="padding:10px 8px;text-align:center">Touches Sent</th>
+            <th style="padding:10px 8px">Next Send</th>
+            <th style="padding:10px 8px">Enrolled</th>
+            <th style="padding:10px 8px"></th>
+          </tr></thead>
+          <tbody>
+            ${enrollments.map(e => `
+              <tr style="border-bottom:1px solid #eee">
+                <td style="padding:10px 8px"><strong>${e.family_name}</strong></td>
+                <td style="padding:10px 8px;color:var(--gray)">${e.center || ''}</td>
+                <td style="padding:10px 8px;text-align:right">$${fmt(e.original_balance)}</td>
+                <td style="padding:10px 8px;text-align:center"><strong>${e.sent_count}</strong> / 7</td>
+                <td style="padding:10px 8px;font-size:12px;color:var(--gray)">${e.next_send_at ? fmtDate(e.next_send_at) : '—'}</td>
+                <td style="padding:10px 8px;font-size:12px;color:var(--gray)">${fmtDate(e.enrolled_at)}</td>
+                <td style="padding:10px 8px"><button class="btn btn-sm btn-ghost" onclick="openFamilyDetail(${e.family_id})">View →</button></td>
+              </tr>`).join('')}
+          </tbody>
+        </table>
+      </div>`;
+  } catch (e) {
+    content.innerHTML = `<div class="card"><div style="color:var(--red)">Error: ${e.message}</div></div>`;
+  }
+}
+
 function renderCollectionsFamilies() {
   // This function ONLY updates the dynamic parts (summary, active table, settled section).
   // It deliberately does not touch the search input or center filter.
@@ -3243,6 +3311,13 @@ async function openFamilyDetail(id) {
         </div>
       ` : ''}
 
+      ${stripeReady && hasLinks && !settled && !family.email_unsubscribed ? `
+        <div class="card" id="campaign-card-${family.id}">
+          <div class="card-title">📬 7-Touch Outreach Campaign</div>
+          <div id="campaign-content-${family.id}" style="font-size:13px;color:var(--gray)">Loading…</div>
+        </div>
+      ` : ''}
+
       <div class="card">
         <div class="card-title" style="display:flex;justify-content:space-between;align-items:center">
           <span>📒 Transaction Ledger (${transactions.length})</span>
@@ -3367,9 +3442,145 @@ async function openFamilyDetail(id) {
           </div>
         `}
       </div>`;
+
+    // Load campaign card (async — happens after main render, doesn't block)
+    if (document.getElementById(`campaign-content-${id}`)) {
+      loadCampaignCard(id);
+    }
   } catch (e) {
     content.innerHTML = `<div class="card"><div style="color:var(--red)">Error: ${e.message}</div></div>`;
   }
+}
+
+// ── Campaign UI ─────────────────────────────────────────────────────────────
+async function loadCampaignCard(familyId) {
+  const el = document.getElementById(`campaign-content-${familyId}`);
+  if (!el) return;
+  try {
+    const data = await api('GET', `/collections/families/${familyId}/campaign`);
+    if (!data.enrolled) {
+      el.innerHTML = `
+        <p style="font-size:13px;color:var(--gray);line-height:1.6;margin-bottom:14px">
+          Send Mary's warm letter automatically over 50 days. The sequence sends 5 emails and 2 texts spread across days 0, 5, 12, 21, 30, 38, and 50. It auto-stops if the family pays, settles, or unsubscribes.
+        </p>
+        <button class="btn btn-gold" onclick="startCampaign(${familyId})">Start 7-Touch Sequence</button>
+      `;
+      return;
+    }
+
+    const e = data.enrollment;
+    const touches = data.touches;
+    const statusBadge = {
+      active: '<span class="badge-pill badge-paid">● Active</span>',
+      paused: '<span class="badge-pill badge-pending">⏸ Paused</span>',
+      completed: '<span class="badge-pill" style="background:#e8e8e8;color:#555">✓ Completed</span>',
+      cancelled: '<span class="badge-pill" style="background:#fde0e0;color:#a04040">✕ Cancelled</span>',
+    }[e.status] || e.status;
+
+    const touchRows = touches.map(t => {
+      const channelIcon = t.channel === 'email' ? '✉️' : '💬';
+      let statusCell;
+      if (t.sent_at) {
+        if (t.send_status === 'sent') {
+          statusCell = `<span style="color:#1e8449">Sent ${fmtDate(t.sent_at)}</span>`;
+        } else if (t.send_status?.startsWith('skipped')) {
+          statusCell = `<span style="color:#c5a572" title="${t.error_detail || ''}">Skipped (${t.send_status.replace('skipped_','')})</span>`;
+        } else {
+          statusCell = `<span style="color:#c0392b" title="${t.error_detail || ''}">Failed</span>`;
+        }
+      } else {
+        const due = new Date(t.scheduled_for);
+        const isDue = due <= new Date();
+        statusCell = isDue
+          ? `<span style="color:#c5a572">⏱ Due now (will fire next tick)</span>`
+          : `<span style="color:var(--gray)">Scheduled ${fmtDate(t.scheduled_for)}</span>`;
+      }
+      return `<tr style="border-bottom:1px solid #eee">
+        <td style="padding:6px 8px;width:40px;text-align:center">${channelIcon}</td>
+        <td style="padding:6px 8px;width:60px"><strong>#${t.touch_number}</strong></td>
+        <td style="padding:6px 8px">Day ${CAMPAIGN_DAY_OFFSETS[t.touch_number-1]}</td>
+        <td style="padding:6px 8px;font-size:12px">${statusCell}</td>
+      </tr>`;
+    }).join('');
+
+    let actionButtons = '';
+    if (e.status === 'active') {
+      actionButtons = `
+        <button class="btn btn-sm btn-ghost" onclick="pauseCampaign(${familyId})">⏸ Pause</button>
+        <button class="btn btn-sm btn-ghost" onclick="cancelCampaign(${familyId})" style="color:var(--red)">✕ Cancel</button>`;
+    } else if (e.status === 'paused') {
+      actionButtons = `
+        <button class="btn btn-sm btn-primary" onclick="resumeCampaign(${familyId})">▶ Resume</button>
+        <button class="btn btn-sm btn-ghost" onclick="cancelCampaign(${familyId})" style="color:var(--red)">✕ Cancel</button>`;
+    } else if (e.status === 'completed' || e.status === 'cancelled') {
+      actionButtons = `
+        <button class="btn btn-sm btn-gold" onclick="startCampaign(${familyId})">↻ Restart Sequence</button>`;
+    }
+
+    el.innerHTML = `
+      <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:10px;flex-wrap:wrap;gap:10px">
+        <div>${statusBadge} <span style="font-size:12px;color:var(--gray);margin-left:8px">Enrolled ${fmtDate(e.enrolled_at)}${e.created_by ? ` by ${e.created_by}` : ''}</span></div>
+        <div style="display:flex;gap:6px">${actionButtons}</div>
+      </div>
+      ${e.paused_reason ? `<div style="background:#fff8e0;border:1px solid var(--gold);padding:8px 12px;border-radius:6px;font-size:12px;margin-bottom:10px">⏸ Paused: ${e.paused_reason}</div>` : ''}
+      ${e.completed_reason ? `<div style="background:#f0f6e8;border:1px solid #6b8e23;padding:8px 12px;border-radius:6px;font-size:12px;margin-bottom:10px">✓ ${e.completed_reason}</div>` : ''}
+      <table style="width:100%;border-collapse:collapse;font-size:12.5px">
+        <thead><tr style="background:#f8f8f8;text-align:left">
+          <th style="padding:6px 8px"></th>
+          <th style="padding:6px 8px">Touch</th>
+          <th style="padding:6px 8px">When</th>
+          <th style="padding:6px 8px">Status</th>
+        </tr></thead>
+        <tbody>${touchRows}</tbody>
+      </table>
+    `;
+  } catch (err) {
+    el.innerHTML = `<div style="color:var(--red);font-size:13px">Failed to load: ${err.message}</div>`;
+  }
+}
+
+const CAMPAIGN_DAY_OFFSETS = [0, 5, 12, 21, 30, 38, 50];
+
+async function startCampaign(familyId) {
+  if (!confirm('Start the 7-touch sequence? Touch 1 (Mary\'s warm letter) will send immediately to the family.')) return;
+  try {
+    const result = await api('POST', `/collections/families/${familyId}/campaign/start`);
+    if (result.touch1_sent) {
+      toast(`Sequence started — touch 1 sent. ${result.next_touches_scheduled} more touches scheduled.`, 'success');
+    } else {
+      toast(`Sequence started, but touch 1 failed: ${result.touch1_error}. Other touches will retry on schedule.`, 'error');
+    }
+    openFamilyDetail(familyId);
+  } catch (e) {
+    toast('Error: ' + e.message, 'error');
+  }
+}
+
+async function pauseCampaign(familyId) {
+  const reason = prompt('Why pause? (optional)') || 'Paused by Mary';
+  try {
+    await api('POST', `/collections/families/${familyId}/campaign/pause`, { reason });
+    toast('Campaign paused.', 'success');
+    loadCampaignCard(familyId);
+  } catch (e) { toast('Error: ' + e.message, 'error'); }
+}
+
+async function resumeCampaign(familyId) {
+  try {
+    await api('POST', `/collections/families/${familyId}/campaign/resume`);
+    toast('Campaign resumed.', 'success');
+    loadCampaignCard(familyId);
+  } catch (e) { toast('Error: ' + e.message, 'error'); }
+}
+
+async function cancelCampaign(familyId) {
+  if (!confirm('Cancel this campaign? Remaining touches will not be sent.')) return;
+  const reason = prompt('Why cancel? (optional)') || 'Cancelled by Mary';
+  try {
+    await api('POST', `/collections/families/${familyId}/campaign/cancel`, { reason });
+    toast('Campaign cancelled.', 'success');
+    loadCampaignCard(familyId);
+  } catch (e) { toast('Error: ' + e.message, 'error'); }
 }
 
 function paymentStatusBadge(s) {
