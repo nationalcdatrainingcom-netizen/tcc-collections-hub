@@ -3153,6 +3153,7 @@ async function openFamilyDetail(id) {
           </div>
           <div style="display:flex;gap:8px;align-items:center;flex-wrap:wrap;justify-content:flex-end">
             ${settled ? `<span class="badge-pill badge-paid" style="font-size:13px;padding:6px 12px">✅ SETTLED</span>` : ''}
+            ${family.email_unsubscribed ? `<span class="badge-pill" style="background:#fde0e0;color:#a04040;font-size:12px;padding:6px 12px" title="Unsubscribed ${family.email_unsubscribed_at ? fmtDate(family.email_unsubscribed_at) : ''}">🚫 Unsubscribed</span>` : ''}
             <button class="btn btn-sm btn-primary" onclick="openStatementPrint(${family.id})">🖨 Print Statement</button>
             <button class="btn btn-sm btn-gold" onclick="openAddAdjustment(${family.id})">+ Add Transaction</button>
             <button class="btn btn-sm btn-ghost" onclick='editFamily(${JSON.stringify(family).replace(/'/g,"&#39;")})'>Edit</button>
@@ -3221,7 +3222,9 @@ async function openFamilyDetail(id) {
               </div>
             ` : ''}
             <div style="display:flex;gap:8px;flex-wrap:wrap">
-              <button class="btn btn-sm btn-primary" onclick="sendPaymentEmail(${family.id})">✉ Send Email to Family</button>
+              ${family.email_unsubscribed
+                ? `<button class="btn btn-sm" disabled style="opacity:.5;cursor:not-allowed" title="Family has unsubscribed">✉ Send Email (Unsubscribed)</button>`
+                : `<button class="btn btn-sm btn-primary" onclick="sendPaymentEmail(${family.id})">✉ Send Email to Family</button>`}
               <button class="btn btn-sm btn-ghost" onclick="openGenerateLinksModal(${family.id}, ${family.remaining_balance})">♻ Regenerate Links</button>
               <button class="btn btn-sm btn-ghost" onclick="deactivateLinks(${family.id})" style="color:var(--red)">🗑 Deactivate Links</button>
             </div>
