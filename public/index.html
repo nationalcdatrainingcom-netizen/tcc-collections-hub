@@ -419,6 +419,9 @@ input[type="file"] { display:none; }
     <div class="nav-item" onclick="showPage('active-campaigns')">
       <span class="nav-icon">📬</span> Active Campaigns
     </div>
+    <div class="nav-item" onclick="showPage('campaign-templates')">
+      <span class="nav-icon">✏️</span> Campaign Templates
+    </div>
   </div>
   <div class="nav-section">
     <div class="nav-label">Attendance</div>
@@ -2980,6 +2983,102 @@ async function loadActiveCampaignsPage(status) {
   }
 }
 
+pages['campaign-templates'] = async () => {
+  document.getElementById('page-title').textContent = 'Campaign Templates';
+  document.getElementById('topbar-actions').innerHTML = '';
+  const content = document.getElementById('content');
+  content.innerHTML = '<div class="loading">Loading templates…</div>';
+  try {
+    const data = await api('GET', '/campaigns/templates');
+    const channelIcon = (ch) => ch === 'email' ? '✉️' : '💬';
+    content.innerHTML = `
+      <div class="card" style="margin-bottom:14px">
+        <div class="card-title">✏️ Edit Touch Templates</div>
+        <p style="font-size:13px;color:var(--gray);line-height:1.6">
+          Customize what touches 2–7 say when they auto-send. Touch 1 (Mary's warm letter) is not editable here — it's used for both the Start Sequence and the standalone Send Email button.
+        </p>
+        <p style="font-size:13px;color:var(--gray);line-height:1.6;margin-top:10px">
+          <strong>Variables you can use:</strong> <code>{first_name}</code>, <code>{half_off}</code>, <code>{savings}</code>, <code>{monthly}</code>, <code>{weekly}</code>, <code>{pay_in_full_url}</code>.
+          They're replaced per-family at send time.
+        </p>
+        <p style="font-size:12px;color:var(--gray);font-style:italic;margin-top:8px">
+          Mary's signature, "Dear {first_name}" greeting, and the unsubscribe footer are all added automatically — don't include them in the body.
+        </p>
+      </div>
+
+      ${data.touches.map(t => `
+        <div class="card" id="template-card-${t.touch_number}" style="margin-bottom:14px">
+          <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:10px;flex-wrap:wrap;gap:10px">
+            <div>
+              <span style="font-size:18px">${channelIcon(t.channel)}</span>
+              <strong style="font-size:16px">Touch ${t.touch_number}</strong>
+              <span style="font-size:13px;color:var(--gray)">· ${t.channel === 'email' ? 'Email' : 'SMS'} · Day ${t.day_offset}</span>
+              ${t.override
+                ? `<span class="badge-pill badge-paid" style="margin-left:8px">Custom</span>`
+                : `<span class="badge-pill" style="background:#e8e8e8;color:#555;margin-left:8px">Default</span>`}
+            </div>
+            <div style="display:flex;gap:6px">
+              ${t.override ? `<button class="btn btn-sm btn-ghost" onclick="revertTemplate(${t.touch_number})" style="color:var(--red)">↺ Revert to Default</button>` : ''}
+              <button class="btn btn-sm btn-primary" onclick="saveTemplate(${t.touch_number})">💾 Save</button>
+            </div>
+          </div>
+
+          ${t.channel === 'email' ? `
+            <div class="form-group">
+              <label>Subject</label>
+              <input id="tmpl-subject-${t.touch_number}" type="text" value="${escapeHtml(t.override?.subject || t.default_subject || '')}" placeholder="${escapeHtml(t.default_subject || '')}">
+            </div>
+          ` : ''}
+
+          <div class="form-group">
+            <label>${t.channel === 'sms' ? 'SMS Body' : 'Email Body'}</label>
+            <textarea id="tmpl-body-${t.touch_number}" rows="${t.channel === 'sms' ? 4 : 8}"
+              style="font-family:Helvetica,Arial,sans-serif;font-size:13px;line-height:1.5;width:100%;resize:vertical"
+              placeholder="${escapeHtml(t.default_body || '')}">${escapeHtml(t.override?.body || t.default_body || '')}</textarea>
+            ${t.channel === 'sms' ? `<div style="font-size:11px;color:var(--gray);margin-top:4px">Keep under 160 chars for one segment. Standard SMS opt-out keyword "STOP" should be included.</div>` : ''}
+          </div>
+
+          ${t.override ? `<div style="font-size:11px;color:var(--gray);margin-top:4px">Last edited ${fmtDate(t.override.updated_at)}${t.override.updated_by ? ' by ' + t.override.updated_by : ''}</div>` : ''}
+        </div>
+      `).join('')}
+    `;
+  } catch (e) {
+    content.innerHTML = `<div class="card"><div style="color:var(--red)">Error: ${e.message}</div></div>`;
+  }
+};
+
+function escapeHtml(s) {
+  if (!s) return '';
+  return String(s).replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;').replace(/"/g, '&quot;');
+}
+
+async function saveTemplate(touchNum) {
+  const subjectEl = document.getElementById(`tmpl-subject-${touchNum}`);
+  const bodyEl = document.getElementById(`tmpl-body-${touchNum}`);
+  const subject = subjectEl ? subjectEl.value.trim() : null;
+  const body = bodyEl ? bodyEl.value.trim() : '';
+  if (!body) return toast('Body cannot be empty', 'error');
+  if (subjectEl && !subject) return toast('Subject cannot be empty', 'error');
+  try {
+    await api('POST', `/campaigns/templates/${touchNum}`, { subject, body });
+    toast(`Touch ${touchNum} template saved`, 'success');
+    pages['campaign-templates']();  // reload
+  } catch (e) {
+    toast('Save failed: ' + e.message, 'error');
+  }
+}
+
+async function revertTemplate(touchNum) {
+  if (!confirm(`Revert Touch ${touchNum} to default? Your custom version will be lost.`)) return;
+  try {
+    await api('DELETE', `/campaigns/templates/${touchNum}`);
+    toast(`Touch ${touchNum} reverted to default`, 'success');
+    pages['campaign-templates']();
+  } catch (e) {
+    toast('Revert failed: ' + e.message, 'error');
+  }
+}
+
 function renderCollectionsFamilies() {
   // This function ONLY updates the dynamic parts (summary, active table, settled section).
   // It deliberately does not touch the search input or center filter.
@@ -3292,7 +3391,8 @@ async function openFamilyDetail(id) {
             <div style="display:flex;gap:8px;flex-wrap:wrap">
               ${family.email_unsubscribed
                 ? `<button class="btn btn-sm" disabled style="opacity:.5;cursor:not-allowed" title="Family has unsubscribed">✉ Send Email (Unsubscribed)</button>`
-                : `<button class="btn btn-sm btn-primary" onclick="sendPaymentEmail(${family.id})">✉ Send Email to Family</button>`}
+                : `<button class="btn btn-sm btn-primary" onclick="sendPaymentEmail(${family.id})">✉ Send Email to Family</button>
+                   <button class="btn btn-sm btn-ghost" onclick="openCustomEmailComposer(${family.id})" title="Compose a one-off email with custom subject and body">✎ Compose Custom Email</button>`}
               <button class="btn btn-sm btn-ghost" onclick="openGenerateLinksModal(${family.id}, ${family.remaining_balance})">♻ Regenerate Links</button>
               <button class="btn btn-sm btn-ghost" onclick="deactivateLinks(${family.id})" style="color:var(--red)">🗑 Deactivate Links</button>
             </div>
@@ -3506,6 +3606,7 @@ async function loadCampaignCard(familyId) {
     let actionButtons = '';
     if (e.status === 'active') {
       actionButtons = `
+        <button class="btn btn-sm btn-ghost" onclick="pauseForFollowUp(${familyId})" title="Pause because you spoke with the family">🗣 Phone Follow-up</button>
         <button class="btn btn-sm btn-ghost" onclick="pauseCampaign(${familyId})">⏸ Pause</button>
         <button class="btn btn-sm btn-ghost" onclick="cancelCampaign(${familyId})" style="color:var(--red)">✕ Cancel</button>`;
     } else if (e.status === 'paused') {
@@ -3561,6 +3662,19 @@ async function pauseCampaign(familyId) {
   try {
     await api('POST', `/collections/families/${familyId}/campaign/pause`, { reason });
     toast('Campaign paused.', 'success');
+    loadCampaignCard(familyId);
+  } catch (e) { toast('Error: ' + e.message, 'error'); }
+}
+
+async function pauseForFollowUp(familyId) {
+  // Specialized pause — used when you've had a phone conversation with the family
+  // and want to follow up off-system. Prompts for what was discussed.
+  const note = prompt('What did you discuss? (e.g., "Spoke with mom — she\'s sending payment Friday")');
+  if (note === null) return;  // user cancelled
+  const reason = `🗣 Phone follow-up: ${note || '(no note)'}`;
+  try {
+    await api('POST', `/collections/families/${familyId}/campaign/pause`, { reason });
+    toast('Campaign paused for follow-up.', 'success');
     loadCampaignCard(familyId);
   } catch (e) { toast('Error: ' + e.message, 'error'); }
 }
@@ -3930,6 +4044,130 @@ async function confirmSendEmail(familyId) {
   try {
     const r = await api('POST', `/collections/families/${familyId}/send-email`, { to });
     toast(`Email sent to ${r.to}`, 'success');
+    closeModal();
+    openFamilyDetail(familyId);
+  } catch (e) {
+    toast('Send failed: ' + e.message, 'error');
+  }
+}
+
+// ── Custom one-off email composer ────────────────────────────────────────────
+async function openCustomEmailComposer(familyId) {
+  const detail = window.__FAMILY_DETAIL?.family
+    ? window.__FAMILY_DETAIL
+    : await api('GET', `/collections/families/${familyId}`);
+  const fam = detail.family;
+  const linkedEmail = (detail.linked_children || []).find(c => c.parent_email)?.parent_email;
+  const defaultEmail = fam.primary_contact_email || linkedEmail || '';
+  const hasLinks = !!fam.payinfull_link_url;
+
+  openModal(`
+    <div class="modal-title">Compose Custom Email</div>
+    <p style="font-size:13px;color:var(--gray);margin-bottom:14px;line-height:1.6">
+      Send a custom-worded email to <strong>${fam.family_name}</strong>.
+      Mary's signature and the unsubscribe footer are added automatically.
+      ${hasLinks ? 'You can optionally include the payment option cards.' : ''}
+    </p>
+
+    <div class="form-group">
+      <label>Recipient Email</label>
+      <input id="cem-to" type="email" value="${defaultEmail}" placeholder="parent@example.com">
+    </div>
+
+    <div class="form-group">
+      <label>Subject</label>
+      <input id="cem-subject" type="text" placeholder="e.g., Following up on our call today" maxlength="120">
+    </div>
+
+    <div class="form-group">
+      <label>Body</label>
+      <textarea id="cem-body" rows="10" style="font-family:Helvetica,Arial,sans-serif;font-size:13px;line-height:1.5;width:100%;resize:vertical" placeholder="Dear [first name],
+
+Thank you for taking the time to talk with me today. As we discussed...
+
+[Two paragraph breaks separate paragraphs in the email]"></textarea>
+      <div style="font-size:11px;color:var(--gray);margin-top:4px">
+        Tip: Leave a blank line between paragraphs for proper spacing. Mary's signature is added at the bottom automatically.
+      </div>
+    </div>
+
+    ${hasLinks ? `
+      <div class="form-group">
+        <label style="display:flex;align-items:center;gap:6px;cursor:pointer">
+          <input type="checkbox" id="cem-include-links" checked>
+          <span>Include payment option cards (recommended)</span>
+        </label>
+      </div>
+    ` : ''}
+
+    <div style="background:var(--cream);border-left:3px solid var(--gold);padding:10px 14px;border-radius:6px;font-size:12px;color:var(--navy);line-height:1.6;margin-bottom:14px">
+      <strong>📨 This email will be logged</strong> in the family's event timeline. It does not affect any active campaign.
+    </div>
+
+    <div class="modal-footer">
+      <button class="btn btn-ghost" onclick="closeModal()">Cancel</button>
+      <button class="btn btn-ghost" onclick="previewCustomEmail(${familyId})">Preview</button>
+      <button class="btn btn-primary" onclick="sendCustomEmail(${familyId})">Send Email</button>
+    </div>`);
+}
+
+function previewCustomEmail(familyId) {
+  const subject = document.getElementById('cem-subject').value.trim();
+  const body = document.getElementById('cem-body').value.trim();
+  if (!subject || !body) return toast('Fill in subject and body to preview', 'error');
+
+  // Build a simple preview popup
+  const fam = window.__FAMILY_DETAIL?.family;
+  const greeting = (fam?.family_name || 'Family').split(/[\s,]+/)[0];
+  const includeLinksEl = document.getElementById('cem-include-links');
+  const includeLinks = includeLinksEl ? includeLinksEl.checked : false;
+
+  const htmlBody = body.split(/\n\n+/).map(p => `<p style="font-size:15px;line-height:1.7;margin:0 0 16px">${p.replace(/\n/g,'<br>').replace(/</g,'&lt;')}</p>`).join('');
+
+  const previewHtml = `<!DOCTYPE html><html><body style="margin:0;padding:24px;background:#f7f5ef;font-family:Helvetica,Arial,sans-serif">
+    <div style="max-width:600px;margin:0 auto;background:#fff;border-radius:8px;overflow:hidden;box-shadow:0 1px 3px rgba(0,0,0,.05)">
+      <div style="background:#1a2744;padding:24px 32px">
+        <div style="font-family:Georgia,serif;font-size:22px;color:#fff">The Children's Center</div>
+        <div style="color:rgba(255,255,255,.7);font-size:13px;margin-top:4px">A note from Mary Wardlaw</div>
+      </div>
+      <div style="padding:32px;color:#1a2744">
+        <p style="font-size:15px;line-height:1.7;margin:0 0 16px">Dear ${greeting},</p>
+        ${htmlBody}
+        ${includeLinks ? '<div style="background:#f7f5ef;padding:16px;border-radius:6px;text-align:center;color:#888;font-size:12px;font-style:italic;margin:16px 0">[Payment option cards will appear here]</div>' : ''}
+        <p style="font-size:15px;line-height:1.7;margin:24px 0 4px">With appreciation,</p>
+        <p style="font-size:15px;line-height:1.7;margin:0;font-weight:500">Mary Wardlaw</p>
+        <p style="font-size:13px;line-height:1.7;margin:0;color:#555">Owner | The Children's Center</p>
+      </div>
+    </div>
+  </body></html>`;
+
+  const w = window.open('', '_blank', 'width=700,height=800');
+  if (!w) return toast('Popup blocked. Allow popups for this site.', 'error');
+  w.document.write(previewHtml);
+  w.document.title = `Preview: ${subject}`;
+  w.document.close();
+}
+
+async function sendCustomEmail(familyId) {
+  const to = document.getElementById('cem-to').value.trim();
+  const subject = document.getElementById('cem-subject').value.trim();
+  const body = document.getElementById('cem-body').value.trim();
+  const includeLinksEl = document.getElementById('cem-include-links');
+  const include_payment_links = includeLinksEl ? includeLinksEl.checked : false;
+
+  if (!to || !to.includes('@')) return toast('Enter a valid recipient email', 'error');
+  if (!subject) return toast('Subject is required', 'error');
+  if (!body) return toast('Body is required', 'error');
+  if (subject.length > 120) return toast('Subject too long (max 120 chars)', 'error');
+  if (body.length > 10000) return toast('Body too long (max 10K chars)', 'error');
+
+  if (!confirm(`Send to ${to}?\n\nSubject: "${subject}"\n\nThis cannot be unsent once delivered.`)) return;
+
+  try {
+    await api('POST', `/collections/families/${familyId}/send-custom-email`, {
+      to, subject, body, include_payment_links,
+    });
+    toast(`Custom email sent to ${to}`, 'success');
     closeModal();
     openFamilyDetail(familyId);
   } catch (e) {
