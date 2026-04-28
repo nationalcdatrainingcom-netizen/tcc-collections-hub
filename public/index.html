@@ -2869,6 +2869,43 @@ pages['collections-families'] = async () => {
   try {
     const families = await api('GET', '/collections/families');
     window.__COLL_FAMILIES = families;
+
+    // Render the filters bar + empty containers ONCE. Subsequent updates only
+    // touch #coll-summary, #coll-active-table, and #coll-settled-section so the
+    // search input never gets recreated (which would lose focus on each keystroke).
+    content.innerHTML = `
+      <div class="card" style="padding:12px 20px;display:flex;gap:12px;align-items:center;flex-wrap:wrap">
+        <div>
+          <label style="font-size:11px;color:var(--gray);text-transform:uppercase;letter-spacing:.5px;display:block;margin-bottom:3px">Center</label>
+          <select id="coll-center-filter" onchange="COLL_CENTER_FILTER=this.value;renderCollectionsFamilies()" style="font-size:13px">
+            <option value="all">All centers</option>
+            <option value="Niles">Niles</option>
+            <option value="Peace">Peace</option>
+            <option value="Montessori">Montessori</option>
+          </select>
+        </div>
+        <div style="flex:1;min-width:220px">
+          <label style="font-size:11px;color:var(--gray);text-transform:uppercase;letter-spacing:.5px;display:block;margin-bottom:3px">Search</label>
+          <input id="coll-search" type="text" placeholder="Family name, email, or child name" style="font-size:13px;width:100%"
+                 oninput="COLL_SEARCH=this.value;renderCollectionsFamilies()">
+        </div>
+        <div style="margin-left:auto;text-align:right">
+          <div style="font-size:11px;color:var(--gray);text-transform:uppercase;letter-spacing:.5px">Showing</div>
+          <div id="coll-summary" style="font-size:15px;font-weight:600;color:var(--navy)">…</div>
+        </div>
+      </div>
+
+      <div id="coll-active-table" class="card" style="padding:0"></div>
+
+      <div id="coll-settled-section"></div>
+    `;
+
+    // Restore previous state (sticky across navigations)
+    const centerSel = document.getElementById('coll-center-filter');
+    if (centerSel) centerSel.value = COLL_CENTER_FILTER;
+    const searchInput = document.getElementById('coll-search');
+    if (searchInput) searchInput.value = COLL_SEARCH;
+
     renderCollectionsFamilies();
   } catch (e) {
     content.innerHTML = `<div class="card"><div style="color:var(--red)">Error: ${e.message}</div></div>`;
@@ -2876,7 +2913,8 @@ pages['collections-families'] = async () => {
 };
 
 function renderCollectionsFamilies() {
-  const content = document.getElementById('content');
+  // This function ONLY updates the dynamic parts (summary, active table, settled section).
+  // It deliberately does not touch the search input or center filter.
   let families = window.__COLL_FAMILIES || [];
 
   // Apply search + center filter
@@ -2908,35 +2946,18 @@ function renderCollectionsFamilies() {
     if (COLL_SORT.column !== col) return '<span style="color:var(--border);font-size:10px">▲▼</span>';
     return COLL_SORT.dir === 'asc' ? '▲' : '▼';
   };
-
-  // Header cell builder
   const h = (col, label) => `<th style="cursor:pointer;user-select:none" onclick="toggleCollSort('${col}')">${label} ${sortIcon(col)}</th>`;
 
-  content.innerHTML = `
-    <div class="card" style="padding:12px 20px;display:flex;gap:12px;align-items:center;flex-wrap:wrap">
-      <div>
-        <label style="font-size:11px;color:var(--gray);text-transform:uppercase;letter-spacing:.5px;display:block;margin-bottom:3px">Center</label>
-        <select onchange="COLL_CENTER_FILTER=this.value;renderCollectionsFamilies()" style="font-size:13px">
-          <option value="all" ${COLL_CENTER_FILTER==='all'?'selected':''}>All centers</option>
-          <option value="Niles" ${COLL_CENTER_FILTER==='Niles'?'selected':''}>Niles</option>
-          <option value="Peace" ${COLL_CENTER_FILTER==='Peace'?'selected':''}>Peace</option>
-          <option value="Montessori" ${COLL_CENTER_FILTER==='Montessori'?'selected':''}>Montessori</option>
-        </select>
-      </div>
-      <div style="flex:1;min-width:220px">
-        <label style="font-size:11px;color:var(--gray);text-transform:uppercase;letter-spacing:.5px;display:block;margin-bottom:3px">Search</label>
-        <input type="text" value="${COLL_SEARCH}" oninput="COLL_SEARCH=this.value;renderCollectionsFamilies()"
-               placeholder="Family name, email, or child name" style="font-size:13px;width:100%">
-      </div>
-      <div style="margin-left:auto;text-align:right">
-        <div style="font-size:11px;color:var(--gray);text-transform:uppercase;letter-spacing:.5px">Showing</div>
-        <div style="font-size:15px;font-weight:600;color:var(--navy)">
-          ${active.length} active · <span style="color:var(--red)">$${active.reduce((s,f) => s + f.remaining_balance, 0).toFixed(2)}</span>
-        </div>
-      </div>
-    </div>
+  // Update the summary (top-right)
+  const summary = document.getElementById('coll-summary');
+  if (summary) {
+    summary.innerHTML = `${active.length} active · <span style="color:var(--red)">$${active.reduce((s,f) => s + f.remaining_balance, 0).toFixed(2)}</span>`;
+  }
 
-    <div class="card" style="padding:0">
+  // Update the active table card
+  const activeTable = document.getElementById('coll-active-table');
+  if (activeTable) {
+    activeTable.innerHTML = `
       <div class="table-wrap">
         <table>
           <thead><tr>
@@ -2976,10 +2997,13 @@ function renderCollectionsFamilies() {
               </tr>`).join('')}
           </tbody>
         </table>
-      </div>
-    </div>
+      </div>`;
+  }
 
-    ${settled.length > 0 ? `
+  // Update the settled section
+  const settledSection = document.getElementById('coll-settled-section');
+  if (settledSection) {
+    settledSection.innerHTML = settled.length === 0 ? '' : `
       <div class="card" style="padding:0;margin-top:16px">
         <div style="padding:14px 20px;border-bottom:1px solid var(--border);font-family:'DM Serif Display',serif;font-size:20px;color:var(--green)">
           ✅ Settled (${settled.length})
@@ -2999,7 +3023,8 @@ function renderCollectionsFamilies() {
             </tbody>
           </table>
         </div>
-      </div>` : ''}`;
+      </div>`;
+  }
 }
 
 function toggleCollSort(col) {
