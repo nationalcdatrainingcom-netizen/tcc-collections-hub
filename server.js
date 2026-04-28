@@ -368,6 +368,18 @@ async function initDB() {
     CREATE INDEX IF NOT EXISTS idx_touches_due ON campaign_touches(scheduled_for, sent_at) WHERE sent_at IS NULL;
     CREATE INDEX IF NOT EXISTS idx_touches_enrollment ON campaign_touches(enrollment_id);
 
+    -- Editable template overrides for touches 2-7. If no row exists for a
+    -- given touch, the hardcoded default in buildTouchContent() is used.
+    -- Touch 1 is intentionally not overridable — it's always Mary's warm letter.
+    CREATE TABLE IF NOT EXISTS campaign_template_overrides (
+      touch_number INTEGER PRIMARY KEY CHECK (touch_number BETWEEN 2 AND 7),
+      subject TEXT,           -- email subject (NULL for SMS)
+      body TEXT NOT NULL,     -- plain text body for emails (used for both .text and converted to HTML).
+                              -- For SMS touches: the entire SMS message.
+      updated_at TIMESTAMPTZ DEFAULT NOW(),
+      updated_by TEXT
+    );
+
     -- Full audit-trail ledger for past-due families. Every charge, payment,
     -- adjustment, refund, and credit is one row here. Remaining balance is
     -- computed as original_balance - SUM(signed amounts) in this table.
@@ -3829,7 +3841,147 @@ app.post('/api/collections/families/:id/send-email', ssoAuth, async (req, res) =
   }
 });
 
-// ── Unsubscribe endpoint (no auth required — accessed via email link) ────────
+// ── Custom one-off email composer ────────────────────────────────────────────
+// Lets Mary send a custom-worded email to a specific family while the
+// payment-option cards are automatically appended below the body so the
+// family always has the click-to-pay paths front and center.
+app.post('/api/collections/families/:id/send-custom-email', ssoAuth, async (req, res) => {
+  if (!sendgrid) {
+    return res.status(503).json({
+      error: 'SendGrid not configured. Set SENDGRID_API_KEY in Render environment variables.',
+    });
+  }
+
+  const family = await familyWithBalance(req.params.id);
+  if (!family) return res.status(404).json({ error: 'Family not found' });
+
+  if (family.email_unsubscribed) {
+    return res.status(403).json({
+      error: `${family.family_name} has unsubscribed from automated emails. You can still email them outside this system.`,
+    });
+  }
+
+  const { to, subject, body, include_payment_links } = req.body;
+  const cleanBody = (body || '').trim();
+  const cleanSubject = (subject || '').trim();
+  if (!cleanSubject) return res.status(400).json({ error: 'Subject is required.' });
+  if (!cleanBody) return res.status(400).json({ error: 'Body is required.' });
+
+  // Resolve recipient email
+  let toEmail = (to || '').trim() || family.primary_contact_email;
+  if (!toEmail) {
+    const { rows } = await pool.query(
+      `SELECT c.parent_email FROM collections_family_children fc
+       JOIN children c ON c.id=fc.child_id
+       WHERE fc.family_id=$1 AND c.parent_email IS NOT NULL AND c.parent_email <> ''
+       LIMIT 1`, [req.params.id]);
+    toEmail = rows[0]?.parent_email;
+  }
+  if (!toEmail) return res.status(422).json({ error: 'No email address on file.' });
+
+  // Generate or fetch unsubscribe token
+  let unsubscribeToken = family.email_unsubscribe_token;
+  if (!unsubscribeToken) {
+    unsubscribeToken = require('crypto').randomBytes(24).toString('hex');
+    await pool.query(`UPDATE collections_families SET email_unsubscribe_token=$1 WHERE id=$2`,
+      [unsubscribeToken, family.id]);
+  }
+  const appUrl = process.env.APP_URL || 'https://tcc-collections-hub.onrender.com';
+  const unsubscribeUrl = `${appUrl}/api/collections/unsubscribe?token=${unsubscribeToken}`;
+
+  // Build optional payment options HTML
+  let optionsHTML = '';
+  let optionsText = '';
+  if (include_payment_links !== false && family.payinfull_link_url) {
+    const halfOff = (parseFloat(family.discount_pay_in_full) || 0).toLocaleString('en-US', { minimumFractionDigits: 2, maximumFractionDigits: 2 });
+    const savings = (parseFloat(family.remaining_balance) - parseFloat(family.discount_pay_in_full)).toLocaleString('en-US', { minimumFractionDigits: 2, maximumFractionDigits: 2 });
+    let monthlyAmount = null, weeklyAmount = null;
+    try {
+      if (stripe && family.paywhatyoucan_link_id) {
+        const link = await stripe.paymentLinks.retrieve(family.paywhatyoucan_link_id, { expand: ['line_items.data.price'] });
+        const price = link.line_items?.data?.[0]?.price;
+        if (price?.unit_amount) monthlyAmount = price.unit_amount / 100;
+      }
+      if (stripe && family.weekly_link_id) {
+        const link = await stripe.paymentLinks.retrieve(family.weekly_link_id, { expand: ['line_items.data.price'] });
+        const price = link.line_items?.data?.[0]?.price;
+        if (price?.unit_amount) weeklyAmount = price.unit_amount / 100;
+      }
+    } catch {}
+
+    const monthly = monthlyAmount ? monthlyAmount.toLocaleString('en-US', { minimumFractionDigits: 2, maximumFractionDigits: 2 }) : null;
+    const weekly = weeklyAmount ? weeklyAmount.toLocaleString('en-US', { minimumFractionDigits: 2, maximumFractionDigits: 2 }) : null;
+    optionsHTML = buildOptionCards({
+      payInFullUrl: family.payinfull_link_url,
+      halfOff, savings,
+      monthlyUrl: family.paywhatyoucan_link_url || null,
+      monthly,
+      weeklyUrl: family.weekly_link_url || null,
+      weekly,
+      emphasis: null,
+    });
+    optionsText = buildOptionPlaintext({
+      halfOff, savings, monthlyUrl: family.paywhatyoucan_link_url, monthly,
+      weeklyUrl: family.weekly_link_url, weekly,
+      payInFullUrl: family.payinfull_link_url,
+    });
+  }
+
+  // Convert body line breaks to <p> tags for HTML rendering
+  const htmlBody = cleanBody
+    .split(/\n\n+/)
+    .map(para => `<p style="font-size:15px;line-height:1.7;margin:0 0 16px">${para.replace(/\n/g, '<br>')}</p>`)
+    .join('');
+
+  // Resolve greeting — used as a fallback if Mary doesn't include "Dear X" herself
+  const greeting = await resolveGreeting(family);
+
+  const closing = `
+    <p style="font-size:15px;line-height:1.7;margin:0 0 4px">With appreciation,</p>
+    <p style="font-size:15px;line-height:1.7;margin:0;font-weight:500">Mary Wardlaw</p>
+    <p style="font-size:13px;line-height:1.7;margin:0;color:#555">Owner | The Children's Center</p>`;
+
+  const html = campaignEmailLayout({
+    greeting,
+    headerSubtitle: 'A note from Mary Wardlaw',
+    body: htmlBody,
+    optionsHTML,
+    closingHTML: closing,
+    unsubscribeUrl,
+  });
+
+  const text = `Dear ${greeting},\n\n${cleanBody}\n${optionsText}\nWith appreciation,\nMary Wardlaw\nOwner | The Children's Center\n\nThe Children's Center\n210 Main Street, Niles, MI 49120\n219 Peace Boulevard, St. Joseph, MI 49085\n\nTo stop receiving these emails: ${unsubscribeUrl}`;
+
+  const fromEmail = process.env.SENDGRID_FROM_EMAIL || 'billing@childrenscenterinc.com';
+  const fromName = process.env.SENDGRID_FROM_NAME || "The Children's Center Billing";
+
+  try {
+    await sendgrid.send({
+      to: toEmail,
+      from: { email: fromEmail, name: fromName },
+      subject: cleanSubject,
+      html, text,
+      categories: ['collections', 'custom-email'],
+      customArgs: { family_id: String(family.id), email_type: 'custom' },
+      headers: {
+        'List-Unsubscribe': `<${unsubscribeUrl}>`,
+        'List-Unsubscribe-Post': 'List-Unsubscribe=One-Click',
+      },
+    });
+
+    await pool.query(
+      `INSERT INTO collections_events (family_id, event_type, detail) VALUES ($1, 'custom_email_sent', $2)`,
+      [family.id, `Custom email sent to ${toEmail} | Subject: ${cleanSubject}`]);
+
+    res.json({ sent: true, to: toEmail });
+  } catch (e) {
+    console.error('SendGrid send error:', e?.response?.body || e.message);
+    const detail = e?.response?.body?.errors?.map(x => x.message).join('; ') || e.message;
+    res.status(500).json({ error: `Email send failed: ${detail}` });
+  }
+});
+
+
 // Both GET and POST are supported per RFC 8058. Email clients use POST for
 // one-click unsubscribe; humans hitting the URL use GET. Either way, the token
 // is the proof of authority — only the family receiving the email knows it.
@@ -3977,11 +4129,71 @@ function buildOptionPlaintext({ halfOff, savings, monthlyUrl, monthly, weeklyUrl
   return s;
 }
 
-function buildTouchContent(touchTemplate, { greeting, halfOff, savings, monthly, weekly, payInFullUrl, monthlyUrl, weeklyUrl, unsubscribeUrl }) {
+async function buildTouchContent(touchTemplate, { greeting, halfOff, savings, monthly, weekly, payInFullUrl, monthlyUrl, weeklyUrl, unsubscribeUrl }) {
   const optionsHTML = buildOptionCards({ payInFullUrl, halfOff, savings, monthlyUrl, monthly, weeklyUrl, weekly,
     emphasis: touchTemplate === 'touch3_small_steps' ? 'weekly' : (touchTemplate === 'touch5_offer_reminder' ? 'pay_in_full' : null) });
   const optionsText = buildOptionPlaintext({ halfOff, savings, monthlyUrl, monthly, weeklyUrl, weekly, payInFullUrl });
 
+  // Map template names to touch numbers (for override lookup)
+  const TEMPLATE_TO_TOUCH_NUMBER = {
+    'touch2_check_in': 2,
+    'touch3_small_steps': 3,
+    'touch4_sms_brief': 4,
+    'touch5_offer_reminder': 5,
+    'touch6_sms_final': 6,
+    'touch7_final_note': 7,
+  };
+  const touchNum = TEMPLATE_TO_TOUCH_NUMBER[touchTemplate];
+
+  // Check for an override in the database
+  if (touchNum) {
+    try {
+      const { rows } = await pool.query(
+        `SELECT subject, body FROM campaign_template_overrides WHERE touch_number=$1`, [touchNum]);
+      if (rows[0] && rows[0].body) {
+        const isSMS = touchTemplate.includes('sms');
+        // Variable substitution
+        const subst = (str) => str
+          .replace(/\{first_name\}/g, greeting)
+          .replace(/\{half_off\}/g, halfOff)
+          .replace(/\{savings\}/g, savings)
+          .replace(/\{monthly\}/g, monthly || '')
+          .replace(/\{weekly\}/g, weekly || '')
+          .replace(/\{pay_in_full_url\}/g, payInFullUrl || '');
+
+        if (isSMS) {
+          return { text: subst(rows[0].body) };
+        } else {
+          // Build HTML version from the plain-text body (preserve paragraph breaks)
+          const cleanBody = subst(rows[0].body);
+          const htmlBody = cleanBody.split(/\n\n+/)
+            .map(p => `<p style="font-size:15px;line-height:1.7;margin:0 0 16px">${p.replace(/\n/g,'<br>')}</p>`)
+            .join('');
+          const closing = `
+            <p style="font-size:15px;line-height:1.7;margin:24px 0 4px">With appreciation,</p>
+            <p style="font-size:15px;line-height:1.7;margin:0;font-weight:500">Mary Wardlaw</p>
+            <p style="font-size:13px;line-height:1.7;margin:0;color:#555">Owner | The Children's Center</p>`;
+          return {
+            subject: subst(rows[0].subject || `A note from The Children's Center`),
+            html: campaignEmailLayout({
+              greeting,
+              headerSubtitle: 'A note from Mary Wardlaw',
+              body: htmlBody,
+              optionsHTML,
+              closingHTML: closing,
+              unsubscribeUrl,
+            }),
+            text: `Dear ${greeting},\n\n${cleanBody}\n${optionsText}\nWith appreciation,\nMary Wardlaw\nOwner | The Children's Center\n\n${unsubscribeUrl ? `To stop receiving these emails: ${unsubscribeUrl}\n` : ''}`,
+          };
+        }
+      }
+    } catch (e) {
+      console.warn('Template override lookup failed:', e.message);
+      // Fall through to default content below
+    }
+  }
+
+  // ── Default templates (used when no DB override exists) ───────────────────
   switch (touchTemplate) {
     case 'touch1_warm_letter':
       // (Already built — uses the existing buildPaymentLinkEmail function. We delegate.)
@@ -4308,7 +4520,7 @@ async function fireTouch(enrollmentId, touchNumber) {
         unsubscribeUrl,
       });
     } else {
-      content = buildTouchContent(def.template, {
+      content = await buildTouchContent(def.template, {
         greeting,
         halfOff,
         savings,
@@ -4388,7 +4600,7 @@ async function fireTouch(enrollmentId, touchNumber) {
       return { success: true, skipped: true, reason: 'Phone format' };
     }
 
-    const content = buildTouchContent(def.template, {
+    const content = await buildTouchContent(def.template, {
       greeting,
       halfOff, savings,
       monthly: monthlyAmount ? monthlyAmount.toLocaleString('en-US', { minimumFractionDigits: 2, maximumFractionDigits: 2 }) : null,
@@ -4562,6 +4774,125 @@ setInterval(runCampaignScheduler, 15 * 60 * 1000);
 app.post('/api/campaigns/scheduler/run-now', ssoAuth, async (req, res) => {
   await runCampaignScheduler();
   res.json({ ran: true });
+});
+
+// ── Editable template overrides (touches 2-7) ────────────────────────────────
+// GET returns the default content for each touch + any override that's been saved.
+// POST upserts an override. DELETE removes an override (reverting to default).
+app.get('/api/campaigns/templates', ssoAuth, async (req, res) => {
+  const { rows } = await pool.query(
+    `SELECT touch_number, subject, body, updated_at, updated_by
+     FROM campaign_template_overrides ORDER BY touch_number`);
+  const overridesByNum = {};
+  for (const r of rows) overridesByNum[r.touch_number] = r;
+
+  // Render each touch's "default content" by calling buildTouchContent with
+  // placeholder data. This shows Mary what the email looks like with no override.
+  const placeholderData = {
+    greeting: '{first_name}',
+    halfOff: '{half_off}',
+    savings: '{savings}',
+    monthly: '{monthly}',
+    weekly: '{weekly}',
+    payInFullUrl: '{pay_in_full_url}',
+    monthlyUrl: '{pay_in_full_url}',  // not used in defaults' text
+    weeklyUrl: '{pay_in_full_url}',
+    unsubscribeUrl: null,
+  };
+
+  // Touch numbers we expose (1 is not editable)
+  const touches = [];
+  for (let n = 2; n <= 7; n++) {
+    const def = CAMPAIGN_TOUCHES.find(t => t.number === n);
+    if (!def) continue;
+
+    // Temporarily skip the DB lookup to get the hardcoded default
+    // We pass an unrecognized template name to bypass override-DB-lookup,
+    // but then call the default switch with the real template.
+    // Cleanest approach: render via a special path.
+    const defaultContent = await renderDefaultTouchContent(def.template, placeholderData);
+
+    touches.push({
+      touch_number: n,
+      channel: def.channel,
+      day_offset: def.day_offset,
+      template: def.template,
+      default_subject: defaultContent?.subject || null,
+      default_body: defaultContent?.text_body || defaultContent?.text || null,
+      override: overridesByNum[n] || null,
+    });
+  }
+  res.json({ touches });
+});
+
+// Helper that always returns the hardcoded default (bypasses DB override).
+async function renderDefaultTouchContent(touchTemplate, vars) {
+  // Inline minimal copy of the switch — we want JUST the default body text
+  // for the editor preview, not the full HTML envelope.
+  const { greeting, halfOff, savings, monthly, weekly, payInFullUrl } = vars;
+  switch (touchTemplate) {
+    case 'touch2_check_in':
+      return {
+        subject: `Just making sure my note came through`,
+        text_body: `I sent a note last week and wanted to make sure it didn't get lost in your inbox. We'd love to help you close the loop on your account in a way that feels good.\n\nHere are the options I mentioned, just in case.\n\nNo pressure at all — just here to make this easy.`,
+      };
+    case 'touch3_small_steps':
+      return {
+        subject: `Sometimes a small step is the right step`,
+        text_body: `One thing I love about our families is how much they value doing right by their commitments — even when life is busy.\n\nIf a big payment isn't possible right now, even $25 a week can quietly close this out over time. There's no judgment here, just a path forward whenever you're ready.\n\nWhatever pace works for your family, we're here for it.`,
+      };
+    case 'touch4_sms_brief':
+      return {
+        text: `Hi {first_name}, this is Mary from The Children's Center. Just wanted to reach out about your account — we have payment options as low as $25/week. Here's the link: {pay_in_full_url} — Mary. Reply STOP to opt out.`,
+      };
+    case 'touch5_offer_reminder':
+      return {
+        subject: `A reminder about the half-off option`,
+        text_body: `I wanted to gently remind you about the special 50%-off pay-in-full option I extended. It won't be available indefinitely, and I'd hate for you to miss the chance to settle for half of what's owed.\n\nPay in full today for just \${half_off} — savings of \${savings}.\n\nOf course, the monthly and weekly options remain available too. Whatever works for your family.`,
+      };
+    case 'touch6_sms_final':
+      return {
+        text: `Hi {first_name}, Mary from The Children's Center. The 50% pay-in-full offer is still on the table — would love to help you close this out. Link: {pay_in_full_url} — Reply STOP to opt out.`,
+      };
+    case 'touch7_final_note':
+      return {
+        subject: `A final friendly note`,
+        text_body: `I've reached out a few times now without hearing back, so I wanted to send one more note before we have to take the next step on your account.\n\nThe options I've shared remain available — including the pay-in-full discount. We'd genuinely rather work this out together than have to escalate, and I want to give you every opportunity to do so.\n\nIf now isn't the right moment, please call me directly at (269) 683-0405. I'll personally work with you to find a way forward.`,
+      };
+  }
+  return null;
+}
+
+app.post('/api/campaigns/templates/:touchNum', ssoAuth, async (req, res) => {
+  const touchNum = parseInt(req.params.touchNum);
+  if (touchNum < 2 || touchNum > 7) return res.status(400).json({ error: 'Touch number must be 2-7' });
+
+  const def = CAMPAIGN_TOUCHES.find(t => t.number === touchNum);
+  const isSMS = def?.channel === 'sms';
+  const { subject, body } = req.body;
+  const cleanBody = (body || '').trim();
+
+  if (!cleanBody) return res.status(400).json({ error: 'Body is required' });
+  if (isSMS && cleanBody.length > 1500) {
+    return res.status(400).json({ error: 'SMS body too long (max 1500 chars; will be split into segments)' });
+  }
+  if (!isSMS && !subject) return res.status(400).json({ error: 'Subject is required for email touches' });
+
+  await pool.query(
+    `INSERT INTO campaign_template_overrides (touch_number, subject, body, updated_at, updated_by)
+     VALUES ($1, $2, $3, NOW(), $4)
+     ON CONFLICT (touch_number) DO UPDATE SET
+       subject=EXCLUDED.subject, body=EXCLUDED.body,
+       updated_at=NOW(), updated_by=EXCLUDED.updated_by`,
+    [touchNum, isSMS ? null : (subject || '').trim(), cleanBody, req.user?.username || 'mary']);
+
+  res.json({ saved: true, touch_number: touchNum });
+});
+
+app.delete('/api/campaigns/templates/:touchNum', ssoAuth, async (req, res) => {
+  const touchNum = parseInt(req.params.touchNum);
+  await pool.query(`DELETE FROM campaign_template_overrides WHERE touch_number=$1`, [touchNum]);
+  res.json({ reverted: true, touch_number: touchNum });
 });
 
 // ── Transactions / Adjustments ───────────────────────────────────────────────
