@@ -3559,10 +3559,35 @@ async function loadCampaignCard(familyId) {
   try {
     const data = await api('GET', `/collections/families/${familyId}/campaign`);
     if (!data.enrolled) {
+      // Detect whether we have an email available before showing Start button
+      const detail = window.__FAMILY_DETAIL;
+      const fam = detail?.family;
+      const linkedEmail = (detail?.linked_children || []).find(c => c.parent_email)?.parent_email;
+      const hasEmail = !!(fam?.primary_contact_email || linkedEmail);
+
+      if (!hasEmail) {
+        el.innerHTML = `
+          <div style="background:#fff8e0;border:1px solid var(--gold);border-radius:8px;padding:14px;margin-bottom:14px">
+            <div style="font-weight:600;color:var(--navy);margin-bottom:6px">⚠️ No email address on file</div>
+            <p style="font-size:13px;color:var(--gray);line-height:1.6;margin:0">
+              The 7-touch sequence needs an email to send to. Add one before starting.
+              Linked children's parent emails are also used as a fallback if available.
+            </p>
+          </div>
+          <button class="btn btn-gold" onclick="openAddEmailModal(${familyId})">+ Add Email Address</button>
+          <button class="btn btn-ghost" disabled style="opacity:.5;cursor:not-allowed;margin-left:6px" title="No email on file">Start 7-Touch Sequence</button>
+        `;
+        return;
+      }
+
       el.innerHTML = `
         <p style="font-size:13px;color:var(--gray);line-height:1.6;margin-bottom:14px">
           Send Mary's warm letter automatically over 50 days. The sequence sends 5 emails and 2 texts spread across days 0, 5, 12, 21, 30, 38, and 50. It auto-stops if the family pays, settles, or unsubscribes.
         </p>
+        <div style="font-size:12px;color:var(--gray);margin-bottom:10px">
+          📧 Will send to: <strong>${fam?.primary_contact_email || linkedEmail}</strong>
+          ${!fam?.primary_contact_email ? ' <span style="color:var(--gold)">(from linked child)</span>' : ''}
+        </div>
         <button class="btn btn-gold" onclick="startCampaign(${familyId})">Start 7-Touch Sequence</button>
       `;
       return;
@@ -3641,6 +3666,67 @@ async function loadCampaignCard(familyId) {
 }
 
 const CAMPAIGN_DAY_OFFSETS = [0, 5, 12, 21, 30, 38, 50];
+
+async function openAddEmailModal(familyId) {
+  // Focused mini-modal: just collect an email and save it. Designed for the
+  // "I want to start a sequence but the family has no email yet" workflow.
+  const detail = window.__FAMILY_DETAIL;
+  const fam = detail?.family;
+  if (!fam) return toast('Family not loaded yet — try again', 'error');
+
+  openModal(`
+    <div class="modal-title">Add Email for ${fam.family_name}</div>
+    <p style="font-size:13px;color:var(--gray);margin-bottom:14px;line-height:1.6">
+      Add the parent's email address. Once saved you can start the 7-touch sequence right away.
+    </p>
+
+    <div class="form-group">
+      <label>Email Address</label>
+      <input id="addemail-input" type="email" placeholder="parent@example.com" autofocus>
+    </div>
+
+    <div class="form-group">
+      <label>Phone (optional — used for SMS touches)</label>
+      <input id="addemail-phone" type="tel" placeholder="(269) 555-1234" value="${fam.primary_contact_phone || ''}">
+    </div>
+
+    <div class="modal-footer">
+      <button class="btn btn-ghost" onclick="closeModal()">Cancel</button>
+      <button class="btn btn-primary" onclick="saveAddEmail(${familyId})">Save & Continue</button>
+    </div>`);
+
+  // Focus the email input
+  setTimeout(() => { document.getElementById('addemail-input')?.focus(); }, 50);
+}
+
+async function saveAddEmail(familyId) {
+  const email = document.getElementById('addemail-input').value.trim();
+  const phone = document.getElementById('addemail-phone').value.trim();
+  if (!email || !email.includes('@')) return toast('Enter a valid email address', 'error');
+
+  // Patch only the email + phone fields, keeping everything else as-is
+  const fam = window.__FAMILY_DETAIL?.family;
+  if (!fam) return toast('Family not loaded', 'error');
+
+  try {
+    await api('PUT', `/collections/families/${familyId}`, {
+      family_name: fam.family_name,
+      original_balance: fam.original_balance,
+      primary_contact_email: email,
+      primary_contact_phone: phone || null,
+      children_names: fam.children_names,
+      center: fam.center,
+      left_date: fam.left_date ? String(fam.left_date).split('T')[0] : null,
+      status: fam.status,
+      notes: fam.notes,
+    });
+    toast('Email saved.', 'success');
+    closeModal();
+    openFamilyDetail(familyId);
+  } catch (e) {
+    toast('Save failed: ' + e.message, 'error');
+  }
+}
 
 async function startCampaign(familyId) {
   if (!confirm('Start the 7-touch sequence? Touch 1 (Mary\'s warm letter) will send immediately to the family.')) return;
