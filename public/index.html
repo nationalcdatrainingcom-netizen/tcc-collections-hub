@@ -3411,7 +3411,7 @@ async function openFamilyDetail(id) {
         </div>
       ` : ''}
 
-      ${stripeReady && hasLinks && !settled && !family.email_unsubscribed ? `
+      ${hasLinks && !settled && !family.email_unsubscribed ? `
         <div class="card" id="campaign-card-${family.id}">
           <div class="card-title">📬 7-Touch Outreach Campaign</div>
           <div id="campaign-content-${family.id}" style="font-size:13px;color:var(--gray)">Loading…</div>
